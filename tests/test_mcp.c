@@ -64,6 +64,43 @@ TEST(jsonrpc_parse_tools_call) {
     PASS();
 }
 
+/* issue #253: JSON-RPC 2.0 §4 permits string ids (Claude Desktop sends them
+ * for "initialize"). Previously strtol-coerced to 0; must be preserved. */
+TEST(jsonrpc_parse_string_id_issue253) {
+    const char *line = "{\"jsonrpc\":\"2.0\",\"id\":\"init-abc\",\"method\":\"initialize\"}";
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse(line, &req);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(req.has_id);
+    ASSERT_NOT_NULL(req.id_str);
+    ASSERT_STR_EQ(req.id_str, "init-abc");
+    cbm_jsonrpc_request_free(&req);
+
+    /* A purely non-numeric string would have become 0 under strtol. */
+    const char *line2 = "{\"jsonrpc\":\"2.0\",\"id\":\"xyz\",\"method\":\"ping\"}";
+    cbm_jsonrpc_request_t req2 = {0};
+    ASSERT_EQ(cbm_jsonrpc_parse(line2, &req2), 0);
+    ASSERT_NOT_NULL(req2.id_str);
+    ASSERT_STR_EQ(req2.id_str, "xyz");
+    cbm_jsonrpc_request_free(&req2);
+    PASS();
+}
+
+/* issue #253: the response must echo the string id verbatim, not as a number. */
+TEST(jsonrpc_format_response_string_id_issue253) {
+    cbm_jsonrpc_response_t resp = {
+        .id_str = "init-abc",
+        .result_json = "{\"ok\":true}",
+    };
+    char *json = cbm_jsonrpc_format_response(&resp);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"id\":\"init-abc\""));
+    /* Must NOT have coerced to a numeric id. */
+    ASSERT_NULL(strstr(json, "\"id\":0"));
+    free(json);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC FORMATTING
  * ══════════════════════════════════════════════════════════════════ */
@@ -1433,13 +1470,15 @@ TEST(jsonrpc_parse_missing_method) {
 }
 
 TEST(jsonrpc_parse_string_id) {
-    /* JSON-RPC spec allows string IDs; parser converts via strtol */
+    /* JSON-RPC §4: string and numeric ids are distinct. A string id is
+     * preserved verbatim (issue #253), never coerced to a number. */
     const char *line = "{\"jsonrpc\":\"2.0\",\"id\":\"99\",\"method\":\"tools/list\"}";
     cbm_jsonrpc_request_t req = {0};
     int rc = cbm_jsonrpc_parse(line, &req);
     ASSERT_EQ(rc, 0);
     ASSERT_TRUE(req.has_id);
-    ASSERT_EQ(req.id, 99);
+    ASSERT_NOT_NULL(req.id_str);
+    ASSERT_STR_EQ(req.id_str, "99");
     ASSERT_STR_EQ(req.method, "tools/list");
     cbm_jsonrpc_request_free(&req);
     PASS();
@@ -1753,10 +1792,10 @@ TEST(mcp_server_run_rapid_messages) {
  * the buffer. Fill a temp cache dir with enough long-named .db files to
  * exceed 4 KB, then hit the bad-project path. Under ASan a regression aborts
  * here; the fixed bounds-check keeps it clean and returns a normal error. */
-#define ISSUE235_DBNAME(buf, dir, i)                                                          \
-    snprintf((buf), sizeof(buf),                                                              \
-             "%s/proj_%02d_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"  \
-             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.db",                        \
+#define ISSUE235_DBNAME(buf, dir, i)                                                         \
+    snprintf((buf), sizeof(buf),                                                             \
+             "%s/proj_%02d_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.db",                      \
              (dir), (i))
 TEST(tool_bad_project_name_no_overflow_issue235) {
     char cache[256];
@@ -1818,6 +1857,8 @@ SUITE(mcp) {
     RUN_TEST(jsonrpc_parse_notification);
     RUN_TEST(jsonrpc_parse_invalid);
     RUN_TEST(jsonrpc_parse_tools_call);
+    RUN_TEST(jsonrpc_parse_string_id_issue253);
+    RUN_TEST(jsonrpc_format_response_string_id_issue253);
 
     /* JSON-RPC parsing — edge cases */
     RUN_TEST(jsonrpc_parse_empty_string);

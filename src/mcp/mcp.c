@@ -151,7 +151,9 @@ int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out) {
         if (yyjson_is_int(v_id)) {
             out->id = yyjson_get_int(v_id);
         } else if (yyjson_is_str(v_id)) {
-            out->id = strtol(yyjson_get_str(v_id), NULL, CBM_DECIMAL_BASE);
+            /* JSON-RPC 2.0 §4 permits string ids (Claude Desktop uses them).
+             * Preserve verbatim instead of coercing via strtol (issue #253). */
+            out->id_str = heap_strdup(yyjson_get_str(v_id));
         }
     }
 
@@ -169,6 +171,7 @@ void cbm_jsonrpc_request_free(cbm_jsonrpc_request_t *r) {
     }
     safe_str_free(&r->jsonrpc);
     safe_str_free(&r->method);
+    safe_str_free(&r->id_str);
     safe_str_free(&r->params_raw);
     memset(r, 0, sizeof(*r));
 }
@@ -183,7 +186,11 @@ char *cbm_jsonrpc_format_response(const cbm_jsonrpc_response_t *resp) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
-    yyjson_mut_obj_add_int(doc, root, "id", resp->id);
+    if (resp->id_str) {
+        yyjson_mut_obj_add_str(doc, root, "id", resp->id_str);
+    } else {
+        yyjson_mut_obj_add_int(doc, root, "id", resp->id);
+    }
 
     if (resp->error_json) {
         /* Parse the error JSON and embed */
@@ -4333,13 +4340,23 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         free(tool_name);
         free(tool_args);
     } else {
-        char *err = cbm_jsonrpc_format_error(req.id, JSONRPC_METHOD_NOT_FOUND, "Method not found");
+        /* Echo the original id (string or numeric, issue #253) on the error. */
+        char err_obj[160];
+        snprintf(err_obj, sizeof(err_obj), "{\"code\":%d,\"message\":\"Method not found\"}",
+                 JSONRPC_METHOD_NOT_FOUND);
+        cbm_jsonrpc_response_t err_resp = {
+            .id = req.id,
+            .id_str = req.id_str,
+            .error_json = err_obj,
+        };
+        char *err = cbm_jsonrpc_format_response(&err_resp);
         cbm_jsonrpc_request_free(&req);
         return err;
     }
 
     cbm_jsonrpc_response_t resp = {
         .id = req.id,
+        .id_str = req.id_str,
         .result_json = result_json,
     };
     char *out = cbm_jsonrpc_format_response(&resp);
