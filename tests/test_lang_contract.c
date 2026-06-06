@@ -1202,14 +1202,11 @@ TEST(contract_edge_file_changes_with) {
     th_write_file(a, "def alpha_v1():\n    return 1\n");
     th_write_file(b, "def beta_v1():\n    return 1\n");
 
-    /* git must be present (this IS a git project). On POSIX `git init` always
-     * works; where it can't (e.g. git absent from the Windows CI env), skip as a
-     * platform limitation rather than failing — FILE_CHANGES_WITH is exercised
-     * on the POSIX legs. */
-    if (run_git(lp.tmpdir, "init -q") != 0) {
-        th_rmtree(lp.tmpdir);
-        SKIP_PLATFORM("git not available (FILE_CHANGES_WITH needs a git repo)");
-    }
+    /* git must be present (this IS a git project) — a failed init means a broken
+     * environment, which is a real failure, not a skip. git is installed on every
+     * CI platform (incl. the Windows msys2 env), and run_git uses `git -C` with no
+     * POSIX-shell syntax, so this runs everywhere. */
+    ASSERT_EQ(run_git(lp.tmpdir, "init -q"), 0);
     run_git(lp.tmpdir, "config user.email t@t.io");
     run_git(lp.tmpdir, "config user.name t");
     run_git(lp.tmpdir, "add -A");
