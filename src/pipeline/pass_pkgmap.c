@@ -1404,12 +1404,26 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             memmove(dd, dd + 1, strlen(dd + 1) + 1);
         }
         for (;;) {
-            const char *file_qn = (const char *)cbm_ht_get(namespace_map, norm);
-            if (file_qn) {
-                const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-                if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
-                    return n;
+            /* The map value is a '\n'-delimited list of __file__ QNs declaring
+             * this namespace. Return the FIRST that is not the importing file,
+             * so a same-package wildcard import (`import com.example.*` from a
+             * file that is itself in com.example) resolves to a sibling — and
+             * deterministically, independent of file-iteration order across
+             * platforms (amd64 vs arm64). */
+            const char *list = (const char *)cbm_ht_get(namespace_map, norm);
+            for (const char *seg = list; seg && *seg;) {
+                const char *eol = strchr(seg, '\n');
+                size_t len = eol ? (size_t)(eol - seg) : strlen(seg);
+                char qbuf[1024];
+                if (len > 0 && len < sizeof(qbuf)) {
+                    memcpy(qbuf, seg, len);
+                    qbuf[len] = '\0';
+                    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
+                    if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+                        return n;
+                    }
                 }
+                seg = eol ? eol + 1 : NULL;
             }
             char *dot = strrchr(norm, '.');
             if (!dot) {
@@ -1607,15 +1621,31 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                 *p = '.';
             }
         }
-        /* First declaration of a namespace wins; later files with the same
-         * namespace still resolve (any declaring file is a valid target).
-         * The hash table does not copy keys, so the strdup'd key is owned by
-         * the map and freed in ns_map_free_entry. */
+        /* Store ALL files declaring a namespace as a '\n'-delimited list so the
+         * resolver can pick a non-importer sibling (see resolve loop). The hash
+         * table does not copy keys, so the strdup'd key is owned by the map and
+         * freed in ns_map_free_entry. */
         if (!cbm_ht_has(map, key)) {
-            cbm_ht_set(map, key, file_qn);
+            cbm_ht_set(map, key, file_qn); /* map owns key + file_qn */
         } else {
-            free(key);
-            free(file_qn);
+            /* Append to the existing list. Re-key with the STORED key pointer
+             * (not our fresh strdup) so the map's key pointer never changes —
+             * otherwise Verstable would adopt the new key and our free(key)
+             * below would free the live key (use-after-free). */
+            const char *stored_key = cbm_ht_get_key(map, key);
+            const char *cur = (const char *)cbm_ht_get(map, key);
+            char *combined = NULL;
+            if (stored_key && cur) {
+                size_t need = strlen(cur) + 1 + strlen(file_qn) + 1;
+                combined = malloc(need);
+                if (combined) {
+                    snprintf(combined, need, "%s\n%s", cur, file_qn);
+                    void *prev = cbm_ht_set(map, stored_key, combined);
+                    free(prev); /* old value string */
+                }
+            }
+            free(key);     /* our fresh strdup — never stored */
+            free(file_qn); /* content copied into combined */
         }
     }
     return map;
