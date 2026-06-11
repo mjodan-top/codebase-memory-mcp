@@ -149,7 +149,7 @@
           "name": "What is Hybrid LSP?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Hybrid LSP is a clean-room re-implementation of the type-resolution algorithms used by real language servers (tsserver, pyright, gopls, intelephense, Roslyn), embedded directly into the binary. It runs alongside tree-sitter to resolve imports, generics, inheritance, and stdlib types — so call edges in the graph mirror what an IDE 'Go to Definition' would resolve, with no language-server process or per-project setup."
+            "text": "Hybrid LSP is a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers (tsserver, pyright, gopls, Roslyn), embedded directly into the binary. It runs alongside tree-sitter to resolve imports, generics, inheritance, and stdlib types — so call edges in the graph mirror what an IDE 'Go to Definition' would resolve, with no language-server process or per-project setup."
           }
         },
         {
@@ -542,9 +542,10 @@
             three modules away, because it does not track imports, generics, inheritance, or stdlib types.
         </p>
         <p style="margin-bottom: 16px;">
-            codebase-memory-mcp ships a <strong>clean-room re-implementation of the type-resolution algorithms
-            used by real language servers</strong> — tsserver/typescript-go, pyright, gopls, intelephense, and
-            Roslyn — embedded directly into the single static C binary. There is no language-server process, no
+            codebase-memory-mcp ships a <strong>lightweight C implementation of language type-resolution
+            algorithms, structurally inspired by and compatible with major language servers</strong> —
+            tsserver/typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer —
+            embedded directly into the single static C binary. There is no language-server process, no
             per-project setup, and no API key. This layer runs alongside tree-sitter on every parse and refines
             <code>CALLS</code>, <code>USAGE</code>, and <code>RESOLVED_CALLS</code> edges with type information,
             so the graph mirrors what an IDE "Go to Definition" would resolve.

@@ -5,8 +5,8 @@
 ## Key facts
 
 - License: MIT, open source.
-- Languages: 159 (157 vendored tree-sitter grammars compiled into the binary).
-- Hybrid LSP type resolution: 9 language families (Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust) — clean-room re-implementation of tsserver, pyright, gopls, intelephense, Roslyn, Eclipse JDT, and rust-analyzer algorithms.
+- Languages: 159 (159 vendored tree-sitter grammars compiled into the binary).
+- Hybrid LSP type resolution: 9 language families (Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust) — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer.
 - MCP tools: 14 (search_graph incl. semantic_query vector search, trace_path (alias: trace_call_path), query_graph (Cypher), detect_changes, get_architecture, get_code_snippet, manage_adr, and more).
 - Semantic search: natural-language code discovery via bundled nomic-embed-code embeddings (768-dim, compiled into the binary); 11-signal combined scoring; fully local, no API key.
 - Semantic & similarity edges: SEMANTICALLY_RELATED (vocabulary-mismatch matches) and SIMILAR_TO (MinHash + LSH near-clone / duplicate detection).
