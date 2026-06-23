@@ -1202,6 +1202,16 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
     for (uint32_t ai = 0; ai < nc && ai < DECORATOR_SCAN_LIMIT; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg);
+        /* Kotlin wraps each annotation argument in a `value_argument` node
+         * (and supports the named form `value = "/x"`); unwrap to the string. */
+        if (strcmp(ak, "value_argument") == 0) {
+            TSNode s = cbm_find_child_by_kind(arg, "string_literal");
+            if (ts_node_is_null(s)) {
+                continue;
+            }
+            arg = s;
+            ak = ts_node_type(arg);
+        }
         if (strcmp(ak, "string") != 0 && strcmp(ak, "string_literal") != 0 &&
             strcmp(ak, "interpreted_string_literal") != 0) {
             continue;
@@ -1252,14 +1262,63 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
     return true;
 }
 
-/* Try to extract a route from a Java/JVM annotation node (`annotation` or
+/* Resolve an annotation's name node across grammars. Java exposes a `name`
+ * field; tree-sitter-kotlin does not — its annotation name lives in a nested
+ * type_identifier:
+ *   @Foo        -> (annotation (user_type (type_identifier)))
+ *   @Foo("/x")  -> (annotation (constructor_invocation (user_type (type_identifier))
+ *                                                      (value_arguments ...)))
+ * Returns a null node when no name can be resolved. */
+static TSNode annotation_name_node(TSNode annotation) {
+    TSNode name = ts_node_child_by_field_name(annotation, TS_FIELD("name"));
+    if (!ts_node_is_null(name)) {
+        return name;
+    }
+    TSNode ut = cbm_find_child_by_kind(annotation, "user_type");
+    if (ts_node_is_null(ut)) {
+        TSNode ci = cbm_find_child_by_kind(annotation, "constructor_invocation");
+        if (!ts_node_is_null(ci)) {
+            ut = cbm_find_child_by_kind(ci, "user_type");
+        }
+    }
+    if (!ts_node_is_null(ut)) {
+        TSNode ti = cbm_find_child_by_kind(ut, "type_identifier");
+        if (ts_node_is_null(ti)) {
+            ti = cbm_find_child_by_kind(ut, "simple_identifier");
+        }
+        return ti;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+/* Resolve an annotation's argument list across grammars. Kotlin keeps the args
+ * under a `constructor_invocation` child as a `value_arguments` node rather than
+ * the `arguments` field / `argument_list` child that Java exposes. */
+static TSNode annotation_args_node(TSNode annotation) {
+    TSNode args = ts_node_child_by_field_name(annotation, TS_FIELD("arguments"));
+    if (!ts_node_is_null(args)) {
+        return args;
+    }
+    args = find_decorator_args(annotation);
+    if (!ts_node_is_null(args)) {
+        return args;
+    }
+    TSNode ci = cbm_find_child_by_kind(annotation, "constructor_invocation");
+    if (!ts_node_is_null(ci)) {
+        return cbm_find_child_by_kind(ci, "value_arguments");
+    }
+    return args;
+}
+
+/* Try to extract a route from a Java/JVM/Kotlin annotation node (`annotation` or
  * `marker_annotation`). Spring mapping annotations carry the HTTP method in the
  * annotation name and the path in the (optional) argument list:
  *   @GetMapping("/orders")  @RequestMapping(value="/api")  @PostMapping
  * Returns true when the annotation is a route-mapping annotation. */
 static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char *source,
                                       const char **out_path, const char **out_method) {
-    TSNode name_node = ts_node_child_by_field_name(annotation, TS_FIELD("name"));
+    TSNode name_node = annotation_name_node(annotation);
     if (ts_node_is_null(name_node)) {
         return false;
     }
@@ -1268,10 +1327,7 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     if (!method) {
         return false;
     }
-    TSNode args = ts_node_child_by_field_name(annotation, TS_FIELD("arguments"));
-    if (ts_node_is_null(args)) {
-        args = find_decorator_args(annotation);
-    }
+    TSNode args = annotation_args_node(annotation);
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
         path = extract_route_path_from_args(a, args, source);

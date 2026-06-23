@@ -283,6 +283,30 @@ TEST(handles_spring_java) {
     PASS();
 }
 
+/* Spring (Kotlin) — @RequestMapping/@GetMapping on a Kotlin @RestController.
+ * REAL BUG: tree-sitter-kotlin annotation nodes have no `name` field (the name
+ * lives in a nested user_type/type_identifier) and carry args under a
+ * constructor_invocation `value_arguments` node, so the Java-shaped
+ * ts_node_child_by_field_name(annotation, "name") / "arguments" lookups in
+ * try_route_from_annotation missed every Kotlin Spring route → route_path never
+ * set → no Route/HANDLES. Fixed by annotation_name_node/annotation_args_node. */
+TEST(handles_spring_kotlin) {
+    static const EtFile f[] = {
+        {"OrderController.kt",
+         "package com.example\n\n"
+         "import org.springframework.web.bind.annotation.RequestMapping\n"
+         "import org.springframework.web.bind.annotation.GetMapping\n\n"
+         "@RequestMapping(\"/api\")\nclass OrderController {\n"
+         "    @GetMapping(\"/orders\")\n"
+         "    fun listOrders(): String {\n"
+         "        return \"orders\"\n    }\n\n"
+         "    @GetMapping(\"/orders/{id}\")\n"
+         "    fun getOrder(id: Int): String {\n"
+         "        return \"order:\" + id\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
+    PASS();
+}
+
 /* ASP.NET Minimal API (C#) — route registration via static MapGet/MapPost calls
  * with identifier handlers, under a Microsoft/AspNetCore path so the resolved
  * callee QN carries the "MapGet"/"Microsoft.AspNetCore" route-reg substrings.
@@ -1351,6 +1375,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
     RUN_TEST(handles_spring_java);
+    RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_rails_ruby);
