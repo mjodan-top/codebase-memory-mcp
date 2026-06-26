@@ -367,6 +367,21 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
 
     /* LSP-resolved calls take precedence over registry-textual matching. */
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call);
+    /* TEMP LSPJOIN DIAG — remove after diagnosing the 89-red LSP-strategy cluster. */
+    printf("[LSPJOIN] lang=%d enc=%s callee=%s lsp=%s arr_count=%d\n", (int)lang,
+           call->enclosing_func_qn ? call->enclosing_func_qn : "(null)",
+           call->callee_name ? call->callee_name : "(null)", lsp ? "HIT" : "miss",
+           lsp_calls ? lsp_calls->count : -1);
+    if (lsp_calls) {
+        for (int _k = 0; _k < lsp_calls->count && _k < 6; _k++) {
+            const CBMResolvedCall *_rc = &lsp_calls->items[_k];
+            printf("[LSPJOIN]   rc[%d] caller=%s callee_qn=%s strat=%s conf=%.2f\n", _k,
+                   _rc->caller_qn ? _rc->caller_qn : "(null)",
+                   _rc->callee_qn ? _rc->callee_qn : "(null)",
+                   _rc->strategy ? _rc->strategy : "(null)", _rc->confidence);
+        }
+    }
+    /* END TEMP LSPJOIN DIAG */
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
             cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn);
