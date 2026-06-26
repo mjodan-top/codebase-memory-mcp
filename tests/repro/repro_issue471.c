@@ -110,6 +110,10 @@
  *
  * Caller must free() the returned pointer.
  */
+/* __attribute__((unused)): on Windows the test body is SKIP_PLATFORM (the
+ * fork/alarm reproduction is POSIX-only), so this builder is unused there and
+ * would trip -Werror=unused-function. */
+static char *build_perl_nested_calls(int depth) __attribute__((unused));
 static char *build_perl_nested_calls(int depth) {
     /*
      * Header:        "sub f { return $_[0]; }\nmy $x = "   (~32 bytes)
