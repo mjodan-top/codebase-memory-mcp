@@ -834,22 +834,39 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         return module_qn;
     }
 
-    // Check if the function is inside a class — compute classQN.funcName
+    // Check if the function is inside a class — compute classQN.funcName.
+    // For nested classes the class QN must carry the FULL nesting chain
+    // (Outer.Inner, not just Inner) so it matches the class/method node QN the
+    // def walk produces via compute_class_qn (extract_defs.c). Qualifying with
+    // only the innermost class under-qualified the enclosing QN, so a call
+    // inside a nested-class method sourced to the file node instead of its
+    // method node and failed to join the LSP-resolved call by caller QN.
     const CBMLangSpec *spec = cbm_lang_spec(lang);
     if (spec && spec->class_node_types) {
-        TSNode cur = ts_node_parent(func_node);
-        while (!ts_node_is_null(cur)) {
-            if (cbm_kind_in_set(cur, spec->class_node_types)) {
-                TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
-                if (!ts_node_is_null(class_name)) {
-                    char *cname = cbm_node_text(a, class_name, source);
-                    if (cname && cname[0]) {
-                        const char *class_qn = cbm_fqn_compute(a, project, rel_path, cname);
-                        return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
-                    }
-                }
+        // Build the dotted class chain from the outermost enclosing class down
+        // to the innermost. Walk parents collecting class names innermost-first,
+        // then prepend each as we ascend so the result reads Outer.Inner.
+        const char *class_chain = NULL;
+        for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
+             cur = ts_node_parent(cur)) {
+            if (!cbm_kind_in_set(cur, spec->class_node_types)) {
+                continue;
             }
-            cur = ts_node_parent(cur);
+            TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
+            if (ts_node_is_null(class_name)) {
+                continue;
+            }
+            char *cname = cbm_node_text(a, class_name, source);
+            if (!cname || !cname[0]) {
+                continue;
+            }
+            class_chain = class_chain
+                              ? cbm_arena_sprintf(a, "%s.%s", cname, class_chain)
+                              : cname;
+        }
+        if (class_chain) {
+            const char *class_qn = cbm_fqn_compute(a, project, rel_path, class_chain);
+            return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
         }
     }
 

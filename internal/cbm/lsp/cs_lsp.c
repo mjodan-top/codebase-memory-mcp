@@ -1585,8 +1585,8 @@ static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
 }
 
 static void cs_resolve_object_creation(CSLSPContext *ctx, TSNode call) {
-    /* `new Foo(...)` adds an implicit Foo..ctor edge. We synth a constructor
-     * call to give the pipeline a high-confidence target when Foo is known. */
+    /* `new Foo(...)` adds an implicit constructor CALLS edge: to Foo's ctor
+     * Method node when one is indexed, otherwise to the Foo class node. */
     TSNode tnode = ts_node_child_by_field_name(call, "type", 4);
     if (ts_node_is_null(tnode)) return;
     const CBMType *t = cs_parse_type_node(ctx, tnode);
@@ -1594,14 +1594,24 @@ static void cs_resolve_object_creation(CSLSPContext *ctx, TSNode call) {
     if (t && t->kind == CBM_TYPE_NAMED) tqn = t->data.named.qualified_name;
     else if (t && t->kind == CBM_TYPE_TEMPLATE) tqn = t->data.template_type.template_name;
     if (!tqn) return;
-    const CBMRegisteredFunc *f = cs_lookup_method(ctx, tqn, ".ctor");
+    /* A C# constructor is extracted as a Method whose short name is the class's
+     * short name (the constructor_declaration `name` field is the class
+     * identifier), so the ctor QN is `<type_qn>.<ShortName>` — never ".ctor".
+     * Look it up by the class short name, mirroring the Java resolver. */
+    const char *dot = strrchr(tqn, '.');
+    const char *short_name = dot ? dot + 1 : tqn;
+    const CBMRegisteredFunc *f = cs_lookup_method(ctx, tqn, short_name);
     if (f) {
         cs_emit_resolved(ctx, f->qualified_name, "cs_ctor", 0.95f);
         return;
     }
-    /* Synthesize: Foo..ctor. */
-    cs_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s..ctor", tqn),
-                      "cs_ctor_synthetic", 0.50f);
+    /* No explicit constructor in the registry. Resolve the `new Foo()` call to
+     * the Foo CLASS node (`tqn`): its short name equals the call's textual
+     * callee_name ("Foo"), so the pipeline join matches, and the class node
+     * always exists, so a CALLS edge forms carrying the strategy — rather than
+     * the old `Foo..ctor`, whose ".ctor" short name joined nothing and resolved
+     * to no node. */
+    cs_emit_resolved(ctx, tqn, "cs_ctor_synthetic", 0.85f);
 }
 
 static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node) {

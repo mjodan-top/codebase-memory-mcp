@@ -2786,10 +2786,13 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
                 if (cf) {
                     java_emit_resolved(ctx, cf->qualified_name, "lsp_constructor", 0.95f);
                 } else {
-                    /* Synth a constructor QN — Class.Class — so downstream
-                     * still gets a resolvable edge. */
-                    java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", qn, short_name),
-                                       "lsp_constructor_synth", 0.85f);
+                    /* No explicit constructor in the registry, so there is no
+                     * `Class.Class` ctor node to point at. Resolve the `new Foo()`
+                     * call to the Foo CLASS node (`qn`) instead: its short name
+                     * equals the textual callee_name ("Foo"), so the pipeline
+                     * join matches, and the class node always exists, so a CALLS
+                     * edge forms carrying the strategy. */
+                    java_emit_resolved(ctx, qn, "lsp_constructor_synth", 0.85f);
                 }
             }
         }
