@@ -1421,6 +1421,7 @@ static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_c
         }
     }
 
+    rt.is_object = true; /* object / companion object → static-like member calls */
     cbm_registry_add_type((CBMTypeRegistry *)ctx->registry, rt);
 
     /* Recurse into body */
@@ -2435,8 +2436,15 @@ static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, 
             size_t recv_len = strlen(recv_qn);
             bool is_member = (strncmp(rf->qualified_name, recv_qn, recv_len) == 0 &&
                               rf->qualified_name[recv_len] == '.');
-            kt_emit_resolved(ctx, rf->qualified_name,
-                             is_member ? "lsp_kt_method" : "lsp_kt_extension", KT_CONF_METHOD);
+            const char *strat = "lsp_kt_extension";
+            if (is_member) {
+                /* A member call on an `object`/`companion object` singleton is a
+                 * static dispatch; on a regular class instance it is a method. */
+                const CBMRegisteredType *recv_rt =
+                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
+            }
+            kt_emit_resolved(ctx, rf->qualified_name, strat, KT_CONF_METHOD);
             if (rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&
                 rf->signature->data.func.return_types && rf->signature->data.func.return_types[0]) {
                 return rf->signature->data.func.return_types[0];
