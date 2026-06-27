@@ -164,13 +164,17 @@ TEST(repro_issue514_data_flow_surfaces_arg_expr) {
     /* The response must not be an error -- the node must be found. */
     ASSERT_NULL(strstr(resp, "function not found"));
 
-    /* The "callees" key must appear (direction=outbound always emits it). */
-    ASSERT_NOT_NULL(strstr(resp, "\"callees\""));
+    /* The response is the MCP tool-result envelope (inner json embedded as an
+     * escaped string value), so the "callees" key appears as \"callees\".
+     * Match the escaped form (see repro_issue480 / test_incremental's
+     * resp_has_key idiom). */
+    ASSERT_NOT_NULL(strstr(resp, "\\\"callees\\\""));
 
-    /* The callees array must be non-empty: "callee" must appear as a hop.
-     * If this fires RED, the CALLS traversal is broken (separate from #514). */
-    ASSERT_NULL(strstr(resp, "\"callees\":[]"));
-    ASSERT_NOT_NULL(strstr(resp, "\"callee\""));
+    /* The callees array must be non-empty: the callee's QN tail "service.callee"
+     * must appear as a hop (unambiguous + escaping-proof). RED if the CALLS
+     * traversal is broken (separate from #514). */
+    ASSERT_NULL(strstr(resp, "\\\"callees\\\":[]"));
+    ASSERT_NOT_NULL(strstr(resp, "service.callee"));
 
     /*
      * THE CORE ASSERTION FOR BUG #514:

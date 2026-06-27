@@ -141,26 +141,26 @@ TEST(repro_issue480_trace_path_nonempty_with_calls) {
      * start-node lookup as the breakage site. */
     ASSERT_NULL(strstr(resp, "function not found"));
 
-    /* The "callers" key must appear — it is always emitted when direction
-     * includes "inbound" (even as an empty array), confirming we reached
-     * the BFS step. */
-    ASSERT_NOT_NULL(strstr(resp, "\"callers\""));
+    /* The response is the MCP tool-result envelope
+     *   {"content":[{"type":"text","text":"<inner trace_path json>"}]}
+     * so the inner json is embedded as a STRING value and its quotes are
+     * backslash-escaped: the "callers" key appears as \"callers\" in the
+     * serialized response. Match the escaped form — the project's own
+     * passing trace_path tests (test_incremental.c, via resp_has_key) do the
+     * same. (The earlier unescaped strstr could never match a correctly
+     * escaped MCP envelope, which is why this repro was mis-targeted.)
+     *
+     * The "callers" key must appear (always emitted for inbound). */
+    ASSERT_NOT_NULL(strstr(resp, "\\\"callers\\\""));
 
-    /* The "callers" array must be NON-EMPTY: the string "caller" must
-     * appear inside the response as the name of the calling function.
-     *
-     * WHY RED on buggy code:
-     *   cbm_store_bfs() starts from nodes[sel].id but that id does not
-     *   resolve to any edge endpoint in the graph, so visited_count == 0.
-     *   bfs_to_json_array() serialises an empty JSON array [].
-     *   strstr(resp, "\"caller\"") returns NULL → ASSERT_NOT_NULL fails.
-     *
-     * The two-part check below distinguishes the two bug symptoms:
-     *   1. empty array  → "callers\":[]"  present, no "\"caller\"" entry
-     *   2. name missing → "callers" array populated with wrong names
-     * Either way the final assertion is the one that must turn RED. */
-    ASSERT_NULL(strstr(resp, "\"callers\":[]")); /* empty array = traversal bug */
-    ASSERT_NOT_NULL(strstr(resp, "\"caller\"")); /* caller name in results    */
+    /* The "callers" array must be NON-EMPTY. WHY RED on the #480 bug:
+     * cbm_store_bfs() returning 0 hops serialises \"callers\":[] (no caller
+     * QN in the response), so BOTH the empty-array guard and the caller-QN
+     * assertion fire RED. We assert the caller's qualified-name tail
+     * "main.caller" (unambiguous vs the callee "main.callee", and immune to
+     * escaping) so a populated, correctly-named caller hop is required. */
+    ASSERT_NULL(strstr(resp, "\\\"callers\\\":[]")); /* empty array = traversal bug */
+    ASSERT_NOT_NULL(strstr(resp, "main.caller"));    /* caller QN in results       */
 
     free(resp);
     rh_cleanup(&lp, store);
