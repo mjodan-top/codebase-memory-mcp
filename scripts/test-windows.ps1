@@ -1,22 +1,50 @@
 <#
 .SYNOPSIS
-    Run the native-Windows red-test suite for codebase-memory-mcp.
+    Run the native-Windows product-surface test suite for codebase-memory-mcp.
 
 .DESCRIPTION
-    Builds the production binary (build/c/codebase-memory-mcp.exe) if it is not
-    already present, then runs the deterministic Windows red tests under
-    tests/windows/. These tests reproduce platform-specific failures at the
-    product surface (real MCP process, real stdio, real SQLite DB).
+    Builds the product binary (build/c/codebase-memory-mcp.exe) if it is not
+    already present, then runs the deterministic Windows integration tests under
+    tests/windows/ against a real codebase-memory-mcp.exe (real stdio / CLI /
+    HTTP UI, real SQLite DB).
 
-    The unit/invariant C suite is built and run via Makefile.cbm. On native
-    Windows the MinGW/LLVM toolchain ships no libasan/libubsan, so the sanitizer
-    flags must be disabled for the local build (SANITIZE=). Where the toolchain
-    *does* provide AddressSanitizer/UBSan (Linux containers, WSL), prefer
-    scripts/test.sh which keeps the sanitizers on.
+    Two categories of test:
+
+      GUARDS      - regression guards for Windows bugs already fixed on main.
+                    They must stay GREEN (exit 0); a RED (exit 1) means the fix
+                    regressed and fails this runner.
+                      * test_non_ascii_path.py    guards #636/#357 (fixed by #700)
+                      * test_hook_augment.py      guards #618      (fixed by #619)
+                      * test_ui_drive_listing.py  guards #548      (roots field)
+
+      KNOWN REDS  - genuine, still-open Windows bugs reproduced at the product
+                    surface. They are EXPECTED to be RED (exit 1) and are opt-in
+                    (never gate CI). If one turns GREEN the underlying bug was
+                    fixed and it should be promoted to a guard.
+                      * test_cli_non_ascii_arg.py reproduces #423/#20 (narrow
+                        argv main() - no wide command line)
+
+    Determinism: indexing runs in-process (CBM_INDEX_SUPERVISOR=0). These tests
+    exercise path / hook / drive handling, not the index-supervisor subprocess
+    path; the pass-level readers (#700's cbm_fopen routing) run in-process either
+    way, so the guard coverage is identical while results stay independent of the
+    local toolchain's worker-spawn behavior.
+
+    On native Windows the MinGW/LLVM toolchain ships no libasan/libubsan, so the
+    build disables sanitizers (SANITIZE=). Where the toolchain provides
+    AddressSanitizer/UBSan (Linux containers, WSL), prefer scripts/test.sh.
 
 .PARAMETER Binary
-    Path to an existing codebase-memory-mcp.exe. If omitted, the script looks for
-    build/c/codebase-memory-mcp.exe and builds it when missing.
+    Path to an existing codebase-memory-mcp.exe. If omitted, the script builds it
+    (target selected by -Target) into build/c/.
+
+.PARAMETER Target
+    Makefile.cbm target used when building: 'cbm-with-ui' (default; needed for the
+    drive-picker guard's embedded HTTP UI) or 'cbm' (no UI - the drive guard then
+    reports a precondition and is skipped).
+
+.PARAMETER GuardsOnly
+    Run only the green guards (the CI gate). Skips the opt-in known-red repros.
 
 .PARAMETER Make
     Path to GNU make (default: 'make' on PATH; MSYS2 ships it at
@@ -24,10 +52,15 @@
 
 .EXAMPLE
     pwsh -File scripts/test-windows.ps1
+.EXAMPLE
+    pwsh -File scripts/test-windows.ps1 -GuardsOnly -Binary build\c\codebase-memory-mcp.exe
 #>
 [CmdletBinding()]
 param(
     [string]$Binary,
+    [ValidateSet("cbm-with-ui", "cbm")]
+    [string]$Target = "cbm-with-ui",
+    [switch]$GuardsOnly,
     [string]$Make = "make"
 )
 
@@ -37,7 +70,7 @@ Set-Location $repoRoot
 
 $python = (Get-Command python -ErrorAction SilentlyContinue)
 if (-not $python) { $python = (Get-Command py -ErrorAction SilentlyContinue) }
-if (-not $python) { throw "Python 3 is required to run the Windows red tests." }
+if (-not $python) { throw "Python 3 is required to run the Windows tests." }
 $py = $python.Source
 
 # A writable Windows temp dir that GNU make forwards to the native gcc. MSYS2
@@ -51,8 +84,8 @@ function Resolve-Binary {
     if ($Explicit) { return (Resolve-Path $Explicit).Path }
     $built = Join-Path $repoRoot "build\c\codebase-memory-mcp.exe"
     if (Test-Path $built) { return $built }
-    Write-Host "Building production binary via Makefile.cbm ..." -ForegroundColor Cyan
-    & $Make "-j" "-f" "Makefile.cbm" "cbm" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp"
+    Write-Host "Building $Target via Makefile.cbm ..." -ForegroundColor Cyan
+    & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp"
     if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
     if (-not (Test-Path $built)) { throw "binary not produced at $built" }
     return $built
@@ -61,45 +94,73 @@ function Resolve-Binary {
 $bin = Resolve-Binary -Explicit $Binary
 Write-Host "Binary: $bin" -ForegroundColor Green
 
-$env:PYTHONUTF8 = "1"   # ensure the harness encodes argv/stdio as UTF-8
+$env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
+$env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
 
-# test_ui_drive_listing.py reproduces the UI directory-picker bug (#548) and
-# therefore needs a UI build (make -f Makefile.cbm cbm-with-ui) plus a machine
-# with more than one drive. Against a non-UI binary it reports a precondition
-# (exit 2), which is treated as a skip-with-reason, not a failure.
-$tests = @(
+# Green regression guards - must stay GREEN (exit 0). RED (exit 1) = the fix for
+# the referenced issue regressed. The drive-picker guard needs the embedded HTTP
+# UI (build target cbm-with-ui); against a non-UI binary it reports a precondition
+# (exit 2) and is skipped rather than failed.
+$guards = @(
     "tests\windows\test_non_ascii_path.py",
-    "tests\windows\test_cli_non_ascii_arg.py",
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py"
 )
 
-$reds = @()
-$precond = @()
-foreach ($t in $tests) {
+# Opt-in known-red repros - EXPECTED red (exit 1); never gate CI.
+$knownReds = @(
+    "tests\windows\test_cli_non_ascii_arg.py"
+)
+
+$guardFailures = @()
+$guardSkips = @()
+$fixedKeepers = @()
+
+Write-Host "`n--- Green guards ---" -ForegroundColor Cyan
+foreach ($t in $guards) {
     Write-Host "`n=== $t ===" -ForegroundColor Cyan
     & $py $t $bin
     $code = $LASTEXITCODE
     if ($code -eq 0) {
         Write-Host "GREEN ($t)" -ForegroundColor Green
     } elseif ($code -eq 1) {
-        Write-Host "RED ($t) - Windows-specific failure reproduced" -ForegroundColor Red
-        $reds += $t
+        Write-Host "RED ($t) - REGRESSION: a fixed Windows bug is broken again" -ForegroundColor Red
+        $guardFailures += $t
     } else {
         Write-Host "PRECONDITION ($t) exit=$code - skipped (see message above)" -ForegroundColor Yellow
-        $precond += $t
+        $guardSkips += $t
+    }
+}
+
+if (-not $GuardsOnly) {
+    Write-Host "`n--- Known reds (opt-in, expected red) ---" -ForegroundColor Cyan
+    foreach ($t in $knownReds) {
+        Write-Host "`n=== $t ===" -ForegroundColor Cyan
+        & $py $t $bin
+        $code = $LASTEXITCODE
+        if ($code -eq 1) {
+            Write-Host "RED ($t) - expected; the underlying Windows bug is still open" -ForegroundColor DarkYellow
+        } elseif ($code -eq 0) {
+            Write-Host "GREEN ($t) - the bug appears FIXED; promote this to a guard" -ForegroundColor Green
+            $fixedKeepers += $t
+        } else {
+            Write-Host "PRECONDITION ($t) exit=$code - skipped (see message above)" -ForegroundColor Yellow
+        }
     }
 }
 
 Write-Host ""
-if ($precond.Count -gt 0) {
-    Write-Host ("Precondition-skipped: {0} (e.g. test_ui_drive_listing needs a UI " -f $precond.Count) -ForegroundColor Yellow
-    Write-Host "build: make -f Makefile.cbm cbm-with-ui, and >1 drive)." -ForegroundColor Yellow
+if ($guardSkips.Count -gt 0) {
+    Write-Host ("Guards skipped (precondition): {0} - e.g. the drive-picker guard " -f $guardSkips.Count) -ForegroundColor Yellow
+    Write-Host "needs a UI build (-Target cbm-with-ui, the default)." -ForegroundColor Yellow
 }
-if ($reds.Count -gt 0) {
-    Write-Host ("RED suite: {0} Windows red tests reproduced platform failures " -f $reds.Count) -ForegroundColor Red
-    Write-Host "(expected until fixed). See tests/windows/RED_TEST_ANALYSIS.md." -ForegroundColor Red
+if ($fixedKeepers.Count -gt 0) {
+    Write-Host ("Known-red repros that are now GREEN (promote to guards): {0}" -f ($fixedKeepers -join ", ")) -ForegroundColor Green
+}
+if ($guardFailures.Count -gt 0) {
+    Write-Host ("REGRESSION: {0} green guard(s) went red: {1}" -f $guardFailures.Count, ($guardFailures -join ", ")) -ForegroundColor Red
+    Write-Host "A previously-fixed Windows bug is broken again. See tests/windows/RED_TEST_ANALYSIS.md." -ForegroundColor Red
     exit 1
 }
-Write-Host "All runnable Windows red tests are GREEN." -ForegroundColor Green
+Write-Host "All Windows green guards passed." -ForegroundColor Green
 exit 0

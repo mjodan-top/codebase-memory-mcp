@@ -1,29 +1,26 @@
-"""RED integration test — Windows non-ASCII repo path drops all definitions.
+"""GREEN regression guard — non-ASCII repo paths keep all definitions on Windows.
 
-Reproduces issue #636 / #357 at the product surface (real codebase-memory-mcp
-process, real SQLite DB, real stdio). Two byte-identical TypeScript fixtures are
-indexed: one under an ASCII parent path, one under a non-ASCII parent path. The
-invariant under test:
+Guards the fix for issue #636 / #357 (landed on main via #700) at the product
+surface (real codebase-memory-mcp process, real SQLite DB, real stdio). Two
+byte-identical TypeScript fixtures are indexed: one under an ASCII parent path,
+one under a non-ASCII parent path. The invariant under test:
 
     A byte-identical fixture must produce equivalent graph counts regardless of
     whether its absolute path contains non-ASCII characters.
 
-Observed on native Windows: the ASCII copy extracts functions/classes/methods
-(12 nodes / 20 edges); every non-ASCII copy (Latin-1 accents, Cyrillic, CJK,
-Greek) extracts only File/Folder nodes (5 nodes / 4 edges) — zero definitions.
+Before #700 native Windows extracted only File/Folder nodes for every non-ASCII
+copy (Latin-1 accents, Cyrillic, CJK, Greek) — zero definitions — while the ASCII
+copy extracted functions/classes/methods. Root cause: each pipeline pass read
+source bytes with plain fopen(path, "rb") (src/pipeline/pass_definitions.c,
+pass_calls.c, …); on Windows fopen() interprets the UTF-8 path in the active ANSI
+code page, so a non-ASCII path could not be opened and the parser received
+nothing. #700 routed the per-pass reads through cbm_fopen (→ _wfopen with a wide
+path, src/foundation/compat_fs.c), so non-ASCII paths now parse identically.
 
-Root cause: each pipeline pass reads source bytes with plain fopen(path, "rb")
-(src/pipeline/pass_definitions.c, pass_calls.c, pass_parallel.c, pass_semantic.c,
-…). On Windows fopen() interprets the UTF-8 path in the active ANSI code page,
-so a path with non-ASCII bytes cannot be opened and the parser receives nothing.
-Directory discovery already uses the wide API (cbm_utf8_to_wide + FindFirstFileW
-in src/foundation/compat_fs.c), which is why File/Folder nodes still appear.
+This guard fails (red) if that fix regresses. It also passes on Linux/macOS
+(byte-transparent UTF-8 filesystem).
 
-This test passes on Linux/macOS (byte-transparent UTF-8 filesystem) and fails on
-native Windows. It turns green once the per-pass read_file helpers convert the
-UTF-8 path to wide (_wfopen) the way compat_fs.c / platform.c already do.
-
-Exit code: 0 == invariant holds (green), 1 == invariant violated (red),
+Exit code: 0 == invariant holds (green), 1 == invariant violated (regression),
 2 == environment/setup error.
 
 Usage:
@@ -153,10 +150,12 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
     if failures:
-        print("\nRED: %d/%d non-ASCII path variants lost definitions: %s" %
+        print("\nREGRESSION (red): %d/%d non-ASCII path variants lost "
+              "definitions: %s" %
               (len(failures), len(NON_ASCII_SEGMENTS), ", ".join(failures)))
         print("Invariant violated: byte-identical fixtures under non-ASCII paths "
-              "must extract the same definitions as the ASCII baseline.")
+              "must extract the same definitions as the ASCII baseline (fixed by "
+              "#700 — has the cbm_fopen routing in the pass readers regressed?).")
         return 1
     print("\nGREEN: all non-ASCII path variants matched the ASCII baseline.")
     return 0

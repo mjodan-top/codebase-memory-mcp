@@ -1,29 +1,25 @@
-r"""RED integration test — the PreToolUse hook augmenter is a no-op on Windows.
+r"""GREEN regression guard — the PreToolUse hook augmenter fires on Windows.
 
-Reproduces issue #618 at the product surface.
+Guards the fix for issue #618 (landed on main via #619) at the product surface.
 
 `codebase-memory-mcp hook-augment` is the non-blocking Claude Code PreToolUse
 Grep/Glob augmenter: given a hook payload it should emit a `hookSpecificOutput`
 with `additionalContext` listing graph symbols that match the searched token.
 
-On Windows it emits nothing for every payload. `src/cli/hook_augment.c` gates on
-POSIX-style absolute paths in two places:
-
-    cbm_cmd_hook_augment (_WIN32 branch):  if (!cwd || cwd[0] != '/') return 0;
-    ha_resolve_and_query walk-up loop:     for (... ; dir[0] == '/'; ...)
-
-A Windows `cwd` is a drive-letter path (`C:\...` / `C:/...`), so `cwd[0]` is
-never `'/'`; the augmenter bails before it ever queries the graph.
+Before #619 it emitted nothing for every payload on Windows: `src/cli/hook_augment.c`
+gated on POSIX-style absolute paths (`cwd[0] == '/'` and a walk-up loop over
+`dir[0] == '/'`). A Windows `cwd` is a drive-letter path (`C:\...` / `C:/...`),
+so `cwd[0]` was never `'/'` and the augmenter bailed before querying the graph.
+#619 added `cbm_is_walkable_abs_path` (accepts `X:/` drive-letter roots), so the
+augmenter now fires for a drive-letter cwd.
 
 This test indexes a repo with a known symbol, confirms `search_graph` finds it
 (control — proves the index and project name are fine), then invokes
 `hook-augment` exactly as the installed PreToolUse hook does and asserts a
-`hookSpecificOutput` payload is produced.
+`hookSpecificOutput` payload is produced. It fails (red) if that fix regresses.
+Also passes on Linux/macOS (`cwd` starts with `/`).
 
-Passes on Linux/macOS (`cwd` starts with `/`). Fails on native Windows until the
-path guards accept drive-letter absolute paths (and the walk-up loop climbs them).
-
-Exit code: 0 == augmenter fired (green), 1 == no-op (red), 2 == setup error.
+Exit code: 0 == augmenter fired (green), 1 == no-op (regression), 2 == setup error.
 
 Usage:
     python test_hook_augment.py <path-to-codebase-memory-mcp[.exe]>
@@ -101,8 +97,9 @@ def main():
         if fired:
             print("\nGREEN: PreToolUse augmenter emitted additionalContext.")
             return 0
-        print("\nRED: hook-augment produced no hookSpecificOutput on Windows "
-              "(drive-letter cwd fails the cwd[0]=='/' guards in hook_augment.c).")
+        print("\nREGRESSION (red): hook-augment produced no hookSpecificOutput on "
+              "Windows (drive-letter cwd rejected — has the #619 "
+              "cbm_is_walkable_abs_path handling in hook_augment.c regressed?).")
         return 1
     finally:
         shutil.rmtree(work, ignore_errors=True)

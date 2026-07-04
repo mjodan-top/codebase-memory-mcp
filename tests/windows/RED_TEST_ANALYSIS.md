@@ -1,48 +1,76 @@
-# Windows Red-Test Analysis
+# Windows Test Analysis
 
-Deterministic, Windows-only red tests found during a native-Windows red-test
-campaign. They reproduce platform-specific failures at the product surface and
-are intended as regression guards while the underlying issues are fixed in
-separate maintainer PRs. **This PR contains no production fixes.**
+Deterministic, Windows-only integration tests found during a native-Windows
+red-test campaign. They drive the product surface (a real `codebase-memory-mcp.exe`
+over stdio / CLI / HTTP UI, real SQLite DB) and pass on Linux/macOS.
+
+Three of the four originally-red findings have since been fixed on `main` and are
+kept here as **green regression guards** (they go red again only if the fix
+regresses). The fourth is a genuine, still-open Windows bug kept as a **known red**.
+
+| Test | Issue | Status |
+|---|---|---|
+| `test_non_ascii_path.py` | #636 / #357 | GREEN guard - fixed by #700 (`cbm_fopen` routing in the pass readers) |
+| `test_hook_augment.py` | #618 | GREEN guard - fixed by #619 (`cbm_is_walkable_abs_path` accepts `X:/`) |
+| `test_ui_drive_listing.py` | #548 | GREEN guard - fixed (drives exposed via the `roots` field) |
+| `test_cli_non_ascii_arg.py` | #423 / #20 | RED (open) - `main()` is still narrow-argv, no wide command line |
+
+The three green guards are wired into CI via the `test-windows-guards` job in
+`.github/workflows/_test.yml` (build the product+UI binary, run the guards with
+`-GuardsOnly`) so #700 / #619 / #548 stay enforced. The known red is opt-in and
+never gates CI. **This PR contains no production fixes.**
 
 ## Environment
 
 - OS: Microsoft Windows 11 Pro, build 10.0.26200
-- Source build: MinGW-w64 GCC 15.2.0 (MSYS2), `make -f Makefile.cbm cbm`
-- Filesystem: NTFS, code page 65001 (UTF-8 console)
+- Source build: MinGW-w64 GCC 15.2.0 (MSYS2), `make -f Makefile.cbm cbm-with-ui`
+- Filesystem: NTFS, code page 65001 (UTF-8 console); drives `C:`, `D:`, `E:`
 - Shells/launchers exercised: PowerShell 5.1 (5.1.26100), `cmd.exe`,
   Git Bash (MSYS2), direct Win32 process launch, Python `subprocess.Popen`,
   Python stdio (line-delimited JSON-RPC) transport
-- CBM source commit under test: `b075f05`
-- Binary: `build/c/codebase-memory-mcp.exe` (production build)
+- Findings first captured at `b075f05`; re-verified after rebasing onto current
+  `main` (this is where the three now-fixed cases were confirmed green)
+- Binary: `build/c/codebase-memory-mcp.exe` (product build, with embedded UI)
+
+### Determinism note (index supervisor)
+
+The guards drive indexing in-process via the `CBM_INDEX_SUPERVISOR=0` kill switch
+(set by `scripts/test-windows.ps1`). The passes under test (`#700`'s `cbm_fopen`
+routing) run in-process either way, so guard coverage is identical, while results
+stay independent of the index-supervisor's separate worker process (whose spawn
+behavior varies by local toolchain). The drive-picker guard does not index at all.
 
 ### Sanitizer note
 
 The MinGW/LLVM toolchain available on this machine ships **no** `libasan` /
-`libubsan`, so an AddressSanitizer/UBSan build is not possible natively (the plan
-anticipates this). The C unit/invariant suite (`build/c/test-runner`) was built
-with `SANITIZE=` and runs; the two red tests below are product-level integration
-tests that drive a real `codebase-memory-mcp.exe` over stdio. On a host where the
-toolchain provides sanitizers (Linux container, WSL), the same fixtures should be
-run through an ASan/UBSan binary via `scripts/test.sh`.
+`libubsan`, so an AddressSanitizer/UBSan build is not possible natively. These are
+product-level integration tests that drive a real `codebase-memory-mcp.exe`; the
+sanitizer C suite is a separate concern (the `test-windows` CI job / `scripts/test.sh`).
 
 ## How to run
 
 ```powershell
-# Builds build/c/codebase-memory-mcp.exe if missing, then runs the red suite.
+# Builds build/c/codebase-memory-mcp.exe (with UI) if missing, then runs the suite.
 pwsh -File scripts/test-windows.ps1
+# only the green guards (the CI gate):
+pwsh -File scripts/test-windows.ps1 -GuardsOnly
 # or, against an installed/relocated binary:
 pwsh -File scripts/test-windows.ps1 -Binary "C:\path\to\codebase-memory-mcp.exe"
 ```
 
-Each test exits `0` (green / invariant holds), `1` (red / Windows failure
-reproduced), or `2` (environment/setup error). Standard-library Python 3 only.
+Each test exits `0` (green), `1` (red), or `2` (precondition/setup). A guard that
+exits `1` fails the runner (regression); a known red that exits `0` is flagged for
+promotion. Standard-library Python 3 only.
 
 ---
 
 ## windows_non_ascii_repo_path_preserves_definitions
 
-- Class: integration
+**Status: GREEN guard - fixed by #700.** The text below describes the original
+red (at `b075f05`); the closing note records the landed fix. The "Actual" counts
+are the pre-fix observation.
+
+- Class: integration (green regression guard)
 - Test: `tests/windows/test_non_ascii_path.py`
 - Related issues: #636, #357, #571 (naming), #530
 - Environment: Windows 11 26200, PowerShell 5.1 / Python stdio, NTFS, CP 65001
@@ -80,14 +108,21 @@ reproduced), or `2` (environment/setup error). Standard-library Python 3 only.
 Verified with `_wfopen` vs `fopen` on a non-ASCII path: `fopen(utf8, "rb")`
 returns `NULL`, `_wfopen(cbm_utf8_to_wide(utf8), L"rb")` opens the same file.
 
-This invariant holds on Linux/macOS (byte-transparent UTF-8 filesystem); the test
-turns green once the pass readers convert to wide.
+**Fix landed (#700):** the per-pass readers now go through `cbm_fopen`, which on
+Windows converts the UTF-8 path to wide and calls `_wfopen` (`src/foundation/compat_fs.c`).
+Re-verified green on current `main`: every non-ASCII variant now matches the ASCII
+baseline (12 nodes / 22 edges / 5 definitions). This invariant also holds on
+Linux/macOS (byte-transparent UTF-8 filesystem).
 
 ---
 
 ## windows_cli_non_ascii_repo_path_is_honored
 
-- Class: integration
+**Status: RED (still open) - the keeper.** Re-verified on current `main`:
+`main()` (`src/main.c`) is still `int main(int argc, char **argv)` with no
+`wmain` / `GetCommandLineW`, so this remains genuinely red. Opt-in; not a CI gate.
+
+- Class: integration (known red)
 - Test: `tests/windows/test_cli_non_ascii_arg.py`
 - Related issues: #636, #423, #20
 - Environment: Windows 11 26200, `cli` argv path, NTFS, CP 65001
@@ -123,7 +158,10 @@ flows that shell out to it, not the stdio server path. Holds on Linux/macOS
 
 ## windows_hook_augment_emits_context
 
-- Class: integration
+**Status: GREEN guard - fixed by #619.** The text below describes the original
+red (at `b075f05`); the closing note records the landed fix.
+
+- Class: integration (green regression guard)
 - Test: `tests/windows/test_hook_augment.py`
 - Related issues: #618
 - Environment: Windows 11 26200, `hook-augment` CLI subcommand
@@ -147,16 +185,26 @@ flows that shell out to it, not the stdio server path. Holds on Linux/macOS
   walk-up loop (~L254): `for (...; dir[0] == '/'; ...)`. A Windows `cwd` is a
   drive-letter path (`C:\...` / `C:/...`), so `cwd[0]` is never `'/'`; the
   augmenter bails before it queries the graph. The PreToolUse Grep/Glob graph
-  augmentation therefore never fires on Windows. Fix direction: accept
-  drive-letter absolute paths (and climb them in the walk-up loop).
+  augmentation therefore never fires on Windows.
 
-Holds on Linux/macOS (`cwd` starts with `/`).
+**Fix landed (#619):** `hook_augment.c` now uses `cbm_is_walkable_abs_path`, which
+accepts a drive-letter root (`X:/`) in addition to POSIX `/`, and the walk-up loop
+climbs it. Re-verified green on current `main`: `hook-augment` emits the
+`hookSpecificOutput` / `additionalContext` payload for a drive-letter `cwd`. Also
+holds on Linux/macOS (`cwd` starts with `/`).
 
 ---
 
 ## windows_ui_picker_reaches_all_drives
 
-- Class: integration
+**Status: GREEN guard - fixed.** The original red asserted drives appear in the
+`dirs` array; the landed fix intentionally exposes them via a separate `roots`
+field, so that assertion would stay red against fixed code. The test was
+**rewritten** to guard the real invariant (every fixed drive is advertised in
+`roots` and is browsable). The text below describes the original red; the closing
+note records the fix and the rewrite.
+
+- Class: integration (green regression guard)
 - Test: `tests/windows/test_ui_drive_listing.py`
 - Related issues: #548
 - Environment: Windows 11 26200 with drives `C:\`, `D:\`, `E:\`; UI build
@@ -177,18 +225,22 @@ Holds on Linux/macOS (`cwd` starts with `/`).
   RED: drives ['D:\\', 'E:\\'] are not reachable from the UI root picker
   ```
 
-- Suspected implementation area: `handle_browse` in `src/ui/http_server.c` does
-  `opendir(path)` for the requested path. For the root it lists only the current
-  drive's contents and never enumerates the logical drives
-  (`GetLogicalDriveStrings`). Fix direction: when the path is the filesystem root
-  on Windows, return the available drive letters as the directory list so the
-  picker can descend into any drive.
+- Suspected implementation area: `handle_browse` in `src/ui/http_server.c` did
+  `opendir(path)` for the requested path and, for the root, listed only the
+  current drive's contents with no logical-drive enumeration.
+
+**Fix landed (#548):** `handle_browse` now calls `append_roots_json`, which on
+Windows enumerates `GetLogicalDrives()` into a `"roots":["C:/","D:/",...]` array
+appended to every `/api/browse` response (POSIX emits `"/"`). The rewritten guard
+asserts every fixed drive is present in `roots` and that `GET /api/browse?path=X:/`
+returns for it. Re-verified green on current `main` (drives `C:`/`D:`/`E:`):
+`roots=['C:/','D:/','E:/']`, all reachable.
 
 This test requires a UI build because the HTTP server only starts when the
-frontend is embedded (`CBM_EMBEDDED_FILE_COUNT > 0`); against a non-UI binary it
-reports a precondition (exit 2), and on a single-drive machine it is not
-meaningful (exit 2). Holds on Linux/macOS (a single `/` root with no drive
-letters).
+frontend is embedded; against a non-UI binary it reports a precondition (exit 2).
+The `roots` check is meaningful even on a single-drive machine (the system drive
+must be advertised and browsable), so it also gates on single-drive CI runners.
+Holds on Linux/macOS (a single `/` root).
 
 ---
 
