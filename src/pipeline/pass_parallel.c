@@ -1393,6 +1393,16 @@ typedef struct {
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
 
+    /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
+     * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
+     * all filter to subsets never pay the O(all_defs) build + multi-GB RSS. Built
+     * under rust_shared_mu into rust_shared_arena, published via rust_shared_reg;
+     * torn down after the worker dispatch. */
+    _Atomic(CBMTypeRegistry *) rust_shared_reg;
+    cbm_mutex_t rust_shared_mu;
+    CBMArena rust_shared_arena;
+    bool rust_shared_arena_live;
+
     /* Counters for parallel.resolve.lsp_cross_done summary. */
     _Atomic int lsp_cross_processed;
     _Atomic int lsp_cross_skipped_no_source;
@@ -2546,6 +2556,34 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
     }
 }
 
+/* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by the
+ * first worker that hits a NULL-filter rust file; later null-files reuse it. Fast
+ * path is a lock-free atomic load; the build happens under rust_shared_mu into the
+ * dedicated rust_shared_arena (never a shared pipeline arena from a worker thread).
+ * Returns NULL if there are no defs (caller falls back to the per-file build). */
+static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
+    CBMTypeRegistry *p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_acquire);
+    if (p)
+        return p;
+    if (!rc->all_defs || rc->def_count <= 0)
+        return NULL;
+    cbm_mutex_lock(&rc->rust_shared_mu);
+    p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_relaxed);
+    if (!p) {
+        cbm_arena_init(&rc->rust_shared_arena);
+        rc->rust_shared_arena_live = true;
+        p = cbm_rust_build_cross_registry(&rc->rust_shared_arena, rc->all_defs, rc->def_count);
+        if (p) {
+            char sb[96];
+            snprintf(sb, sizeof(sb), "types=%d funcs=%d", p->type_count, p->func_count);
+            cbm_log_info("cross_lsp.rust_registry", "scale", sb);
+        }
+        atomic_store_explicit(&rc->rust_shared_reg, p, memory_order_release);
+    }
+    cbm_mutex_unlock(&rc->rust_shared_mu);
+    return p;
+}
+
 static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
@@ -2738,36 +2776,6 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                             result->cached_tree, &result->resolved_calls);
                         used_prebuilt = true;
                         break;
-                    case CBM_LANG_RUST: {
-                        /* Byte-identity-preserving Tier-2. The rust per-file build uses
-                         * all_defs ONLY when the filter returns NULL (the ~90s amplifier
-                         * files, e.g. rust kernel modules); those share the once-built all_defs
-                         * registry. Files that filter to a SUBSET (the majority) resolve
-                         * against that subset today, so they keep their per-file build —
-                         * feeding them the shared all_defs registry would be a SUPERSET and
-                         * could change the graph. (See report cc799e17.) Both paths read the
-                         * same worker-thread manifest as the fallback. */
-                        CBMLSPDef *r_filtered = NULL;
-                        int r_fc = 0;
-                        if (rc->module_def_index) {
-                            r_filtered = cbm_pxc_filter_defs_for_file(
-                                rc->module_def_index, rc->all_defs, lang, result->namespace_name,
-                                def_module, imp_vals, imp_count, &r_fc);
-                        }
-                        if (!r_filtered) {
-                            cbm_run_rust_lsp_cross_with_registry(
-                                &result->arena, lsp_source, lsp_source_len, def_module, prebuilt,
-                                imp_keys, imp_vals, imp_count, result->cached_tree,
-                                cbm_pxc_get_rust_manifest(), &result->resolved_calls,
-                                /*result=*/NULL);
-                        } else {
-                            cbm_pxc_run_one(lang, result, lsp_source, lsp_source_len, def_module,
-                                            r_filtered, r_fc, imp_keys, imp_vals, imp_count);
-                            free(r_filtered);
-                        }
-                        used_prebuilt = true;
-                        break;
-                    }
                     case CBM_LANG_CSHARP:
                         cbm_run_cs_lsp_cross_with_registry(
                             &result->arena, lsp_source, lsp_source_len, def_module, prebuilt,
@@ -2828,8 +2836,26 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                             file_def_count = filtered_count;
                         }
                     }
-                    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
-                        lang == CBM_LANG_TSX) {
+                    if (lang == CBM_LANG_RUST && !filtered) {
+                        /* Rust NULL-filter file (the ~all_defs amplifier) → resolve against
+                         * the LAZILY-built shared registry instead of rebuilding all_defs
+                         * per file. Byte-identical: a per-file all_defs build == the shared
+                         * all_defs build (def_module_qn always set). SUBSET rust files
+                         * (filtered != NULL) fall to the per-file build below, unchanged.
+                         * Manifest via the getter = same value cbm_pxc_run_one reads here. */
+                        CBMTypeRegistry *shared = pp_rust_shared_registry(rc);
+                        if (shared) {
+                            cbm_run_rust_lsp_cross_with_registry(
+                                &result->arena, lsp_source, lsp_source_len, def_module, shared,
+                                imp_keys, imp_vals, imp_count, result->cached_tree,
+                                cbm_pxc_get_rust_manifest(), &result->resolved_calls,
+                                /*result=*/NULL);
+                        } else {
+                            cbm_pxc_run_one(lang, result, lsp_source, lsp_source_len, def_module,
+                                            file_defs, file_def_count, imp_keys, imp_vals, imp_count);
+                        }
+                    } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                               lang == CBM_LANG_TSX) {
                         bool js, jsx, dts;
                         cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
                         cbm_pxc_run_one_ts(result, lsp_source, lsp_source_len, def_module,
@@ -2968,6 +2994,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
     atomic_init(&rc.lsp_cross_skipped_no_source, 0);
+    /* F4 lazy shared Rust registry: mutex up before workers spawn. */
+    atomic_init(&rc.rust_shared_reg, NULL);
+    cbm_mutex_init(&rc.rust_shared_mu);
+    rc.rust_shared_arena_live = false;
 
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
@@ -2975,6 +3005,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
+    /* Workers joined: the shared Rust registry (if built) is no longer read.
+     * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
+     * all QNs, so freeing all_defs afterward is safe). */
+    if (rc.rust_shared_arena_live) {
+        cbm_arena_destroy(&rc.rust_shared_arena);
+        rc.rust_shared_arena_live = false;
+    }
+    cbm_mutex_destroy(&rc.rust_shared_mu);
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);

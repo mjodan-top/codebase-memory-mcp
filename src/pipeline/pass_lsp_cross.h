@@ -108,7 +108,8 @@ typedef struct {
     CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
-    CBMTypeRegistry *rust;   /* CBM_LANG_RUST */
+    /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
+     * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
 
 /* Return the appropriate pre-built registry for a language, or NULL
@@ -134,10 +135,8 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
         return r->php;
     case CBM_LANG_CSHARP:
         return r->cs;
-    case CBM_LANG_RUST:
-        return r->rust;
     default:
-        return NULL;
+        return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
     }
 }
 

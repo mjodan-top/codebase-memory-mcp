@@ -903,13 +903,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        cross_registries.rust = cbm_rust_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        if (cross_registries.rust) {
-            char _rsb[96];
-            snprintf(_rsb, sizeof(_rsb), "types=%d funcs=%d", cross_registries.rust->type_count,
-                     cross_registries.rust->func_count);
-            cbm_log_info("cross_lsp.rust_registry", "scale", _rsb);
-        }
+        /* Rust: NOT built here. The shared all_defs registry is built LAZILY on the
+         * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
+         * — repos whose rust files all filter to subsets never pay the build/RSS. */
     }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
