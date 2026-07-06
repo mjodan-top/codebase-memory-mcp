@@ -1594,12 +1594,18 @@ DL_ARCHIVE_UI="codebase-memory-mcp-ui-${DL_OS}-${DL_ARCH}.${DL_EXT}"
 
 # 12a: curl download (try standard, then UI variant)
 echo "--- Phase 12a: curl download ---"
-if ! curl -fSL -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>/dev/null; then
+# --noproxy '*': never route the local test server through a proxy — a proxy env
+# var present on some runners (notably windows-11-arm) made curl fail to reach
+# 127.0.0.1 while the app's own downloader (WinHTTP) bypassed it. On failure,
+# surface curl's stderr instead of swallowing it so the reason is visible.
+if ! curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>/tmp/cbm-curl12a.err; then
   # Try UI variant
-  if curl -fSL -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>/dev/null; then
+  if curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>>/tmp/cbm-curl12a.err; then
     DL_ARCHIVE="$DL_ARCHIVE_UI"
   else
     echo "FAIL 12a: curl download failed (tried standard and ui variants)"
+    echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
+    cat /tmp/cbm-curl12a.err 2>/dev/null || true
     exit 1
   fi
 fi
