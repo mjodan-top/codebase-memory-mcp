@@ -36,14 +36,20 @@ foreach ($arg in $args) {
 # unlike $env:PROCESSOR_ARCHITECTURE, which reports the emulated "AMD64", and
 # PROCESSOR_ARCHITEW6432, which is unset for 64-bit emulated processes. Fall back
 # to the env vars only if the .NET API is somehow unavailable.
-try {
-    $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-    $Arch = if ($osArch -eq 'Arm64') { "arm64" } else { "amd64" }
-} catch {
-    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
-        $Arch = "arm64"
-    } else {
-        $Arch = "amd64"
+if ($env:CBM_ARCH) {
+    # Explicit override wins — used by CI/tests, and an escape hatch under x64
+    # emulation on ARM64 where no in-process detection is reliable.
+    $Arch = $env:CBM_ARCH
+} else {
+    try {
+        $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+        $Arch = if ($osArch -eq 'Arm64') { "arm64" } else { "amd64" }
+    } catch {
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
+            $Arch = "arm64"
+        } else {
+            $Arch = "amd64"
+        }
     }
 }
 
