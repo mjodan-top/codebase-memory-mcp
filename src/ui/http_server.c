@@ -1744,9 +1744,9 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     if (cbm_http_path_match(req->path, "/")) {
         const cbm_embedded_file_t *f = cbm_embedded_lookup("/index.html");
         if (f) {
-            char html_hdrs[512];
+            char html_hdrs[1024];
             snprintf(html_hdrs, sizeof(html_hdrs),
-                     "%sContent-Type: text/html\r\nCache-Control: no-cache\r\n", g_cors);
+                     "%sContent-Type: text/html\r\nCache-Control: no-cache\r\n" CBM_UI_CSP, g_cors);
             cbm_http_reply_buf(c, 200, html_hdrs, f->data, (size_t)f->size);
             return;
         }
