@@ -618,6 +618,10 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * function name and suffix is NULL, so the target QN must be
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
+    const char *direct = cbm_ht_get_key(r->exact, resolved);
+    if (direct) {
+        return (cbm_resolution_t){direct, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+    }
     char candidate[CBM_SZ_512];
     if (suffix && suffix[0]) {
         snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);

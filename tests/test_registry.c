@@ -367,6 +367,25 @@ TEST(resolve_import_map_bare_function) {
     PASS();
 }
 
+/* Aliased bare import (`from m import f as g`, called as g()). The import-map
+ * value is the full symbol QN (IMPORTS edge targets the function node), and
+ * the callee at the site is the alias g — NOT f. Resolution must return the
+ * symbol directly instead of appending the alias (which yields m.f.g → miss).
+ * Regression for #875. */
+TEST(resolve_import_map_bare_alias) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function");
+    /* Import map: alias "_scan_bash" → FULL SYMBOL QN (not the module). */
+    const char *keys[] = {"_scan_bash"};
+    const char *vals[] = {"proj.security_scan.scan_bash"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "_scan_bash", "proj.hooks.pre_tool", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.security_scan.scan_bash");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_unique_name) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
@@ -818,6 +837,7 @@ SUITE(registry) {
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
+    RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
