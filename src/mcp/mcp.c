@@ -4450,6 +4450,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(mode_str);
         free(name_override);
         free(repo_path);
+        free(project_alias);
         return cbm_mcp_text_result("repo_path is outside the allowed root", true);
     }
 
