@@ -6,6 +6,7 @@
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline.h"
 #include "foundation/compat.h"
+#include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
 
@@ -245,6 +246,32 @@ TEST(artifact_exists_check) {
     PASS();
 }
 
+TEST(family_artifact_export_import_roundtrip) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    int rc = cbm_family_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(cbm_family_artifact_exists("test-proj"));
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/family-import.db", g_tmpdir);
+    rc = cbm_family_artifact_import("test-proj", import_db);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test-proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
+    cbm_store_close(s);
+
+    char famdir[1024];
+    snprintf(famdir, sizeof(famdir), "%s/families/test-proj", cbm_resolve_cache_dir());
+    cleanup_dir(famdir);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_commit_hash) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -450,6 +477,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);
+    RUN_TEST(family_artifact_export_import_roundtrip);
     RUN_TEST(artifact_commit_hash);
     RUN_TEST(artifact_schema_version_mismatch);
     RUN_TEST(artifact_import_missing);

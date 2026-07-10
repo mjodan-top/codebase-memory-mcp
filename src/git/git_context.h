@@ -22,6 +22,9 @@ typedef struct {
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
+char *cbm_git_context_project_alias_path(const cbm_git_context_t *ctx);
+char *cbm_git_context_read_project_alias(const cbm_git_context_t *ctx);
+int cbm_git_context_write_project_alias(const cbm_git_context_t *ctx, const char *alias);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
 
 #endif

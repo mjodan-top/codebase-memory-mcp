@@ -221,7 +221,14 @@ static int init_schema(cbm_store_t *s) {
         "CREATE TABLE IF NOT EXISTS projects ("
         "  name TEXT PRIMARY KEY,"
         "  indexed_at TEXT NOT NULL,"
-        "  root_path TEXT NOT NULL"
+        "  root_path TEXT NOT NULL,"
+        "  project_kind TEXT NOT NULL DEFAULT '',"
+        "  project_alias TEXT NOT NULL DEFAULT '',"
+        "  worktree_root TEXT NOT NULL DEFAULT '',"
+        "  canonical_root TEXT NOT NULL DEFAULT '',"
+        "  git_common_dir TEXT NOT NULL DEFAULT '',"
+        "  head_sha TEXT NOT NULL DEFAULT '',"
+        "  branch TEXT NOT NULL DEFAULT ''"
         ");"
         "CREATE TABLE IF NOT EXISTS file_hashes ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -306,6 +313,34 @@ static int init_schema(cbm_store_t *s) {
             return CBM_STORE_ERR;
         }
         sqlite3_finalize(probe);
+    }
+
+    {
+        struct {
+            const char *name;
+            const char *sql;
+        } project_cols[] = {
+            {"project_kind", "ALTER TABLE projects ADD COLUMN project_kind TEXT NOT NULL DEFAULT '';"},
+            {"project_alias", "ALTER TABLE projects ADD COLUMN project_alias TEXT NOT NULL DEFAULT '';"},
+            {"worktree_root", "ALTER TABLE projects ADD COLUMN worktree_root TEXT NOT NULL DEFAULT '';"},
+            {"canonical_root", "ALTER TABLE projects ADD COLUMN canonical_root TEXT NOT NULL DEFAULT '';"},
+            {"git_common_dir", "ALTER TABLE projects ADD COLUMN git_common_dir TEXT NOT NULL DEFAULT '';"},
+            {"head_sha", "ALTER TABLE projects ADD COLUMN head_sha TEXT NOT NULL DEFAULT '';"},
+            {"branch", "ALTER TABLE projects ADD COLUMN branch TEXT NOT NULL DEFAULT '';"},
+        };
+        for (size_t i = 0; i < sizeof(project_cols) / sizeof(project_cols[0]); i++) {
+            char *err = NULL;
+            int arc = sqlite3_exec(s->db, project_cols[i].sql, NULL, NULL, &err);
+            if (arc != SQLITE_OK) {
+                const char *msg = err ? err : "";
+                bool duplicate = strstr(msg, "duplicate column name") != NULL;
+                sqlite3_free(err);
+                if (!duplicate) {
+                    snprintf(s->errbuf, sizeof(s->errbuf), "exec: alter projects %s", project_cols[i].name);
+                    return CBM_STORE_ERR;
+                }
+            }
+        }
     }
 
     /* FTS5 contentless virtual table for BM25 full-text search.
@@ -1108,11 +1143,44 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
-int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path) {
+static void project_fill_defaults(cbm_project_t *p) {
+    if (!p) {
+        return;
+    }
+    if (!p->project_kind) {
+        p->project_kind = "";
+    }
+    if (!p->project_alias) {
+        p->project_alias = "";
+    }
+    if (!p->worktree_root) {
+        p->worktree_root = "";
+    }
+    if (!p->canonical_root) {
+        p->canonical_root = "";
+    }
+    if (!p->git_common_dir) {
+        p->git_common_dir = "";
+    }
+    if (!p->head_sha) {
+        p->head_sha = "";
+    }
+    if (!p->branch) {
+        p->branch = "";
+    }
+}
+
+int cbm_store_upsert_project_ex(cbm_store_t *s, const cbm_project_t *project) {
+    if (!project || !project->name || !project->root_path) {
+        return CBM_STORE_ERR;
+    }
+    cbm_project_t tmp = *project;
+    project_fill_defaults(&tmp);
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_project,
-                       "INSERT INTO projects (name, indexed_at, root_path) VALUES (?1, ?2, ?3) "
-                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3;");
+                       "INSERT INTO projects (name, indexed_at, root_path, project_kind, project_alias, worktree_root, canonical_root, git_common_dir, head_sha, branch) "
+                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
+                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3, project_kind=?4, project_alias=?5, worktree_root=?6, canonical_root=?7, git_common_dir=?8, head_sha=?9, branch=?10;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1120,9 +1188,16 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     char ts[CBM_SZ_64];
     iso_now(ts, sizeof(ts));
 
-    bind_text(stmt, SKIP_ONE, name);
+    bind_text(stmt, SKIP_ONE, tmp.name);
     bind_text(stmt, ST_COL_2, ts);
-    bind_text(stmt, ST_COL_3, root_path);
+    bind_text(stmt, ST_COL_3, tmp.root_path);
+    bind_text(stmt, 4, tmp.project_kind);
+    bind_text(stmt, 5, tmp.project_alias);
+    bind_text(stmt, 6, tmp.worktree_root);
+    bind_text(stmt, 7, tmp.canonical_root);
+    bind_text(stmt, 8, tmp.git_common_dir);
+    bind_text(stmt, 9, tmp.head_sha);
+    bind_text(stmt, 10, tmp.branch);
 
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
@@ -1132,10 +1207,15 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     return CBM_STORE_OK;
 }
 
+int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path) {
+    cbm_project_t project = {.name = name, .root_path = root_path};
+    return cbm_store_upsert_project_ex(s, &project);
+}
+
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_get_project,
-                       "SELECT name, indexed_at, root_path FROM projects WHERE name = ?1;");
+                       "SELECT name, indexed_at, root_path, project_kind, project_alias, worktree_root, canonical_root, git_common_dir, head_sha, branch FROM projects WHERE name = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1146,6 +1226,13 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
         out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        out->project_kind = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        out->project_alias = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
+        out->worktree_root = heap_strdup((const char *)sqlite3_column_text(stmt, 5));
+        out->canonical_root = heap_strdup((const char *)sqlite3_column_text(stmt, 6));
+        out->git_common_dir = heap_strdup((const char *)sqlite3_column_text(stmt, 7));
+        out->head_sha = heap_strdup((const char *)sqlite3_column_text(stmt, 8));
+        out->branch = heap_strdup((const char *)sqlite3_column_text(stmt, 9));
         return CBM_STORE_OK;
     }
     return CBM_STORE_NOT_FOUND;
@@ -1154,7 +1241,7 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_list_projects,
-                       "SELECT name, indexed_at, root_path FROM projects ORDER BY name;");
+                       "SELECT name, indexed_at, root_path, project_kind, project_alias, worktree_root, canonical_root, git_common_dir, head_sha, branch FROM projects ORDER BY name;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1172,6 +1259,13 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
         arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         arr[n].indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         arr[n].root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].project_kind = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        arr[n].project_alias = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
+        arr[n].worktree_root = heap_strdup((const char *)sqlite3_column_text(stmt, 5));
+        arr[n].canonical_root = heap_strdup((const char *)sqlite3_column_text(stmt, 6));
+        arr[n].git_common_dir = heap_strdup((const char *)sqlite3_column_text(stmt, 7));
+        arr[n].head_sha = heap_strdup((const char *)sqlite3_column_text(stmt, 8));
+        arr[n].branch = heap_strdup((const char *)sqlite3_column_text(stmt, 9));
         n++;
     }
 
@@ -6380,6 +6474,13 @@ void cbm_project_free_fields(cbm_project_t *p) {
     safe_str_free(&p->name);
     safe_str_free(&p->indexed_at);
     safe_str_free(&p->root_path);
+    safe_str_free(&p->project_kind);
+    safe_str_free(&p->project_alias);
+    safe_str_free(&p->worktree_root);
+    safe_str_free(&p->canonical_root);
+    safe_str_free(&p->git_common_dir);
+    safe_str_free(&p->head_sha);
+    safe_str_free(&p->branch);
 }
 
 void cbm_store_free_projects(cbm_project_t *projects, int count) {

@@ -39,6 +39,92 @@ static void trim_newlines(char *s) {
     }
 }
 
+
+static void trim_ascii_whitespace(char *s) {
+    if (!s || !s[0]) {
+        return;
+    }
+    size_t start = 0;
+    size_t len = strlen(s);
+    while (start < len && isspace((unsigned char)s[start])) {
+        start++;
+    }
+    size_t end = len;
+    while (end > start && isspace((unsigned char)s[end - 1])) {
+        end--;
+    }
+    if (start > 0) {
+        memmove(s, s + start, end - start);
+    }
+    s[end - start] = '\0';
+}
+
+static char *read_small_file(const char *path) {
+    if (!path) {
+        return NULL;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long size = ftell(fp);
+    if (size < 0 || size > GIT_OUTPUT_MAX) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+    char *buf = calloc((size_t)size + 1, 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t nread = fread(buf, 1, (size_t)size, fp);
+    fclose(fp);
+    buf[nread] = '\0';
+    trim_newlines(buf);
+    trim_ascii_whitespace(buf);
+    return buf;
+}
+
+static int write_small_file_atomic(const char *path, const char *data) {
+    if (!path || !data) {
+        return CBM_NOT_FOUND;
+    }
+    char tmp[CBM_SZ_1K];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (n < 0 || n >= (int)sizeof(tmp)) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+    size_t len = strlen(data);
+    int rc = 0;
+    if (len > 0 && fwrite(data, 1, len, fp) != len) {
+        rc = CBM_NOT_FOUND;
+    }
+    if (rc == 0 && fwrite("\n", 1, 1, fp) != 1) {
+        rc = CBM_NOT_FOUND;
+    }
+    if (fclose(fp) != 0) {
+        rc = CBM_NOT_FOUND;
+    }
+    if (rc != 0) {
+        remove(tmp);
+        return rc;
+    }
+    if (rename(tmp, path) != 0) {
+        remove(tmp);
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
 static bool git_validate_repo_path(const char *repo_path) {
     if (!cbm_validate_shell_arg(repo_path)) {
         return false;
@@ -247,6 +333,64 @@ void cbm_git_context_free(cbm_git_context_t *ctx) {
     free(ctx->head_sha);
     free(ctx->base_sha);
     memset(ctx, 0, sizeof(*ctx));
+}
+
+
+char *cbm_git_context_project_alias_path(const cbm_git_context_t *ctx) {
+    if (!ctx || !ctx->worktree_root || !ctx->worktree_root[0] || !ctx->git_common_dir ||
+        !ctx->git_common_dir[0]) {
+        return NULL;
+    }
+    char *base = path_is_absolute(ctx->git_common_dir)
+                     ? git_strdup(ctx->git_common_dir)
+                     : join_root_relative(ctx->worktree_root, ctx->git_common_dir);
+    if (!base) {
+        return NULL;
+    }
+    size_t len = strlen(base);
+    while (len > 1 && (base[len - 1] == '/' || base[len - 1] == '\\')) {
+        base[--len] = '\0';
+    }
+    size_t need = strlen(base) + strlen("/codebase-memory.project-alias") + 1;
+    char *path = malloc(need);
+    if (!path) {
+        free(base);
+        return NULL;
+    }
+    snprintf(path, need, "%s/codebase-memory.project-alias", base);
+    free(base);
+    return path;
+}
+
+char *cbm_git_context_read_project_alias(const cbm_git_context_t *ctx) {
+    char *path = cbm_git_context_project_alias_path(ctx);
+    if (!path) {
+        return NULL;
+    }
+    char *alias = read_small_file(path);
+    free(path);
+    if (!alias || !alias[0]) {
+        free(alias);
+        return NULL;
+    }
+    if (!cbm_validate_project_name(alias)) {
+        free(alias);
+        return NULL;
+    }
+    return alias;
+}
+
+int cbm_git_context_write_project_alias(const cbm_git_context_t *ctx, const char *alias) {
+    if (!ctx || !alias || !alias[0] || !cbm_validate_project_name(alias)) {
+        return CBM_NOT_FOUND;
+    }
+    char *path = cbm_git_context_project_alias_path(ctx);
+    if (!path) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = write_small_file_atomic(path, alias);
+    free(path);
+    return rc;
 }
 
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
