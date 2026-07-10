@@ -4472,12 +4472,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
 
-    if (project_alias && maybe_persist_project_alias(repo_path, project_alias) != 0) {
-        free(repo_path);
-        free(project_alias);
-        return cbm_mcp_text_result("failed to persist project_alias into git-common-dir", true);
-    }
-
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
         free(name_override);
@@ -4489,6 +4483,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         cbm_pipeline_free(p);
         free(name_override);
         free(repo_path);
+        free(project_alias);
         return cbm_mcp_text_result("invalid project name", true);
     }
     free(name_override);
@@ -4501,7 +4496,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_set_persistence(p, persistence);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
-    free(project_alias);
 
     /* Bootstrap from artifact if no local DB exists */
     try_artifact_bootstrap(project_name, repo_path);
@@ -4563,6 +4557,14 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
             file_errors, file_error_count, has_logfile ? logfile_path : NULL);
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
+        /* Persist the explicit project_alias into the git-common-dir ONLY after
+         * a successful index, so a failed request leaves no on-disk side effect
+         * (bug fix: previously written before the pipeline ran). Best-effort:
+         * an alias-persist failure does not fail an otherwise-successful index. */
+        if (project_alias && maybe_persist_project_alias(repo_path, project_alias) != 0) {
+            yyjson_mut_obj_add_str(doc, root, "project_alias_warning",
+                                   "indexed, but failed to persist project_alias into git-common-dir");
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
@@ -4585,6 +4587,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(project_name);
     free(repo_path);
+    free(project_alias);
 
     char *result = cbm_mcp_text_result(json, rc != 0);
     free(json);
