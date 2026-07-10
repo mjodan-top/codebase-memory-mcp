@@ -191,6 +191,9 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
+    if (p && project_name && project_name[0]) {
+        (void)cbm_pipeline_apply_project_alias(p, project_name);
+    }
     if (!p) {
         cbm_pipeline_unlock();
         return CBM_NOT_FOUND;

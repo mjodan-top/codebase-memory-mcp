@@ -1067,6 +1067,18 @@ TEST(tool_trace_call_path_depth_clamped) {
     PASS();
 }
 
+TEST(tool_list_family_snapshots_empty) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":221,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_family_snapshots\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "snapshots"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Reproduce-first (#650, distilled): two GENUINELY-DIFFERENT same-named functions
  * whose bodies differ in length score differently, so the old exact-tie check did
  * not flag them ambiguous — and bfs_union_same_name (#546) then merged the caller
@@ -1135,6 +1147,19 @@ TEST(tool_trace_call_path_distinct_defs_not_over_unioned) {
     ASSERT_NOT_NULL(strstr(inner, "suggestions"));
     ASSERT_NULL(strstr(inner, "\"callers\""));
     free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_delete_family_snapshot_not_found) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":222,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"delete_family_snapshot\","
+                                   "\"arguments\":{\"project\":\"nonexistent\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not_found"));
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -1209,6 +1234,24 @@ TEST(tool_trace_call_path_dts_stub_unions_with_impl) {
     PASS();
 }
 
+TEST(tool_delete_project_reports_family_flags) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_store_upsert_project(st, "family-del-proj", "/tmp/family-del-proj");
+    cbm_mcp_server_set_project(srv, "family-del-proj");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":224,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"delete_project\","
+                                   "\"arguments\":{\"project\":\"family-del-proj\","
+                                   "\"delete_family_snapshot\":true}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "delete_family_snapshot"));
+    ASSERT_NOT_NULL(strstr(resp, "family_snapshot_deleted"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -1220,6 +1263,24 @@ TEST(tool_delete_project_not_found) {
     ASSERT_NOT_NULL(strstr(resp, "not_found"));
     free(resp);
 
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_status_includes_family_cache_fields) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_store_upsert_project(st, "family-proj", "/tmp/family-proj");
+    cbm_mcp_server_set_project(srv, "family-proj");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"index_status\","
+                                   "\"arguments\":{\"project\":\"family-proj\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "family_snapshot_present"));
+    ASSERT_NOT_NULL(strstr(resp, "project_kind"));
+    ASSERT_NOT_NULL(strstr(resp, "cache"));
+    free(resp);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -5259,6 +5320,7 @@ SUITE(mcp) {
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
+    RUN_TEST(tool_list_family_snapshots_empty);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
@@ -5267,6 +5329,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_includes_family_cache_fields);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);
@@ -5276,6 +5339,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
+    RUN_TEST(tool_delete_family_snapshot_not_found);
+    RUN_TEST(tool_delete_project_reports_family_flags);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);

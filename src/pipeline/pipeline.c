@@ -30,6 +30,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/str_util.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
@@ -161,6 +162,102 @@ static void log_phase_mem(const char *phase) {
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
+/* Strip a trailing git metadata suffix ("/.git") from a canonical repo root so
+ * the derived project name reads like the repo rather than its .git dir. A main
+ * checkout's canonical_root is ".../repo/.git" (or ".../repo" via the fallback),
+ * and every linked worktree of the SAME repo resolves to the IDENTICAL
+ * canonical_root (git's own --git-common-dir), so the name derived from it is
+ * stable across all worktrees. Returns a heap copy the caller frees, or NULL. */
+static char *canonical_root_repo_path(const char *canonical_root) {
+    if (!canonical_root || !canonical_root[0]) {
+        return NULL;
+    }
+    char *dup = strdup(canonical_root);
+    if (!dup) {
+        return NULL;
+    }
+    size_t len = strlen(dup);
+    while (len > 1 && (dup[len - 1] == '/' || dup[len - 1] == '\\')) {
+        dup[--len] = '\0';
+    }
+    const size_t tlen = 5; /* "/.git" or "\\.git" */
+    if (len >= tlen &&
+        (strcmp(dup + len - tlen, "/.git") == 0 || strcmp(dup + len - tlen, "\\.git") == 0)) {
+        dup[len - tlen] = '\0';
+        len -= tlen;
+    } else if (strcmp(dup, ".git") == 0) {
+        free(dup);
+        return NULL;
+    }
+    while (len > 1 && (dup[len - 1] == '/' || dup[len - 1] == '\\')) {
+        dup[--len] = '\0';
+    }
+    if (len == 0) {
+        free(dup);
+        return NULL;
+    }
+    return dup;
+}
+
+/* Resolve the project name for a repo path.
+ *
+ * Precedence:
+ *   1. An explicitly persisted project_alias in git-common-dir (user opted in).
+ *   2. A name derived from the git canonical root (git-common-dir). Every
+ *      worktree of the same repository resolves to ONE shared project/db
+ *      automatically, without the user setting an alias (issue #1).
+ *   3. Fallback to the raw filesystem path (non-git dirs, or git contexts that
+ *      failed to yield a usable canonical root).
+ *
+ * Only path (3) is worktree-sensitive; (1) and (2) are path-independent, so two
+ * worktrees of the same repo no longer build two separate indexes. */
+static char *derive_project_name_for_path(const char *repo_path, const cbm_git_context_t *ctx) {
+    if (ctx && ctx->is_git) {
+        char *alias = cbm_git_context_read_project_alias(ctx);
+        if (alias) {
+            return alias;
+        }
+        char *repo_root = canonical_root_repo_path(ctx->canonical_root);
+        if (repo_root) {
+            char *name = cbm_project_name_from_path(repo_root);
+            free(repo_root);
+            if (name) {
+                return name;
+            }
+        }
+    }
+    return cbm_project_name_from_path(repo_path);
+}
+
+char *cbm_pipeline_project_name_for_path(const char *repo_path) {
+    if (!repo_path) {
+        return NULL;
+    }
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(repo_path, &ctx);
+    char *name = derive_project_name_for_path(repo_path, &ctx);
+    cbm_git_context_free(&ctx);
+    return name;
+}
+
+int cbm_pipeline_apply_project_alias(cbm_pipeline_t *p, const char *project_name) {
+    if (!p || !project_name || !project_name[0] || !cbm_validate_project_name(project_name)) {
+        return CBM_NOT_FOUND;
+    }
+    char *dup = strdup(project_name);
+    if (!dup) {
+        return CBM_NOT_FOUND;
+    }
+    free(p->project_name);
+    p->project_name = dup;
+    free(p->branch_qn);
+    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+    if (!p->branch_qn) {
+        p->branch_qn = strdup(p->project_name);
+    }
+    return 0;
+}
+
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
                                  cbm_index_mode_t mode) {
     if (!repo_path) {
@@ -174,8 +271,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
 
     p->repo_path = strdup(repo_path);
     p->db_path = db_path ? strdup(db_path) : NULL;
-    p->project_name = cbm_project_name_from_path(repo_path);
     (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
+    p->project_name = derive_project_name_for_path(repo_path, &p->git_ctx);
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
     p->persistence = false;
@@ -1087,6 +1184,25 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     CBM_PROF_END("persist", "1_reopen", t_reopen);
     if (hash_store) {
         CBM_PROF_START(t_delhash);
+        char *proj_alias_tmp = cbm_git_context_read_project_alias(&p->git_ctx);
+        const char *project_kind = p->git_ctx.is_git ? "git-project" : "path-only";
+        if (proj_alias_tmp && strcmp(proj_alias_tmp, p->project_name) == 0) {
+            project_kind = "family-overlay";
+        }
+        cbm_project_t proj_meta = {
+            .name = p->project_name,
+            .root_path = p->repo_path,
+            .project_kind = project_kind,
+            .project_alias = proj_alias_tmp ? proj_alias_tmp : "",
+            .worktree_root = p->git_ctx.worktree_root ? p->git_ctx.worktree_root : "",
+            .canonical_root = p->git_ctx.canonical_root ? p->git_ctx.canonical_root : "",
+            .git_common_dir = p->git_ctx.git_common_dir ? p->git_ctx.git_common_dir : "",
+            .head_sha = p->git_ctx.head_sha ? p->git_ctx.head_sha : "",
+            .branch = p->git_ctx.branch ? p->git_ctx.branch : "",
+        };
+        cbm_store_upsert_project_ex(hash_store, &proj_meta);
+        free(proj_alias_tmp);
+
         cbm_store_delete_file_hashes(hash_store, p->project_name);
         CBM_PROF_END("persist", "2_delete_file_hashes", t_delhash);
 
@@ -1216,6 +1332,15 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
             /* A failed persistence export intentionally fails the run; this used to be ignored. */
             return arc;
+        }
+    }
+
+    if (p->git_ctx.is_git) {
+        int frc = cbm_family_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_FAST);
+        if (frc != 0) {
+            const char *err = cbm_artifact_export_last_error();
+            cbm_log_warn("family.snapshot.export.err", "project", p->project_name, "err",
+                         err ? err : "unknown");
         }
     }
 

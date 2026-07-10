@@ -47,6 +47,17 @@ typedef enum {
 /* Create a new pipeline. Caller owns the result. */
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm_index_mode_t mode);
 
+/* Resolve the effective project name for a path.
+ * If the repo family has a persisted alias in git-common-dir, use it;
+ * otherwise fall back to cbm_project_name_from_path(path).
+ * Caller must free() the returned string. */
+char *cbm_pipeline_project_name_for_path(const char *repo_path);
+
+/* Apply an exact repo-family project alias (no path-derived normalization —
+ * the caller already validated it via cbm_validate_project_name). Recomputes
+ * branch QN. Returns 0 on success, -1 on validation/allocation failure. */
+int cbm_pipeline_apply_project_alias(cbm_pipeline_t *p, const char *project_name);
+
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
@@ -65,7 +76,10 @@ void cbm_pipeline_cancel(cbm_pipeline_t *p);
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
 
-/* Override the derived project name with a sanitized user-provided label. */
+/* Override the derived project name with a sanitized user-provided label
+ * (path-like normalization via cbm_project_name_from_path — distinct from
+ * cbm_pipeline_apply_project_alias, which applies an exact pre-validated
+ * repo-family alias with no further normalization). */
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
 
 /* Get the index mode (CBM_MODE_FULL, CBM_MODE_MODERATE, CBM_MODE_FAST). */

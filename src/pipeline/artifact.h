@@ -61,4 +61,11 @@ char *cbm_artifact_commit(const char *repo_path);
  * were the pre-existing bug). Exposed so the shell-safety contract is unit-tested. */
 bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path);
 
+/* Export/import a local family snapshot under ~/.cache/codebase-memory-mcp/families/<project>/.
+ * Used for rehydrating a missing local DB for the same repo family/worktree alias. */
+int cbm_family_artifact_export(const char *db_path, const char *repo_path, const char *project_name,
+                               int quality);
+int cbm_family_artifact_import(const char *project_name, const char *cache_db_path);
+bool cbm_family_artifact_exists(const char *project_name);
+
 #endif /* CBM_ARTIFACT_H */

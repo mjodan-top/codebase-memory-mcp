@@ -128,6 +128,15 @@ static bool artifact_path(char *buf, size_t bufsz, const char *repo_path, const 
     return n >= 0 && (size_t)n < bufsz;
 }
 
+static bool family_repo_root(char *buf, size_t bufsz, const char *project_name) {
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir || !project_name || !cbm_validate_project_name(project_name)) {
+        return false;
+    }
+    int n = snprintf(buf, bufsz, "%s/families/%s", cache_dir, project_name);
+    return n >= 0 && (size_t)n < bufsz;
+}
+
 /* Read entire file into malloc'd buffer. Sets *out_len. Returns NULL on error. */
 static char *read_file_alloc(const char *path, size_t *out_len) {
     FILE *fp = cbm_fopen(path, "rb");
@@ -777,4 +786,30 @@ char *cbm_artifact_commit(const char *repo_path) {
     }
     yyjson_doc_free(doc);
     return result;
+}
+
+
+int cbm_family_artifact_export(const char *db_path, const char *repo_path, const char *project_name,
+                               int quality) {
+    char family_root[CBM_SZ_4K];
+    if (!family_repo_root(family_root, sizeof(family_root), project_name)) {
+        return artifact_export_fail("family_export", project_name, "invalid_project_name", 0);
+    }
+    return cbm_artifact_export(db_path, family_root, project_name, quality);
+}
+
+int cbm_family_artifact_import(const char *project_name, const char *cache_db_path) {
+    char family_root[CBM_SZ_4K];
+    if (!family_repo_root(family_root, sizeof(family_root), project_name)) {
+        return CBM_NOT_FOUND;
+    }
+    return cbm_artifact_import(family_root, cache_db_path);
+}
+
+bool cbm_family_artifact_exists(const char *project_name) {
+    char family_root[CBM_SZ_4K];
+    if (!family_repo_root(family_root, sizeof(family_root), project_name)) {
+        return false;
+    }
+    return cbm_artifact_exists(family_root);
 }

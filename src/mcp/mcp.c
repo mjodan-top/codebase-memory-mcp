@@ -327,6 +327,9 @@ static const tool_def_t TOOLS[] = {
      "(gitignore/.cbmignore/skip-lists) — by design, not failures.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
+     "\"project_alias\":{\"type\":\"string\",\"description\":"
+     "\"Optional stable alias for the repo family. When set on a git repo, the alias is "
+     "persisted in git-common-dir so future worktrees reuse the same project/db\"},"
      "\"mode\":{\"type\":\"string\","
      "\"enum\":[\"full\",\"moderate\",\"fast\",\"cross-repo-intelligence\"],"
      "\"default\":\"full\",\"description\":\"All modes run type-aware LSP call/usage "
@@ -494,10 +497,18 @@ static const tool_def_t TOOLS[] = {
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
      "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
 
-    {"list_projects", "List projects", "List all indexed projects",
+    {"list_projects", "List projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
+
+    {"list_family_snapshots", "List family snapshots", "List local family snapshot caches",
      "{\"type\":\"object\",\"properties\":{}}"},
-    {"delete_project", "Delete project", "Delete a project from the index",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+
+    {"delete_family_snapshot", "Delete family snapshot", "Delete a local family snapshot cache",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":[\"project\"]}"},
+
+    {"delete_project", "Delete project",
+     "Delete a project from the index",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"delete_family_snapshot\":{\"type\":\"boolean\",\"default\":false}},\"required\":["
      "\"project\"]}"},
 
     {"index_status", "Index status",
@@ -1190,6 +1201,32 @@ static void add_git_context_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, con
     }
 }
 
+static void add_project_cache_json(yyjson_mut_doc *doc, yyjson_mut_val *obj,
+                                   const char *project_name, const char *root_path) {
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(root_path, &ctx);
+
+    char *alias = cbm_git_context_read_project_alias(&ctx);
+    if (alias) {
+        yyjson_mut_obj_add_strcpy(doc, obj, "project_alias", alias);
+    } else {
+        yyjson_mut_obj_add_null(doc, obj, "project_alias");
+    }
+    yyjson_mut_obj_add_bool(doc, obj, "family_snapshot_present",
+                            cbm_family_artifact_exists(project_name));
+
+    const char *kind = "path-only";
+    if (alias && project_name && strcmp(alias, project_name) == 0) {
+        kind = "family-overlay";
+    } else if (ctx.is_git) {
+        kind = "git-project";
+    }
+    yyjson_mut_obj_add_str(doc, obj, "project_kind", kind);
+
+    free(alias);
+    cbm_git_context_free(&ctx);
+}
+
 static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *root_path) {
     cbm_git_context_t ctx = {0};
     (void)cbm_git_context_resolve(root_path, &ctx);
@@ -1365,6 +1402,181 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
     return found;
 }
 
+static bool family_root_path(char *buf, size_t bufsz, const char *project_name) {
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir || !project_name || !cbm_validate_project_name(project_name)) {
+        return false;
+    }
+    int n = snprintf(buf, bufsz, "%s/families/%s", cache_dir, project_name);
+    return n >= 0 && (size_t)n < bufsz;
+}
+
+static void build_family_snapshot_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr,
+                                             const char *project_name) {
+    char root_path[CBM_SZ_2K] = "";
+    if (!family_root_path(root_path, sizeof(root_path), project_name)) {
+        return;
+    }
+    bool present = cbm_family_artifact_exists(project_name);
+    if (!present) {
+        return;
+    }
+    yyjson_mut_val *p = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, p, "project", project_name);
+    yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path);
+    yyjson_mut_obj_add_bool(doc, p, "artifact_present", present);
+    char *commit = cbm_artifact_commit(root_path);
+    if (commit) {
+        yyjson_mut_obj_add_strcpy(doc, p, "commit", commit);
+    } else {
+        yyjson_mut_obj_add_null(doc, p, "commit");
+    }
+    free(commit);
+    char meta_path[CBM_SZ_2K];
+    snprintf(meta_path, sizeof(meta_path), "%s/.codebase-memory/artifact.json", root_path);
+    struct stat st;
+    if (stat(meta_path, &st) == 0) {
+        yyjson_mut_obj_add_int(doc, p, "size_bytes", (int64_t)st.st_size);
+    }
+    yyjson_mut_arr_add_val(arr, p);
+}
+
+static char *handle_list_family_snapshots(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    (void)args;
+    char fam_root[CBM_SZ_1K];
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return cbm_mcp_text_result("cache dir unavailable", true);
+    }
+    snprintf(fam_root, sizeof(fam_root), "%s/families", cache_dir);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_obj_add_val(doc, root, "snapshots", arr);
+    cbm_dir_t *d = cbm_opendir(fam_root);
+    if (d) {
+        cbm_dirent_t *de;
+        while ((de = cbm_readdir(d)) != NULL) {
+            const char *name = de->name;
+            if (!name || name[0] == '.') {
+                continue;
+            }
+            if (!cbm_validate_project_name(name)) {
+                continue;
+            }
+            build_family_snapshot_json_entry(doc, arr, name);
+        }
+        cbm_closedir(d);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *out = cbm_mcp_text_result(json, false);
+    free(json);
+    return out;
+}
+
+static char *handle_delete_family_snapshot(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char *name = cbm_mcp_get_string_arg(args, "project");
+    if (!name) {
+        return cbm_mcp_text_result("project is required", true);
+    }
+    char root_path[CBM_SZ_2K];
+    if (!family_root_path(root_path, sizeof(root_path), name)) {
+        free(name);
+        return cbm_mcp_text_result("invalid project", true);
+    }
+    char zst[CBM_SZ_2K], meta[CBM_SZ_2K], artdir[CBM_SZ_2K];
+    snprintf(artdir, sizeof(artdir), "%s/.codebase-memory", root_path);
+    snprintf(zst, sizeof(zst), "%s/graph.db.zst", artdir);
+    snprintf(meta, sizeof(meta), "%s/artifact.json", artdir);
+    bool exists = (access(zst, F_OK) == 0) || (access(meta, F_OK) == 0);
+    const char *status = "not_found";
+    bool is_error = false;
+    const char *error_detail = NULL;
+    if (exists) {
+        int rc1 = cbm_unlink(zst);
+        int e1 = errno;
+        int rc2 = cbm_unlink(meta);
+        int e2 = errno;
+        if ((rc1 == 0 || e1 == ENOENT) && (rc2 == 0 || e2 == ENOENT)) {
+            (void)cbm_rmdir(artdir);
+            (void)cbm_rmdir(root_path);
+            status = "deleted";
+        } else {
+            status = "delete_failed";
+            error_detail = strerror(rc1 != 0 && e1 != ENOENT ? e1 : e2);
+            is_error = true;
+        }
+    } else {
+        is_error = true;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "project", name);
+    yyjson_mut_obj_add_str(doc, root, "status", status);
+    if (error_detail) {
+        yyjson_mut_obj_add_str(doc, root, "error", error_detail);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(name);
+    char *out = cbm_mcp_text_result(json, is_error);
+    free(json);
+    return out;
+}
+
+static void maybe_backfill_project_cache_metadata(cbm_store_t *pstore, const char *project_name,
+                                                 const char *db_path, cbm_project_t *proj) {
+    if (!pstore || !project_name || !proj || !proj->root_path || !proj->root_path[0]) {
+        return;
+    }
+    bool needs = !(proj->project_kind && proj->project_kind[0]) ||
+                 !(proj->worktree_root && proj->worktree_root[0]) ||
+                 !(proj->canonical_root && proj->canonical_root[0]) ||
+                 !(proj->git_common_dir && proj->git_common_dir[0]) ||
+                 !(proj->head_sha && proj->head_sha[0]) ||
+                 !(proj->project_alias && proj->project_alias[0]);
+    if (!needs && cbm_family_artifact_exists(project_name)) {
+        return;
+    }
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(proj->root_path, &ctx);
+    char *alias = cbm_git_context_read_project_alias(&ctx);
+    if (!alias && ctx.is_git && ctx.worktree_root && ctx.worktree_root[0]) {
+        char *direct = cbm_project_name_from_path(ctx.worktree_root);
+        if (direct && strcmp(direct, project_name) != 0) {
+            (void)cbm_git_context_write_project_alias(&ctx, project_name);
+            alias = heap_strdup(project_name);
+        }
+        free(direct);
+    }
+    const char *kind = ctx.is_git ? "git-project" : "path-only";
+    if (alias && strcmp(alias, project_name) == 0) {
+        kind = "family-overlay";
+    }
+    cbm_project_t updated = {
+        .name = project_name,
+        .root_path = proj->root_path,
+        .project_kind = kind,
+        .project_alias = alias ? alias : "",
+        .worktree_root = ctx.worktree_root ? ctx.worktree_root : "",
+        .canonical_root = ctx.canonical_root ? ctx.canonical_root : "",
+        .git_common_dir = ctx.git_common_dir ? ctx.git_common_dir : "",
+        .head_sha = ctx.head_sha ? ctx.head_sha : "",
+        .branch = ctx.branch ? ctx.branch : "",
+    };
+    (void)cbm_store_upsert_project_ex(pstore, &updated);
+    if (ctx.is_git && db_path && db_path[0] && !cbm_family_artifact_exists(project_name)) {
+        (void)cbm_family_artifact_export(db_path, proj->root_path, project_name, CBM_ARTIFACT_FAST);
+    }
+    free(alias);
+    cbm_git_context_free(&ctx);
+}
+
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
@@ -1390,6 +1602,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     char root_path_buf[CBM_SZ_1K] = "";
     cbm_project_t proj = {0};
     if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
+        maybe_backfill_project_cache_metadata(pstore, project_name, full_path, &proj);
         if (proj.root_path) {
             snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
         }
@@ -1400,6 +1613,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
+    add_project_cache_json(doc, p, project_name, root_path_buf[0] ? root_path_buf : NULL);
     add_git_context_json(doc, p, root_path_buf[0] ? root_path_buf : NULL);
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
@@ -2311,10 +2525,24 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         if (cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
+            yyjson_mut_obj_add_strcpy(doc, root, "project_kind",
+                                      proj_info.project_kind ? proj_info.project_kind : "");
+            if (proj_info.project_alias && proj_info.project_alias[0]) {
+                yyjson_mut_obj_add_strcpy(doc, root, "project_alias", proj_info.project_alias);
+            } else {
+                yyjson_mut_obj_add_null(doc, root, "project_alias");
+            }
+            yyjson_mut_obj_add_bool(doc, root, "family_snapshot_present",
+                                    cbm_family_artifact_exists(project));
+            yyjson_mut_val *cache = yyjson_mut_obj(doc);
+            add_git_context_string(doc, cache, "worktree_root", proj_info.worktree_root);
+            add_git_context_string(doc, cache, "canonical_root", proj_info.canonical_root);
+            add_git_context_string(doc, cache, "git_common_dir", proj_info.git_common_dir);
+            add_git_context_string(doc, cache, "head_sha", proj_info.head_sha);
+            add_git_context_string(doc, cache, "branch", proj_info.branch);
+            yyjson_mut_obj_add_val(doc, root, "cache", cache);
             add_git_context_json(doc, root, proj_info.root_path);
-            safe_str_free(&proj_info.name);
-            safe_str_free(&proj_info.indexed_at);
-            safe_str_free(&proj_info.root_path);
+            cbm_project_free_fields(&proj_info);
         }
         add_coverage_report(doc, root, store, project);
         if (nodes == 0) {
@@ -2337,7 +2565,8 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
 
 /* delete_project: just erase the .db file (and WAL/SHM). */
 static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
-    char *name = get_project_arg(args);
+    char *name = cbm_mcp_get_string_arg(args, "project");
+    bool delete_family_snapshot = cbm_mcp_get_bool_arg(args, "delete_family_snapshot");
     if (!name) {
         return cbm_mcp_text_result("project is required", true);
     }
@@ -2350,6 +2579,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         }
         free(srv->current_project);
         srv->current_project = NULL;
+    }
+
+    cbm_project_t proj_info = {0};
+    bool have_proj_info = false;
+    if (srv->owns_store && srv->store && cbm_store_get_project(srv->store, name, &proj_info) == CBM_STORE_OK) {
+        have_proj_info = true;
     }
 
     /* Wait for any in-progress pipeline to finish before deleting */
@@ -2369,12 +2604,29 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     const char *error_detail = NULL;
     bool is_error = false;
 
+    bool family_deleted = false;
     if (exists) {
         int rc = cbm_unlink(path);
         (void)cbm_unlink(wal);
         (void)cbm_unlink(shm);
         if (rc == 0) {
             status = "deleted";
+            if (delete_family_snapshot) {
+                char fam_root[CBM_SZ_2K];
+                if (family_root_path(fam_root, sizeof(fam_root), name)) {
+                    char artdir[CBM_SZ_2K], zst[CBM_SZ_2K], meta[CBM_SZ_2K];
+                    snprintf(artdir, sizeof(artdir), "%s/.codebase-memory", fam_root);
+                    snprintf(zst, sizeof(zst), "%s/graph.db.zst", artdir);
+                    snprintf(meta, sizeof(meta), "%s/artifact.json", artdir);
+                    int rc1 = cbm_unlink(zst); int e1 = errno;
+                    int rc2 = cbm_unlink(meta); int e2 = errno;
+                    if ((rc1 == 0 || e1 == ENOENT) && (rc2 == 0 || e2 == ENOENT)) {
+                        (void)cbm_rmdir(artdir);
+                        (void)cbm_rmdir(fam_root);
+                        family_deleted = true;
+                    }
+                }
+            }
         } else {
             status = "delete_failed";
             error_detail = strerror(errno);
@@ -2397,12 +2649,26 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "project", name);
     yyjson_mut_obj_add_str(doc, root, "status", status);
+    yyjson_mut_obj_add_bool(doc, root, "delete_family_snapshot", delete_family_snapshot);
+    yyjson_mut_obj_add_bool(doc, root, "family_snapshot_deleted", family_deleted);
+    if (have_proj_info) {
+        if (proj_info.project_alias && proj_info.project_alias[0]) {
+            yyjson_mut_obj_add_strcpy(doc, root, "project_alias", proj_info.project_alias);
+        } else {
+            yyjson_mut_obj_add_null(doc, root, "project_alias");
+        }
+        yyjson_mut_obj_add_strcpy(doc, root, "project_kind",
+                                  proj_info.project_kind ? proj_info.project_kind : "");
+    }
     if (error_detail) {
         yyjson_mut_obj_add_str(doc, root, "error", error_detail);
     }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    if (have_proj_info) {
+        cbm_project_free_fields(&proj_info);
+    }
     free(name);
 
     char *result = cbm_mcp_text_result(json, is_error);
@@ -3422,7 +3688,17 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
 static void try_artifact_bootstrap(const char *project_name, const char *repo_path) {
     char db_buf[CBM_SZ_1K];
     project_db_path(project_name, db_buf, sizeof(db_buf));
-    if (cbm_file_size(db_buf) < 0 && cbm_artifact_exists(repo_path)) {
+    if (cbm_file_size(db_buf) >= 0) {
+        return;
+    }
+    if (cbm_family_artifact_exists(project_name)) {
+        cbm_log_info("index.family_bootstrap", "project", project_name);
+        if (cbm_family_artifact_import(project_name, db_buf) == 0) {
+            return;
+        }
+        cbm_log_warn("index.family_bootstrap.err", "project", project_name);
+    }
+    if (cbm_artifact_exists(repo_path)) {
         cbm_log_info("index.artifact_bootstrap", "project", project_name);
         cbm_artifact_import(repo_path, db_buf);
     }
@@ -4114,6 +4390,22 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
+
+static int maybe_persist_project_alias(const char *repo_path, const char *project_alias) {
+    if (!project_alias || !project_alias[0]) {
+        return 0;
+    }
+    cbm_git_context_t ctx = {0};
+    int rc = cbm_git_context_resolve(repo_path, &ctx);
+    if (rc != 0 || !ctx.is_git) {
+        cbm_git_context_free(&ctx);
+        return 0;
+    }
+    rc = cbm_git_context_write_project_alias(&ctx, project_alias);
+    cbm_git_context_free(&ctx);
+    return rc;
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
      * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
@@ -4126,13 +4418,22 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    char *project_alias = cbm_mcp_get_string_arg(args, "project_alias");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
     cbm_normalize_path_sep(repo_path);
 
+    if (project_alias && !cbm_validate_project_name(project_alias)) {
+        free(repo_path);
+        free(project_alias);
+        free(mode_str);
+        return cbm_mcp_text_result("project_alias must match [A-Za-z0-9._-] and not start with dot", true);
+    }
+
     if (!repo_path) {
         free(mode_str);
         free(name_override);
+        free(project_alias);
         return cbm_mcp_text_result("repo_path is required", true);
     }
 
@@ -4155,6 +4456,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
         free(name_override);
+        free(project_alias);
         char *result = handle_cross_repo_mode(repo_path, args);
         free(repo_path);
         return result;
@@ -4170,10 +4472,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
 
+    if (project_alias && maybe_persist_project_alias(repo_path, project_alias) != 0) {
+        free(repo_path);
+        free(project_alias);
+        return cbm_mcp_text_result("failed to persist project_alias into git-common-dir", true);
+    }
+
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
         free(name_override);
         free(repo_path);
+        free(project_alias);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
     if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
@@ -4183,9 +4492,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("invalid project name", true);
     }
     free(name_override);
+    if (project_alias && cbm_pipeline_apply_project_alias(p, project_alias) != 0) {
+        cbm_pipeline_free(p);
+        free(repo_path);
+        free(project_alias);
+        return cbm_mcp_text_result("failed to apply project_alias", true);
+    }
     cbm_pipeline_set_persistence(p, persistence);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
+    free(project_alias);
 
     /* Bootstrap from artifact if no local DB exists */
     try_artifact_bootstrap(project_name, repo_path);
@@ -6090,6 +6406,12 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     if (strcmp(tool_name, "list_projects") == 0) {
         return handle_list_projects(srv, args_json);
     }
+    if (strcmp(tool_name, "list_family_snapshots") == 0) {
+        return handle_list_family_snapshots(srv, args_json);
+    }
+    if (strcmp(tool_name, "delete_family_snapshot") == 0) {
+        return handle_delete_family_snapshot(srv, args_json);
+    }
     if (strcmp(tool_name, "get_graph_schema") == 0) {
         return handle_get_graph_schema(srv, args_json);
     }
@@ -6156,11 +6478,9 @@ static void detect_session(cbm_mcp_server_t *srv) {
         }
     }
 
-    /* Derive project name from path — must match cbm_project_name_from_path
-     * used by the pipeline, otherwise session queries look for a .db file
-     * that doesn't match the indexed project name. */
+    /* Derive project name using the same alias-aware logic as the pipeline. */
     if (srv->session_root[0]) {
-        char *pname = cbm_project_name_from_path(srv->session_root);
+        char *pname = cbm_pipeline_project_name_for_path(srv->session_root);
         if (pname) {
             snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
             free(pname);
@@ -6219,6 +6539,9 @@ static void *autoindex_thread(void *arg) {
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
+    if (p && srv->session_project[0]) {
+        (void)cbm_pipeline_apply_project_alias(p, srv->session_project);
+    }
     if (!p) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;

@@ -51,6 +51,13 @@ typedef struct {
     const char *name;
     const char *indexed_at; /* ISO 8601 */
     const char *root_path;
+    const char *project_kind;
+    const char *project_alias;
+    const char *worktree_root;
+    const char *canonical_root;
+    const char *git_common_dir;
+    const char *head_sha;
+    const char *branch;
 } cbm_project_t;
 
 typedef struct {
@@ -276,6 +283,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path);
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path);
+int cbm_store_upsert_project_ex(cbm_store_t *s, const cbm_project_t *project);
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);
