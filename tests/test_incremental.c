@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <sys/time.h>
 
 /* ── Globals ──────────────────────────────────────────────────────── */
 
@@ -863,56 +864,53 @@ TEST(incr_accuracy_vs_full) {
  *   - change 1 byte of content -> counts differ (changed, still detected)
  * ══════════════════════════════════════════════════════════════════ */
 TEST(incr_mtime_bump_only_is_unchanged) {
-    /* Baseline: current graph equals the full index (prior tests restored it,
-     * or this asserts against the full snapshot captured in incr_full_index). */
+    /* Self-contained: create our OWN probe file so no other test's edits to
+     * shared fixture files can pollute the baseline. Index once to record it,
+     * then bump ONLY its mtime (what `git checkout` does) and re-index. */
+    const char *rel = "fastapi/issue6_mtime_probe.py";
+    write_file_at(rel, "def issue6_probe_one(a: int) -> int:\n    return a + 1\n\n"
+                       "def issue6_probe_two(b: str) -> str:\n    return b.upper()\n");
+
+    double ms = 0; size_t peak_mb = 0;
+    char *r0 = index_repo_timed(&ms, &peak_mb);
+    ASSERT(r0 != NULL); ASSERT(strstr(r0, "indexed") != NULL); free(r0);
+    ASSERT(has_function("issue6_probe_one"));
     int nodes_before = get_node_count();
     int edges_before = get_edge_count();
     ASSERT_GT(nodes_before, 0);
 
-    /* Pick a stable existing source file and bump ONLY its mtime, leaving the
-     * bytes untouched — exactly what `git checkout` does across branches. */
     char path[512];
-    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    snprintf(path, sizeof(path), "%s/%s", g_repodir, rel);
     struct stat st0;
     ASSERT_EQ(stat(path, &st0), 0);
     off_t size_before = st0.st_size;
 
-    /* Push mtime forward by ~1000s so it definitely differs from the stored
-     * value; size is preserved. */
-    struct timespec times[2];
-    times[0].tv_sec = st0.st_mtime + 1000; times[0].tv_nsec = 0; /* atime */
-    times[1].tv_sec = st0.st_mtime + 1000; times[1].tv_nsec = 0; /* mtime */
-    ASSERT_EQ(utimensat(AT_FDCWD, path, times, 0), 0);
-
-    /* Confirm content/size really unchanged, mtime really changed. */
+    /* Bump mtime forward ~1000s, bytes untouched. */
+    struct timeval tv[2];
+    tv[0].tv_sec = st0.st_mtime + 1000; tv[0].tv_usec = 0;
+    tv[1].tv_sec = st0.st_mtime + 1000; tv[1].tv_usec = 0;
+    ASSERT_EQ(utimes(path, tv), 0);
     struct stat st1;
     ASSERT_EQ(stat(path, &st1), 0);
     ASSERT_EQ((long)st1.st_size, (long)size_before);
     ASSERT(st1.st_mtime != st0.st_mtime);
 
-    double ms = 0; size_t peak_mb = 0;
-    char *resp = index_repo_timed(&ms, &peak_mb);
-    ASSERT(resp != NULL);
-    ASSERT(strstr(resp, "indexed") != NULL);
-    free(resp);
+    char *r1 = index_repo_timed(&ms, &peak_mb);
+    ASSERT(r1 != NULL); ASSERT(strstr(r1, "indexed") != NULL); free(r1);
 
-    /* HARD GATE: a pure mtime bump must not change the graph. If the content
-     * hash tiebreak regressed (or was never wired), the file would be re-parsed;
-     * even if the reparse produced identical nodes, the intent is that counts
-     * stay exactly equal to the pre-bump graph. */
+    /* HARD GATE (issue #6): a pure mtime bump must leave the graph identical.
+     * Pre-fix (mtime+size only) this file would be re-parsed; the content-hash
+     * tiebreak now proves the bytes are identical and skips it. */
     ASSERT_EQ(get_node_count(), nodes_before);
     ASSERT_EQ(get_edge_count(), edges_before);
-
     printf("    [issue#6] mtime-only bump: counts stable (%d nodes / %d edges), %.0fms\n",
            nodes_before, edges_before, ms);
     PASS();
 }
 
-/* Counterpart: a real 1-byte content change MUST still be detected. This guards
- * against "just skip everything" false-green of the above. */
 TEST(incr_content_change_still_detected) {
     char path[512];
-    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    snprintf(path, sizeof(path), "%s/fastapi/issue6_mtime_probe.py", g_repodir);
     /* Append a real new function -> content differs -> must be re-parsed. */
     FILE *f = fopen(path, "a");
     ASSERT(f != NULL);
