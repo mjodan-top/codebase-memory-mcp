@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sqlite3.h>
 
 /* ── Globals ──────────────────────────────────────────────────────── */
 
@@ -208,6 +209,341 @@ static int bm25_hits(const char *term) {
     free(resp);
     return hit;
 }
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Issue #12: partial-load vs full-load incremental consistency
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * cbm_pipeline_run_incremental can load the existing graph via two paths:
+ *   - full load  (cbm_gbuf_load_from_db): reads the WHOLE project graph.
+ *   - partial load (cbm_gbuf_load_from_db_partial): reads only the changed
+ *     files' nodes + their 1-hop cross-file neighbors + edges touching that
+ *     set (see CBM_INCR_PARTIAL_LOAD_THRESHOLD / _MIN_FILES, both runtime
+ *     overridable via env for exactly this kind of test).
+ *
+ * Both paths MUST produce an IDENTICAL final on-disk graph for the same
+ * change. dump_snapshot() below serializes every node (label, name,
+ * qualified_name, file_path, start_line, end_line — NOT id, which is
+ * allocation-order-dependent and expected to differ between the two paths)
+ * and every edge (source qualified_name, target qualified_name, type) into
+ * one big sorted, newline-joined string. Comparing these strings byte-for-
+ * byte is the actual invariant check — not just node/edge COUNTs, which
+ * would miss a case where the partial path resolves a DIFFERENT symbol to
+ * the same count of edges (e.g. a registry seeding gap silently rewiring an
+ * edge to the wrong target of the same name). */
+
+typedef struct {
+    char **lines;
+    int count;
+    int cap;
+} snapshot_lines_t;
+
+static void snapshot_push(snapshot_lines_t *s, const char *fmt, ...) {
+    if (s->count >= s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 256;
+        s->lines = realloc(s->lines, (size_t)s->cap * sizeof(char *));
+    }
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    s->lines[s->count++] = strdup(buf);
+}
+
+static int snapshot_cmp(const void *a, const void *b) {
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+/* Serialize the current on-disk graph for `project` into one sorted,
+ * newline-joined string. Caller frees the returned buffer. */
+static char *dump_snapshot(const char *db_path, const char *project) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(db_path, &db) != SQLITE_OK) {
+        if (db)
+            sqlite3_close(db);
+        return NULL;
+    }
+
+    snapshot_lines_t s = {0};
+
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db,
+                       "SELECT label, name, qualified_name, file_path, start_line, end_line "
+                       "FROM nodes WHERE project = ?1 ORDER BY qualified_name, label",
+                       -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        snapshot_push(&s, "N|%s|%s|%s|%s|%d|%d", (const char *)sqlite3_column_text(stmt, 0),
+                     (const char *)sqlite3_column_text(stmt, 1),
+                     (const char *)sqlite3_column_text(stmt, 2),
+                     (const char *)sqlite3_column_text(stmt, 3), sqlite3_column_int(stmt, 4),
+                     sqlite3_column_int(stmt, 5));
+    }
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db,
+                       "SELECT src.qualified_name, tgt.qualified_name, e.type "
+                       "FROM edges e "
+                       "JOIN nodes src ON e.source_id = src.id "
+                       "JOIN nodes tgt ON e.target_id = tgt.id "
+                       "WHERE e.project = ?1 "
+                       "ORDER BY src.qualified_name, tgt.qualified_name, e.type",
+                       -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        snapshot_push(&s, "E|%s|%s|%s", (const char *)sqlite3_column_text(stmt, 0),
+                     (const char *)sqlite3_column_text(stmt, 1),
+                     (const char *)sqlite3_column_text(stmt, 2));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    qsort(s.lines, (size_t)s.count, sizeof(char *), snapshot_cmp);
+
+    size_t total = 1;
+    for (int i = 0; i < s.count; i++) {
+        total += strlen(s.lines[i]) + 1;
+    }
+    char *out = malloc(total);
+    out[0] = '\0';
+    for (int i = 0; i < s.count; i++) {
+        strcat(out, s.lines[i]);
+        strcat(out, "\n");
+        free(s.lines[i]);
+    }
+    free(s.lines);
+    return out;
+}
+
+/* Force the load-mode env knobs so index_repo() below deterministically
+ * takes the partial or full path regardless of this fixture's actual file
+ * count (fastapi is ~1100 files; ratio/min-files defaults would otherwise
+ * make the choice depend on how many files a given test happens to touch). */
+static void force_load_mode(bool partial) {
+    if (partial) {
+        cbm_setenv("CBM_INCR_PARTIAL_LOAD_MIN_FILES", "1", 1);
+        cbm_setenv("CBM_INCR_PARTIAL_LOAD_THRESHOLD", "1.0", 1);
+    } else {
+        cbm_setenv("CBM_INCR_PARTIAL_LOAD_MIN_FILES", "1", 1);
+        cbm_setenv("CBM_INCR_PARTIAL_LOAD_THRESHOLD", "0.0", 1);
+    }
+}
+
+static void reset_load_mode(void) {
+    cbm_unsetenv("CBM_INCR_PARTIAL_LOAD_MIN_FILES");
+    cbm_unsetenv("CBM_INCR_PARTIAL_LOAD_THRESHOLD");
+}
+
+/* Scenario 1: change ONE file whose function is called from another
+ * (already-indexed) file — exercises inbound cross-file edge
+ * capture/restore under the partial-load neighbor-graph path. */
+TEST(incr_partial_vs_full_load_single_file_cross_call) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    write_file_at("fastapi/incr12_callee.py",
+                  "def incr12_target():\n    return 1\n");
+    write_file_at("fastapi/incr12_caller.py",
+                  "from fastapi.incr12_callee import incr12_target\n"
+                  "def incr12_caller():\n    return incr12_target()\n");
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    /* Now edit ONLY the callee — its body changes but its name/QN doesn't,
+     * so the inbound CALLS edge from incr12_caller must survive re-linking
+     * whichever load path ran. */
+    struct timespec ts = {0, INCR_FIX_SLEEP_NS};
+    nanosleep(&ts, NULL);
+    write_file_at("fastapi/incr12_callee.py",
+                  "def incr12_target():\n    return 2  # changed body\n");
+
+    force_load_mode(true);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    char *partial_snapshot = dump_snapshot(g_dbpath, g_project);
+
+    /* Rebuild fully from scratch, replay the SAME final file state, then run
+     * the SAME last edit forced through the full-load path, so both
+     * snapshots reflect the identical end state reached via different load
+     * strategies. */
+    unlink(g_dbpath);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    nanosleep(&ts, NULL);
+    write_file_at("fastapi/incr12_callee.py",
+                  "def incr12_target():\n    return 2  # changed body\n");
+    force_load_mode(false);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    char *full_snapshot = dump_snapshot(g_dbpath, g_project);
+    reset_load_mode();
+
+    ASSERT(partial_snapshot != NULL);
+    ASSERT(full_snapshot != NULL);
+    ASSERT(strcmp(partial_snapshot, full_snapshot) == 0);
+
+    free(partial_snapshot);
+    free(full_snapshot);
+    delete_file_at("fastapi/incr12_callee.py");
+    delete_file_at("fastapi/incr12_caller.py");
+    resp = index_repo();
+    if (resp)
+        free(resp);
+    PASS();
+}
+
+/* Scenario 2: changed-file ratio above the threshold — the partial path must
+ * itself fall back to a full load, so its result trivially equals a run that
+ * was forced full from the start. Exercises the fallback branch. */
+TEST(incr_partial_vs_full_load_above_threshold_falls_back) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    for (int i = 0; i < 5; i++) {
+        char path[128], content[256];
+        snprintf(path, sizeof(path), "fastapi/incr12_bulk_%d.py", i);
+        snprintf(content, sizeof(content), "def incr12_bulk_%d():\n    return %d\n", i, i);
+        write_file_at(path, content);
+    }
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    struct timespec ts = {0, INCR_FIX_SLEEP_NS};
+    nanosleep(&ts, NULL);
+    for (int i = 0; i < 5; i++) {
+        char path[128], content[256];
+        snprintf(path, sizeof(path), "fastapi/incr12_bulk_%d.py", i);
+        snprintf(content, sizeof(content), "def incr12_bulk_%d():\n    return %d + 1\n", i, i);
+        write_file_at(path, content);
+    }
+
+    /* Ask for partial mode, but with min_files set ABOVE this tiny fixture's
+     * changed set so the ratio/size guard itself declines partial and the
+     * code takes its OWN full-load branch — this is the real fallback path,
+     * not a test-forced full run. */
+    cbm_setenv("CBM_INCR_PARTIAL_LOAD_MIN_FILES", "999999", 1);
+    cbm_setenv("CBM_INCR_PARTIAL_LOAD_THRESHOLD", "1.0", 1);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    char *fallback_snapshot = dump_snapshot(g_dbpath, g_project);
+
+    unlink(g_dbpath);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    nanosleep(&ts, NULL);
+    for (int i = 0; i < 5; i++) {
+        char path[128], content[256];
+        snprintf(path, sizeof(path), "fastapi/incr12_bulk_%d.py", i);
+        snprintf(content, sizeof(content), "def incr12_bulk_%d():\n    return %d + 1\n", i, i);
+        write_file_at(path, content);
+    }
+    force_load_mode(false);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    char *full_snapshot = dump_snapshot(g_dbpath, g_project);
+    reset_load_mode();
+
+    ASSERT(fallback_snapshot != NULL);
+    ASSERT(full_snapshot != NULL);
+    ASSERT(strcmp(fallback_snapshot, full_snapshot) == 0);
+
+    free(fallback_snapshot);
+    free(full_snapshot);
+    for (int i = 0; i < 5; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "fastapi/incr12_bulk_%d.py", i);
+        delete_file_at(path);
+    }
+    resp = index_repo();
+    if (resp)
+        free(resp);
+    PASS();
+}
+
+/* Scenario 3: a changed file references a project symbol it did NOT
+ * reference before (no pre-existing edge) — this is the exact gap
+ * registry_seed_from_db exists to close: cbm_gbuf_foreach_node over a
+ * PARTIALLY loaded graph would miss this symbol's file as a 1-hop neighbor,
+ * so registry seeding must come from the DB directly, not from the loaded
+ * gbuf, for the partial path to resolve the new cross-file symbol at all. */
+TEST(incr_partial_vs_full_load_new_cross_file_symbol) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    /* Pre-existing symbol with NO caller yet (so no edge links to it before
+     * the edit below — the partial path's 1-hop neighbor walk has nothing to
+     * find it through). */
+    write_file_at("fastapi/incr12_new_target.py",
+                  "def incr12_brand_new_symbol():\n    return 42\n");
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    /* Now a DIFFERENT, unrelated file starts calling it for the first time —
+     * a fresh cross-file reference with no prior edge for the partial loader
+     * to walk. */
+    struct timespec ts = {0, INCR_FIX_SLEEP_NS};
+    nanosleep(&ts, NULL);
+    write_file_at("fastapi/incr12_new_caller.py",
+                  "from fastapi.incr12_new_target import incr12_brand_new_symbol\n"
+                  "def incr12_new_caller():\n    return incr12_brand_new_symbol()\n");
+
+    force_load_mode(true);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    char *partial_snapshot = dump_snapshot(g_dbpath, g_project);
+
+    unlink(g_dbpath);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    write_file_at("fastapi/incr12_new_target.py",
+                  "def incr12_brand_new_symbol():\n    return 42\n");
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    nanosleep(&ts, NULL);
+    write_file_at("fastapi/incr12_new_caller.py",
+                  "from fastapi.incr12_new_target import incr12_brand_new_symbol\n"
+                  "def incr12_new_caller():\n    return incr12_brand_new_symbol()\n");
+    force_load_mode(false);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    char *full_snapshot = dump_snapshot(g_dbpath, g_project);
+    reset_load_mode();
+
+    ASSERT(partial_snapshot != NULL);
+    ASSERT(full_snapshot != NULL);
+    /* CRITICAL: the new CALLS edge from incr12_new_caller to
+     * incr12_brand_new_symbol must appear in BOTH snapshots identically. A
+     * registry seeding gap would silently drop it from the partial path only. */
+    ASSERT(strstr(partial_snapshot, "incr12_brand_new_symbol") != NULL);
+    ASSERT(strcmp(partial_snapshot, full_snapshot) == 0);
+
+    free(partial_snapshot);
+    free(full_snapshot);
+    delete_file_at("fastapi/incr12_new_target.py");
+    delete_file_at("fastapi/incr12_new_caller.py");
+    resp = index_repo();
+    if (resp)
+        free(resp);
+    PASS();
+}
+
 
 static int count_by_label(const char *label) {
     char *resp =
@@ -3154,6 +3490,9 @@ SUITE(incremental) {
     RUN_TEST(incr_rapid_reindex);
     RUN_TEST(incr_replace_file_content);
     RUN_TEST(incr_fts_bm25_consistency);
+    RUN_TEST(incr_partial_vs_full_load_single_file_cross_call);
+    RUN_TEST(incr_partial_vs_full_load_above_threshold_falls_back);
+    RUN_TEST(incr_partial_vs_full_load_new_cross_file_symbol);
     RUN_TEST(incr_batch_add_delete);
 
     /* Phase 6: Recovery + accuracy */

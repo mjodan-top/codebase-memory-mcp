@@ -21,11 +21,13 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/log.h"
+#include "foundation/profile.h"
 #include "foundation/hash_table.h"
 #include "foundation/sha256.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include <sqlite3.h>
 
 #include <errno.h>
 #include <stdlib.h>
@@ -39,6 +41,39 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_NS_PER_MS 1000000.0
 #define CBM_NS_PER_SEC 1000000000LL
+
+/* Issue #12: partial-load thresholds for cbm_gbuf_load_from_db_partial.
+ * Below this changed/total file ratio AND at/above the min file count, the
+ * incremental path loads only the changed files' neighborhood instead of
+ * the entire graph. See use_partial_load in cbm_pipeline_run_incremental.
+ *
+ * Both are runtime-overridable via env vars so tests can force either path
+ * deterministically without recompiling (mirrors other CBM_* env knobs in
+ * this codebase, e.g. CBM_LOG_LEVEL / CBM_PROFILE). Defaults are the
+ * production values described above. */
+static double incr_partial_load_threshold(void) {
+    const char *raw = getenv("CBM_INCR_PARTIAL_LOAD_THRESHOLD");
+    if (raw && raw[0]) {
+        char *end = NULL;
+        double v = strtod(raw, &end);
+        if (end && *end == '\0' && v >= 0.0 && v <= 1.0) {
+            return v;
+        }
+    }
+    return 0.3;
+}
+
+static int incr_partial_load_min_files(void) {
+    const char *raw = getenv("CBM_INCR_PARTIAL_LOAD_MIN_FILES");
+    if (raw && raw[0]) {
+        char *end = NULL;
+        long v = strtol(raw, &end, 10);
+        if (end && *end == '\0' && v >= 0) {
+            return (int)v;
+        }
+    }
+    return 500;
+}
 
 /* ── Timing helper (same as pipeline.c) ──────────────────────────── */
 
@@ -595,6 +630,43 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_registry_add(r, node->name, node->qualified_name, node->label);
 }
 
+/* Issue #12 correctness note (partial-load path): cbm_gbuf_foreach_node over
+ * a PARTIALLY loaded graph only sees changed files + their existing 1-hop
+ * edge neighbors. A changed file that calls a project symbol it never
+ * referenced before (no pre-existing edge to it) would NOT have that
+ * symbol's file pulled in as a neighbor, so the partial gbuf's registry
+ * would miss it — a real divergence from what a full reindex would resolve.
+ * To keep incremental re-resolution correct regardless of load mode, seed
+ * the registry directly from the DB's full symbol table (name/qualified_name
+ * /label only — no properties, no edges) instead of iterating the in-RAM
+ * graph. This is still much cheaper than cbm_gbuf_load_from_db: it reads
+ * three narrow columns for registry-eligible labels only, doing no gbuf
+ * node/edge materialization, no property JSON parsing, no edge remapping. */
+static void registry_seed_from_db(cbm_store_t *store, const char *project, cbm_registry_t *r) {
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT name, qualified_name, label FROM nodes WHERE project = ? "
+                           "AND label IN ('Function','Method','Variable','Field','Class',"
+                           "'Struct','Interface','Enum','Type','Trait')",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+        const char *qn = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        const char *label = (const char *)sqlite3_column_text(stmt, 2);
+        if (incr_label_is_registry_symbol(label)) {
+            cbm_registry_add(r, name, qn, label);
+        }
+    }
+    sqlite3_finalize(stmt);
+}
+
 /* Run parallel or sequential extract+resolve for changed files. */
 static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
     struct timespec t;
@@ -882,10 +954,44 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     struct timespec t;
 
-    /* Step 1: Load existing graph into RAM */
+    /* Step 1: Load existing graph into RAM.
+     *
+     * Issue #12: cbm_gbuf_load_from_db is O(whole-graph) — it SELECTs every
+     * node/edge row for the project regardless of how few files changed. On
+     * a large project this fixed cost alone can make incremental slower than
+     * a from-scratch full index. When the change set is a small fraction of
+     * the project (below CBM_INCR_PARTIAL_LOAD_THRESHOLD) AND the project is
+     * large enough to matter (>= CBM_INCR_PARTIAL_LOAD_MIN_FILES), load only
+     * the changed files' nodes plus their 1-hop cross-file neighbors instead
+     * of the entire graph. Below CBM_INCR_PARTIAL_LOAD_MIN_FILES, or above
+     * the ratio threshold, fall back to the existing full load — it is not
+     * worth the extra query complexity for small projects, and a large
+     * change set needs most of the graph anyway. */
+    bool use_partial_load =
+        file_count >= incr_partial_load_min_files() &&
+        ci > 0 &&
+        ((double)ci / (double)file_count) < incr_partial_load_threshold();
+
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_gbuf_t *existing = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
-    int load_rc = cbm_gbuf_load_from_db(existing, db_path, project);
+    int load_rc;
+    CBM_PROF_START(t_prof_load);
+    if (use_partial_load) {
+        const char **changed_paths = malloc((size_t)ci * sizeof(char *));
+        for (int i = 0; i < ci; i++) {
+            changed_paths[i] = changed_files[i].rel_path;
+        }
+        load_rc =
+            cbm_gbuf_load_from_db_partial(existing, db_path, project, changed_paths, ci);
+        free(changed_paths);
+        cbm_log_info("incremental.load_mode", "mode", "partial", "changed", itoa_buf(ci),
+                     "total", itoa_buf(file_count));
+    } else {
+        load_rc = cbm_gbuf_load_from_db(existing, db_path, project);
+        cbm_log_info("incremental.load_mode", "mode", "full", "changed", itoa_buf(ci), "total",
+                     itoa_buf(file_count));
+    }
+    CBM_PROF_END_N("incremental", "load_from_db", t_prof_load, cbm_gbuf_node_count(existing));
     cbm_log_info("incremental.load_db", "rc", itoa_buf(load_rc), "nodes",
                  itoa_buf(cbm_gbuf_node_count(existing)), "edges",
                  itoa_buf(cbm_gbuf_edge_count(existing)), "elapsed_ms",
@@ -903,6 +1009,21 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_free_coverage(old_cov, old_cov_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
+    }
+
+    /* Issue #12 correctness: when the partial-load path is active, seed the
+     * registry directly from the DB's full symbol table (registry_seed_from_db)
+     * BEFORE closing `store` below — this must happen while `store` is still
+     * open, and independently of the partially-loaded `existing` gbuf, so a
+     * changed file that references a symbol with no pre-existing edge (hence
+     * not pulled in as a 1-hop neighbor) still resolves correctly. The full-load
+     * path is unaffected: it keeps using cbm_gbuf_foreach_node further below,
+     * whose result is provably identical to registry_seed_from_db when
+     * `existing` already holds the WHOLE graph. */
+    cbm_registry_t *db_registry = NULL;
+    if (use_partial_load) {
+        db_registry = cbm_registry_new();
+        registry_seed_from_db(store, project, db_registry);
     }
 
     cbm_store_close(store);
@@ -964,11 +1085,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("incremental.purge", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
     /* Step 3-5: Registry + extract + resolve */
-    cbm_registry_t *registry = cbm_registry_new();
+    cbm_registry_t *registry;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_gbuf_foreach_node(existing, registry_visitor, registry);
+    CBM_PROF_START(t_prof_registry);
+    if (db_registry) {
+        registry = db_registry; /* already seeded from DB above, store now closed */
+    } else {
+        registry = cbm_registry_new();
+        cbm_gbuf_foreach_node(existing, registry_visitor, registry);
+    }
+    CBM_PROF_END_N("incremental", "registry_seed", t_prof_registry, cbm_registry_size(registry));
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
-                 "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+                 "mode", db_registry ? "db_direct" : "gbuf_iter", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
 
     /* Discovery exclusions (gitignore + skip dirs) captured by the run that
      * routed here. Borrowed from the pipeline so the auxiliary repo walks

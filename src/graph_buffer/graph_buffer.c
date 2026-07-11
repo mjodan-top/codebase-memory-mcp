@@ -1006,6 +1006,272 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
     return 0;
 }
 
+
+/* ── Partial load (issue #12) ────────────────────────────────────── */
+
+/* Build a "?,?,?..." placeholder list of `count` entries into buf. Returns
+ * the number of bytes written (excluding NUL), or -1 if buf is too small. */
+static int build_placeholders(char *buf, size_t buf_sz, int count) {
+    size_t off = 0;
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(buf + off, buf_sz - off, i == 0 ? "?" : ",?");
+        if (n < 0 || (size_t)n >= buf_sz - off) {
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return (int)off;
+}
+
+/* Load nodes matching `WHERE project = ? AND file_path IN (...)` (or,
+ * when `by_id` is true, `WHERE project = ? AND id IN (...)`) into gb,
+ * remapping old ids into *old_to_new (grown/allocated by the caller to
+ * max_old_id+1 entries). Returns 0 on success. */
+static int partial_load_nodes_where(cbm_gbuf_t *gb, sqlite3 *db, const char *project,
+                                    bool by_id, const char **rel_paths, const int64_t *ids,
+                                    int count, int64_t *old_to_new, int64_t max_old_id) {
+    if (count == 0) {
+        return 0;
+    }
+    enum { PARTIAL_SQL_BUF = 4096 };
+    char placeholders[PARTIAL_SQL_BUF];
+    if (build_placeholders(placeholders, sizeof(placeholders), count) < 0) {
+        return CBM_NOT_FOUND;
+    }
+    char sql[PARTIAL_SQL_BUF + 256];
+    snprintf(sql, sizeof(sql),
+             "SELECT id, label, name, qualified_name, file_path, start_line, end_line, "
+             "properties FROM nodes WHERE project = ? AND %s IN (%s) ORDER BY id",
+             by_id ? "id" : "file_path", placeholders);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    for (int i = 0; i < count; i++) {
+        if (by_id) {
+            sqlite3_bind_int64(stmt, GB_COL_2 + i, ids[i]);
+        } else {
+            sqlite3_bind_text(stmt, GB_COL_2 + i, rel_paths[i], CBM_NOT_FOUND, SQLITE_STATIC);
+        }
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t old_id = sqlite3_column_int64(stmt, 0);
+        const char *label = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        const char *name = (const char *)sqlite3_column_text(stmt, GB_COL_2);
+        const char *qn = (const char *)sqlite3_column_text(stmt, GB_COL_3);
+        const char *fp = (const char *)sqlite3_column_text(stmt, GB_COL_4);
+        int sl = sqlite3_column_int(stmt, GB_COL_5);
+        int el = sqlite3_column_int(stmt, GB_COL_6);
+        const char *props = (const char *)sqlite3_column_text(stmt, GB_COL_7);
+
+        if (old_id > max_old_id || old_to_new[old_id] != 0) {
+            /* Already loaded (e.g. also a neighbor of another changed file) —
+             * upsert_node dedups by QN anyway, but skip the redundant call. */
+            continue;
+        }
+        int64_t new_id = cbm_gbuf_upsert_node(gb, label, name, qn, fp, sl, el, props);
+        if (new_id > 0 && old_id <= max_old_id) {
+            old_to_new[old_id] = new_id;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+/* Collect the distinct 1-hop cross-file neighbor node ids reachable from
+ * `seed_ids` (either direction of an edge). Appends new ids (not already
+ * present in old_to_new) into *out_ids (caller frees), returns count. */
+static int collect_neighbor_ids(sqlite3 *db, const char *project, const int64_t *seed_ids,
+                                int seed_count, const int64_t *old_to_new, int64_t max_old_id,
+                                int64_t **out_ids) {
+    *out_ids = NULL;
+    if (seed_count == 0) {
+        return 0;
+    }
+    enum { NEIGH_SQL_BUF = 4096 };
+    char placeholders[NEIGH_SQL_BUF];
+    if (build_placeholders(placeholders, sizeof(placeholders), seed_count) < 0) {
+        return 0;
+    }
+    char sql[NEIGH_SQL_BUF + 512];
+    snprintf(sql, sizeof(sql),
+             "SELECT DISTINCT source_id FROM edges WHERE project = ? AND target_id IN (%s) "
+             "UNION SELECT DISTINCT target_id FROM edges WHERE project = ? AND source_id IN (%s)",
+             placeholders, placeholders);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    int bi = SKIP_ONE;
+    sqlite3_bind_text(stmt, bi++, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    for (int i = 0; i < seed_count; i++) {
+        sqlite3_bind_int64(stmt, bi++, seed_ids[i]);
+    }
+    sqlite3_bind_text(stmt, bi++, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    for (int i = 0; i < seed_count; i++) {
+        sqlite3_bind_int64(stmt, bi++, seed_ids[i]);
+    }
+
+    int cap = 64;
+    int n = 0;
+    int64_t *ids = malloc((size_t)cap * sizeof(int64_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t id = sqlite3_column_int64(stmt, 0);
+        if (id <= 0 || id > max_old_id || old_to_new[id] != 0) {
+            continue; /* already loaded or out of range */
+        }
+        if (n >= cap) {
+            cap *= 2;
+            ids = realloc(ids, (size_t)cap * sizeof(int64_t));
+        }
+        ids[n++] = id;
+    }
+    sqlite3_finalize(stmt);
+    *out_ids = ids;
+    return n;
+}
+
+int cbm_gbuf_load_from_db_partial(cbm_gbuf_t *gb, const char *db_path, const char *project,
+                                  const char **changed_rel_paths, int changed_count) {
+    if (!gb || !db_path || !project || !changed_rel_paths || changed_count <= 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+
+    sqlite3_stmt *mstmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT MAX(id) FROM nodes WHERE project = ?", CBM_NOT_FOUND,
+                           &mstmt, NULL) != SQLITE_OK) {
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(mstmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    int64_t max_old_id = 0;
+    if (sqlite3_step(mstmt) == SQLITE_ROW) {
+        max_old_id = sqlite3_column_int64(mstmt, 0);
+    }
+    sqlite3_finalize(mstmt);
+
+    int64_t *old_to_new = calloc((size_t)(max_old_id + SKIP_ONE), sizeof(int64_t));
+    if (!old_to_new) {
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Step 1: load changed files' own nodes. */
+    if (partial_load_nodes_where(gb, db, project, false, changed_rel_paths, NULL, changed_count,
+                                 old_to_new, max_old_id) != 0) {
+        free(old_to_new);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Step 2: collect the 1-hop cross-file neighbor ids of the just-loaded
+     * seed node set, then load those neighbor nodes too. Seeds are every id
+     * newly mapped by step 1 (old_to_new[i] != 0). */
+    int64_t *seed_ids = malloc((size_t)(max_old_id + SKIP_ONE) * sizeof(int64_t));
+    int seed_count = 0;
+    if (seed_ids) {
+        for (int64_t i = 1; i <= max_old_id; i++) {
+            if (old_to_new[i] != 0) {
+                seed_ids[seed_count++] = i;
+            }
+        }
+    }
+    int64_t *neighbor_ids = NULL;
+    int neighbor_count =
+        seed_ids ? collect_neighbor_ids(db, project, seed_ids, seed_count, old_to_new, max_old_id,
+                                        &neighbor_ids)
+                 : 0;
+    free(seed_ids);
+
+    if (neighbor_count > 0) {
+        partial_load_nodes_where(gb, db, project, true, NULL, neighbor_ids, neighbor_count,
+                                 old_to_new, max_old_id);
+    }
+    free(neighbor_ids);
+
+    /* Step 3: load only edges touching the loaded node set — query by
+     * source_id/target_id IN (loaded ids) (indexed via idx_edges_source /
+     * idx_edges_target) instead of scanning every edge row in the project,
+     * which is the whole point of the partial path. Rows whose OTHER
+     * endpoint is outside the loaded set are naturally dropped below by the
+     * existing `new_src > 0 && new_tgt > 0` filter — same semantics as the
+     * full-load path. */
+    int64_t *loaded_ids = malloc((size_t)(max_old_id + SKIP_ONE) * sizeof(int64_t));
+    int loaded_count = 0;
+    if (loaded_ids) {
+        for (int64_t i = 1; i <= max_old_id; i++) {
+            if (old_to_new[i] != 0) {
+                loaded_ids[loaded_count++] = i;
+            }
+        }
+    }
+    if (!loaded_ids || loaded_count == 0) {
+        free(loaded_ids);
+        free(old_to_new);
+        cbm_store_close(store);
+        return 0;
+    }
+    enum { EDGE_SQL_BUF = 8192 };
+    char edge_placeholders[EDGE_SQL_BUF];
+    if (build_placeholders(edge_placeholders, sizeof(edge_placeholders), loaded_count) < 0) {
+        free(loaded_ids);
+        free(old_to_new);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+    char edge_sql[EDGE_SQL_BUF + 512];
+    snprintf(edge_sql, sizeof(edge_sql),
+             "SELECT source_id, target_id, type, properties FROM edges "
+             "WHERE project = ? AND (source_id IN (%s) OR target_id IN (%s))",
+             edge_placeholders, edge_placeholders);
+    if (sqlite3_prepare_v2(db, edge_sql, CBM_NOT_FOUND, &mstmt, NULL) != SQLITE_OK) {
+        free(loaded_ids);
+        free(old_to_new);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+    int ebi = SKIP_ONE;
+    sqlite3_bind_text(mstmt, ebi++, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    for (int i = 0; i < loaded_count; i++) {
+        sqlite3_bind_int64(mstmt, ebi++, loaded_ids[i]);
+    }
+    for (int i = 0; i < loaded_count; i++) {
+        sqlite3_bind_int64(mstmt, ebi++, loaded_ids[i]);
+    }
+    free(loaded_ids);
+    while (sqlite3_step(mstmt) == SQLITE_ROW) {
+        int64_t old_src = sqlite3_column_int64(mstmt, 0);
+        int64_t old_tgt = sqlite3_column_int64(mstmt, SKIP_ONE);
+        const char *type = (const char *)sqlite3_column_text(mstmt, GB_COL_2);
+        const char *props = (const char *)sqlite3_column_text(mstmt, GB_COL_3);
+
+        int64_t new_src = (old_src > 0 && old_src <= max_old_id) ? old_to_new[old_src] : 0;
+        int64_t new_tgt = (old_tgt > 0 && old_tgt <= max_old_id) ? old_to_new[old_tgt] : 0;
+        if (new_src > 0 && new_tgt > 0) {
+            cbm_gbuf_insert_edge(gb, new_src, new_tgt, type, props);
+        }
+    }
+    sqlite3_finalize(mstmt);
+
+    free(old_to_new);
+    cbm_store_close(store);
+    return 0;
+}
+
 void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, void *userdata) {
     if (!gb || !fn) {
         return;
