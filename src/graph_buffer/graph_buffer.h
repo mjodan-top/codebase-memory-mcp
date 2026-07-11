@@ -175,4 +175,14 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
  * Returns 0 on success. */
 int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
 
+/* Incremental merge scoped to a set of changed files (issue #4): only UPSERTs
+ * nodes whose file_path is in `changed`; edges touching a changed file are
+ * (re)written, resolving an unchanged endpoint's id from the on-disk graph.
+ * Rows for unchanged files are left untouched — write set is O(change), not
+ * O(graph). Caller must have removed changed files' stale rows first and
+ * opened a transaction. */
+struct CBMHashTable;
+int cbm_gbuf_merge_changed_into_store(cbm_gbuf_t *gb, cbm_store_t *store,
+                                      const struct CBMHashTable *changed);
+
 #endif /* CBM_GRAPH_BUFFER_H */
