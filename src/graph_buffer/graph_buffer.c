@@ -1135,6 +1135,48 @@ static int collect_neighbor_ids(sqlite3 *db, const char *project, const int64_t 
     return n;
 }
 
+/* Load every node whose label is "registry-eligible" (Function/Method/
+ * Variable/Field/Class/Struct/Interface/Enum/Type/Trait — mirrors
+ * incr_label_is_registry_symbol in pipeline_incremental.c EXACTLY). This
+ * keeps the partial-load node set consistent with registry_seed_from_db's
+ * query predicate: any symbol the registry resolves a reference TO must also
+ * have a backing node in `gb`, or cbm_gbuf_find_by_qn during resolution
+ * would return NULL and the resolver would silently drop the edge (issue
+ * #12 follow-up: a changed file referencing a project symbol it never
+ * pointed to before has no pre-existing edge, so the 1-hop neighbor walk
+ * alone cannot find it). Returns 0 on success. */
+static int partial_load_registry_nodes(cbm_gbuf_t *gb, sqlite3 *db, const char *project,
+                                       int64_t *old_to_new, int64_t max_old_id) {
+    const char *sql =
+        "SELECT id, label, name, qualified_name, file_path, start_line, end_line, properties "
+        "FROM nodes WHERE project = ? AND label IN ('Function','Method','Variable','Field',"
+        "'Class','Struct','Interface','Enum','Type','Trait')";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t old_id = sqlite3_column_int64(stmt, 0);
+        if (old_id <= 0 || old_id > max_old_id || old_to_new[old_id] != 0) {
+            continue; /* already loaded */
+        }
+        const char *label = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        const char *name = (const char *)sqlite3_column_text(stmt, GB_COL_2);
+        const char *qn = (const char *)sqlite3_column_text(stmt, GB_COL_3);
+        const char *fp = (const char *)sqlite3_column_text(stmt, GB_COL_4);
+        int sl = sqlite3_column_int(stmt, GB_COL_5);
+        int el = sqlite3_column_int(stmt, GB_COL_6);
+        const char *props = (const char *)sqlite3_column_text(stmt, GB_COL_7);
+        int64_t new_id = cbm_gbuf_upsert_node(gb, label, name, qn, fp, sl, el, props);
+        if (new_id > 0) {
+            old_to_new[old_id] = new_id;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
 int cbm_gbuf_load_from_db_partial(cbm_gbuf_t *gb, const char *db_path, const char *project,
                                   const char **changed_rel_paths, int changed_count) {
     if (!gb || !db_path || !project || !changed_rel_paths || changed_count <= 0) {
@@ -1173,6 +1215,18 @@ int cbm_gbuf_load_from_db_partial(cbm_gbuf_t *gb, const char *db_path, const cha
     /* Step 1: load changed files' own nodes. */
     if (partial_load_nodes_where(gb, db, project, false, changed_rel_paths, NULL, changed_count,
                                  old_to_new, max_old_id) != 0) {
+        free(old_to_new);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Step 1.5 (issue #12 follow-up): also load every registry-eligible node
+     * project-wide, so the registry seeded from the SAME predicate
+     * (registry_seed_from_db) always has a backing gbuf node to resolve
+     * references TO — even when no pre-existing edge makes it a 1-hop
+     * neighbor of a changed file (e.g. a brand-new cross-file reference to a
+     * previously-uncalled symbol). */
+    if (partial_load_registry_nodes(gb, db, project, old_to_new, max_old_id) != 0) {
         free(old_to_new);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
