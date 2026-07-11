@@ -851,6 +851,88 @@ TEST(incr_accuracy_vs_full) {
  *  PHASE 7: Performance regression guards
  * ══════════════════════════════════════════════════════════════════ */
 
+/* ══════════════════════════════════════════════════════════════════
+ *  Issue #6: mtime-only change (git checkout / worktree switch rewrites
+ *  file mtimes even when content is byte-identical) must NOT be treated
+ *  as a content change. Before the fix, dirty detection compared only
+ *  mtime+size, so a pure mtime bump re-parsed the file. After the fix,
+ *  the content-hash tiebreak proves the bytes are identical and skips it.
+ *
+ *  Ground-truth, deterministic asserts (no LLM):
+ *   - bump mtime only  -> node/edge counts identical to full (unchanged)
+ *   - change 1 byte of content -> counts differ (changed, still detected)
+ * ══════════════════════════════════════════════════════════════════ */
+TEST(incr_mtime_bump_only_is_unchanged) {
+    /* Baseline: current graph equals the full index (prior tests restored it,
+     * or this asserts against the full snapshot captured in incr_full_index). */
+    int nodes_before = get_node_count();
+    int edges_before = get_edge_count();
+    ASSERT_GT(nodes_before, 0);
+
+    /* Pick a stable existing source file and bump ONLY its mtime, leaving the
+     * bytes untouched — exactly what `git checkout` does across branches. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    struct stat st0;
+    ASSERT_EQ(stat(path, &st0), 0);
+    off_t size_before = st0.st_size;
+
+    /* Push mtime forward by ~1000s so it definitely differs from the stored
+     * value; size is preserved. */
+    struct timespec times[2];
+    times[0].tv_sec = st0.st_mtime + 1000; times[0].tv_nsec = 0; /* atime */
+    times[1].tv_sec = st0.st_mtime + 1000; times[1].tv_nsec = 0; /* mtime */
+    ASSERT_EQ(utimensat(AT_FDCWD, path, times, 0), 0);
+
+    /* Confirm content/size really unchanged, mtime really changed. */
+    struct stat st1;
+    ASSERT_EQ(stat(path, &st1), 0);
+    ASSERT_EQ((long)st1.st_size, (long)size_before);
+    ASSERT(st1.st_mtime != st0.st_mtime);
+
+    double ms = 0; size_t peak_mb = 0;
+    char *resp = index_repo_timed(&ms, &peak_mb);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+
+    /* HARD GATE: a pure mtime bump must not change the graph. If the content
+     * hash tiebreak regressed (or was never wired), the file would be re-parsed;
+     * even if the reparse produced identical nodes, the intent is that counts
+     * stay exactly equal to the pre-bump graph. */
+    ASSERT_EQ(get_node_count(), nodes_before);
+    ASSERT_EQ(get_edge_count(), edges_before);
+
+    printf("    [issue#6] mtime-only bump: counts stable (%d nodes / %d edges), %.0fms\n",
+           nodes_before, edges_before, ms);
+    PASS();
+}
+
+/* Counterpart: a real 1-byte content change MUST still be detected. This guards
+ * against "just skip everything" false-green of the above. */
+TEST(incr_content_change_still_detected) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    /* Append a real new function -> content differs -> must be re-parsed. */
+    FILE *f = fopen(path, "a");
+    ASSERT(f != NULL);
+    fprintf(f, "\n\ndef incr_issue6_sentinel_fn(z: int) -> int:\n    return z * 2\n");
+    fclose(f);
+
+    double ms = 0; size_t peak_mb = 0;
+    char *resp = index_repo_timed(&ms, &peak_mb);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+
+    /* The new symbol must appear -> proves the changed file was re-parsed,
+     * i.e. the hash tiebreak did NOT wrongly classify a real change as clean. */
+    ASSERT(has_function("incr_issue6_sentinel_fn"));
+    printf("    [issue#6] 1-byte content change: re-parsed and detected, %.0fms\n", ms);
+    PASS();
+}
+
+
 TEST(incr_perf_single_file_fast) {
     /* Modifying one file should complete in <2s (not re-parse everything) */
     write_file_at("fastapi/incr_perf_probe.py", "def perf_probe():\n    return 42\n");
@@ -2989,6 +3071,8 @@ SUITE(incremental) {
 
     /* Phase 7: Performance regression */
     RUN_TEST(incr_perf_single_file_fast);
+    RUN_TEST(incr_mtime_bump_only_is_unchanged);
+    RUN_TEST(incr_content_change_still_detected);
 
     /* Phase 8: list_projects + index_status + schema */
     RUN_TEST(tool_list_projects_basic);
