@@ -713,6 +713,28 @@ static void incr_prune_file_cb(const char *key, void *value, void *userdata) {
     }
 }
 
+/* Issue #8: per-file FTS delete/insert callbacks for incremental FTS5
+ * maintenance. delete runs BEFORE node prune (needs the current nodes rows to
+ * form the contentless 'delete' with the exact indexed values); insert runs
+ * AFTER the changed subgraph is UPSERTed (fresh nodes rows). Deleted files are
+ * in changed_paths too: their delete removes stale FTS rows, and their insert
+ * is a no-op (zero matching nodes). */
+static void incr_fts_delete_file_cb(const char *key, void *value, void *userdata) {
+    (void)value;
+    incr_prune_ctx_t *ctx = (incr_prune_ctx_t *)userdata;
+    if (ctx && key) {
+        cbm_store_fts_delete_file(ctx->store, ctx->project, key);
+    }
+}
+
+static void incr_fts_insert_file_cb(const char *key, void *value, void *userdata) {
+    (void)value;
+    incr_prune_ctx_t *ctx = (incr_prune_ctx_t *)userdata;
+    if (ctx && key) {
+        cbm_store_fts_insert_file(ctx->store, ctx->project, key);
+    }
+}
+
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                              cbm_file_info_t *files, int file_count,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
@@ -732,6 +754,14 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     if (hash_store) {
         cbm_store_begin_bulk(hash_store);
         cbm_store_begin(hash_store);
+        /* Issue #8: delete stale FTS5 rows for changed/deleted files BEFORE the
+         * node rows are pruned — the contentless 'delete' command needs the
+         * original indexed column values, which only exist while the nodes rows
+         * are still present. */
+        if (changed_paths) {
+            incr_prune_ctx_t fts_del = {.store = hash_store, .project = project};
+            cbm_ht_foreach(changed_paths, incr_fts_delete_file_cb, &fts_del);
+        }
         /* Prune changed + deleted files' stale rows (edges cascade). */
         if (changed_paths) {
             incr_prune_ctx_t prune = {.store = hash_store, .project = project};
@@ -752,18 +782,18 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
             cbm_log_error("incremental.err", "msg", "persist_coverage", "project", project);
         }
 
-        /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
-         * any triggers that could have kept nodes_fts synchronized, so we
-         * rebuild from the nodes table here.  See the full-dump path in
-         * pipeline.c for the matching logic. */
-        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-        if (cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                           "FROM nodes;") != CBM_STORE_OK) {
-            cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+        /* Issue #8: FTS5 incremental maintenance. The old path did an O(graph)
+         * delete-all + full-table rescan on every incremental index, defeating
+         * the row-level dump above (#4/#5). Instead, having already deleted the
+         * changed/deleted files' stale FTS rows before the prune, re-insert FTS
+         * rows for ONLY the changed files' fresh nodes. Deleted files match zero
+         * nodes here (no-op). Unchanged files' FTS rows were never touched — and
+         * their nodes.id is stable across the row-level dump, so their existing
+         * FTS rowids remain correct. This keeps FTS cost O(change), not O(graph),
+         * while staying byte-identical to the full-index FTS content. */
+        if (changed_paths) {
+            incr_prune_ctx_t fts_ins = {.store = hash_store, .project = project};
+            cbm_ht_foreach(changed_paths, incr_fts_insert_file_cb, &fts_ins);
         }
 
         cbm_store_close(hash_store);

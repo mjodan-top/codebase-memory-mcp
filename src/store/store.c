@@ -1573,6 +1573,118 @@ int cbm_store_delete_nodes_by_file(cbm_store_t *s, const char *project, const ch
     return CBM_STORE_OK;
 }
 
+/* ── FTS5 incremental maintenance (issue #8) ─────────────────────────
+ * nodes_fts is a CONTENTLESS FTS5 table (content=''), so it stores only the
+ * inverted index — there is no shadow copy of the source columns and no
+ * trigger keeping it in sync with `nodes`. The incremental row-level persist
+ * (#4/#5) touches only changed/deleted files' node rows, so the FTS index must
+ * be maintained the same way instead of the old O(graph) delete-all + full
+ * rescan. These two helpers delete/insert ONLY the FTS rows for one file's
+ * nodes, keeping FTS maintenance proportional to the change set.
+ *
+ * Contentless-table delete requires the special 'delete' command carrying the
+ * ORIGINAL column values that were indexed at insert time. At insert time the
+ * `name` column is fed cbm_camel_split(name); the delete must therefore pass
+ * the identical cbm_camel_split(name) expression, or FTS5 leaves stale posting
+ * entries behind. We SELECT the values straight from `nodes` (still present at
+ * delete time — the caller runs this BEFORE pruning node rows) so the delete
+ * mirrors exactly what was inserted. */
+int cbm_store_fts_delete_file(cbm_store_t *s, const char *project, const char *file_path) {
+    if (!s || !project || !file_path) {
+        return CBM_STORE_ERR;
+    }
+    /* Read back the indexed column values for every node in this file, then
+     * issue a per-row contentless 'delete'. Two variants: the camelCase-split
+     * form (matches the primary insert) with a plain-name fallback, mirroring
+     * the insert-side fallback so a delete never diverges from its insert. */
+    sqlite3_stmt *sel = NULL;
+    const char *sel_sql =
+        "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+        "FROM nodes WHERE project = ?1 AND file_path = ?2;";
+    if (sqlite3_prepare_v2(s->db, sel_sql, CBM_NOT_FOUND, &sel, NULL) != SQLITE_OK) {
+        /* cbm_camel_split unavailable (shouldn't happen — always registered).
+         * Fall back to plain name so delete still matches a plain-name insert. */
+        const char *sel_plain =
+            "SELECT id, name, qualified_name, label, file_path "
+            "FROM nodes WHERE project = ?1 AND file_path = ?2;";
+        if (sqlite3_prepare_v2(s->db, sel_plain, CBM_NOT_FOUND, &sel, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "fts_delete_file_select");
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_stmt *del = NULL;
+    const char *del_sql =
+        "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path) "
+        "VALUES('delete', ?1, ?2, ?3, ?4, ?5);";
+    if (sqlite3_prepare_v2(s->db, del_sql, CBM_NOT_FOUND, &del, NULL) != SQLITE_OK) {
+        sqlite3_finalize(sel);
+        store_set_error_sqlite(s, "fts_delete_file_prepare");
+        return CBM_STORE_ERR;
+    }
+
+    int rc = CBM_STORE_OK;
+    bind_text(sel, SKIP_ONE, project);
+    bind_text(sel, ST_COL_2, file_path);
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+        sqlite3_int64 id = sqlite3_column_int64(sel, 0);
+        const unsigned char *name = sqlite3_column_text(sel, 1);
+        const unsigned char *qn = sqlite3_column_text(sel, 2);
+        const unsigned char *label = sqlite3_column_text(sel, 3);
+        const unsigned char *fp = sqlite3_column_text(sel, 4);
+        sqlite3_bind_int64(del, 1, id);
+        sqlite3_bind_text(del, 2, (const char *)name, CBM_NOT_FOUND, CBM_SQLITE_TRANSIENT);
+        sqlite3_bind_text(del, 3, (const char *)qn, CBM_NOT_FOUND, CBM_SQLITE_TRANSIENT);
+        sqlite3_bind_text(del, 4, (const char *)label, CBM_NOT_FOUND, CBM_SQLITE_TRANSIENT);
+        sqlite3_bind_text(del, 5, (const char *)fp, CBM_NOT_FOUND, CBM_SQLITE_TRANSIENT);
+        if (sqlite3_step(del) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "fts_delete_file_step");
+            rc = CBM_STORE_ERR;
+            /* keep going: best-effort, but report failure */
+        }
+        sqlite3_reset(del);
+        sqlite3_clear_bindings(del);
+    }
+    sqlite3_finalize(sel);
+    sqlite3_finalize(del);
+    return rc;
+}
+
+/* Insert FTS rows for every node currently in `file_path`. Called AFTER the
+ * changed-file subgraph has been UPSERTed, so `nodes` holds the fresh rows.
+ * Deleted files match zero rows here (their nodes are gone), so calling this
+ * for a deleted file is a harmless no-op. Mirrors the full-path insert exactly
+ * (cbm_camel_split with a plain-name fallback) so incremental and full indexes
+ * are byte-identical. */
+int cbm_store_fts_insert_file(cbm_store_t *s, const char *project, const char *file_path) {
+    if (!s || !project || !file_path) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *ins = NULL;
+    const char *ins_sql =
+        "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+        "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+        "FROM nodes WHERE project = ?1 AND file_path = ?2;";
+    if (sqlite3_prepare_v2(s->db, ins_sql, CBM_NOT_FOUND, &ins, NULL) != SQLITE_OK) {
+        const char *ins_plain =
+            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+            "SELECT id, name, qualified_name, label, file_path "
+            "FROM nodes WHERE project = ?1 AND file_path = ?2;";
+        if (sqlite3_prepare_v2(s->db, ins_plain, CBM_NOT_FOUND, &ins, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "fts_insert_file_prepare");
+            return CBM_STORE_ERR;
+        }
+    }
+    bind_text(ins, SKIP_ONE, project);
+    bind_text(ins, ST_COL_2, file_path);
+    int rc = CBM_STORE_OK;
+    if (sqlite3_step(ins) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "fts_insert_file_step");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(ins);
+    return rc;
+}
+
 int cbm_store_delete_nodes_by_label(cbm_store_t *s, const char *project, const char *label) {
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_nodes_by_label,
                                         "DELETE FROM nodes WHERE project = ?1 AND label = ?2;");
