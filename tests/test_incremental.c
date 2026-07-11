@@ -425,13 +425,17 @@ TEST(incr_modify_file) {
     ASSERT(has_function("incr_modify_extra_b"));
     ASSERT_GT(get_node_count(), nodes_before);
 
-    /* Single-file incremental should be faster than full */
-    if ((int)ms > (int)(g_full_index_ms * 1.5)) {
-        printf("    [PERF WARNING] incremental slower than 1.5x full: %.0fms vs %.0fms\n", ms,
-               g_full_index_ms);
-    }
-
+    /* Issue #4 HARD GATE: a single-file incremental reindex must be strictly
+     * cheaper than a full reindex. The old row-level dump regression (unlink +
+     * full-graph rebuild) made incremental scale with graph size; this asserts
+     * it does not. Bound is generous (< full) to stay stable on noisy CI while
+     * still failing a true O(graph) regression, which pushes incremental to
+     * >= full on a repo this size. g_full_index_ms is the baseline captured by
+     * incr_full_index earlier in this ordered suite. */
     printf("    [perf] modify 1 file: %.0fms (full was %.0fms)\n", ms, g_full_index_ms);
+    if (g_full_index_ms > 50.0) { /* only gate when baseline is meaningful */
+        ASSERT_LT((int)ms, (int)g_full_index_ms);
+    }
 
     PASS();
 }
@@ -456,14 +460,19 @@ TEST(incr_formatter_run) {
     ASSERT(strstr(resp, "indexed") != NULL);
     free(resp);
 
-    /* Graph should be nearly identical — formatter adds no functions.
-     * Warn on >10% variance (can happen with sparse checkout / smaller repos). */
+    /* Graph should be nearly identical — a formatter adds no functions.
+     * Issue #4 HARD GATE: the row-level incremental dump must preserve nodes AND
+     * edges across a 50-file reindex. A lost-edge regression in the row-level
+     * path (e.g. dropping cross-file inbound edges whose source lives in an
+     * unchanged file) would blow past this 10% band, so this asserts hard on
+     * both counts rather than only warning. CALLS is exempted below because
+     * reformatting genuinely shifts line-number-based resolution. */
     int node_diff = abs(get_node_count() - nodes_before);
     int edge_diff = abs(get_edge_count() - edges_before);
-    if (node_diff > nodes_before / 10 || edge_diff > edges_before / 10) {
-        printf("    [PERF WARNING] formatter drift: node_diff=%d (max %d), edge_diff=%d (max %d)\n",
-               node_diff, nodes_before / 10, edge_diff, edges_before / 10);
-    }
+    printf("    [perf] formatter drift: node_diff=%d (max %d), edge_diff=%d (max %d)\n",
+           node_diff, nodes_before / 10, edge_diff, edges_before / 10);
+    ASSERT_LTE(node_diff, nodes_before / 10);
+    ASSERT_LTE(edge_diff, edges_before / 10);
 
     /* CALLS edges: reformatting changes line numbers which affects resolution. */
     int calls_diff = abs(get_edge_count_by_type("CALLS") - calls_before);

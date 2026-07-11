@@ -1841,3 +1841,122 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     free(temp_to_real);
     return 0;
 }
+
+/* Incremental merge scoped to a set of changed files (issue #4).
+ *
+ * Unlike cbm_gbuf_merge_into_store (which UPSERTs the ENTIRE in-memory graph
+ * back to the store, i.e. O(graph size) write amplification), this only writes
+ * rows whose file_path is in `changed` — the set of files re-parsed this run.
+ * Unchanged files' rows are left untouched on disk. Edges are written only when
+ * BOTH endpoints resolved to a real id this run (endpoint node was itself part
+ * of the changed set, so it was UPSERTed above) — the inbound cross-file edges
+ * that the incremental purge orphaned are restored separately by the caller's
+ * relink step, which UPSERTs them through the same insert_edge dedup path.
+ *
+ * Preconditions (caller): the changed files' stale rows were already removed
+ * via cbm_store_delete_nodes_by_file (edges cascade via ON DELETE CASCADE,
+ * foreign_keys=ON), and the store is inside a transaction opened by the caller.
+ * insert_edge / upsert_node both use ON CONFLICT DO UPDATE (never REPLACE), so
+ * re-writing a row is a safe idempotent update, not a delete+insert that would
+ * trip the edge cascade.
+ */
+int cbm_gbuf_merge_changed_into_store(cbm_gbuf_t *gb, cbm_store_t *store,
+                                      const CBMHashTable *changed) {
+    if (!gb || !store || !changed) {
+        return CBM_NOT_FOUND;
+    }
+
+    int64_t max_temp_id = gb->next_id;
+    int64_t *temp_to_real = calloc((size_t)max_temp_id, sizeof(int64_t));
+    if (!temp_to_real) {
+        return CBM_NOT_FOUND;
+    }
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *n = gb->nodes.items[i];
+
+        if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+            continue;
+        }
+        /* Only nodes belonging to a changed file are (re)written. */
+        if (!n->file_path || !cbm_ht_get((CBMHashTable *)changed, n->file_path)) {
+            continue;
+        }
+
+        cbm_node_t sn = {
+            .project = gb->project,
+            .label = n->label,
+            .name = n->name,
+            .qualified_name = n->qualified_name,
+            .file_path = n->file_path,
+            .start_line = n->start_line,
+            .end_line = n->end_line,
+            .properties_json = n->properties_json,
+        };
+        int64_t real_id = cbm_store_upsert_node(store, &sn);
+        if (real_id > 0 && n->id < max_temp_id) {
+            temp_to_real[n->id] = real_id;
+        }
+    }
+
+    /* Write edges touching a changed file. At least ONE endpoint must have been
+     * UPSERTed this run (lives in a changed file); the OTHER endpoint may live
+     * in an UNCHANGED file (e.g. a cross-file inbound edge restored by the
+     * caller's relink step, whose source file was never re-parsed). For such an
+     * endpoint temp_to_real is 0, but its row already exists on disk unchanged —
+     * resolve its id by qualified_name. Edges with NEITHER endpoint changed are
+     * skipped: they were never deleted, so their disk rows are already correct.
+     * This keeps the write set proportional to the CHANGED-file neighbourhood
+     * (O(change), issue #4), not the whole graph. */
+    for (int i = 0; i < gb->edges.count; i++) {
+        cbm_gbuf_edge_t *e = gb->edges.items[i];
+        int64_t real_src = (e->source_id < max_temp_id) ? temp_to_real[e->source_id] : 0;
+        int64_t real_tgt = (e->target_id < max_temp_id) ? temp_to_real[e->target_id] : 0;
+
+        /* Skip edges wholly inside unchanged files (their rows survived). */
+        if (real_src == 0 && real_tgt == 0) {
+            continue;
+        }
+
+        /* Resolve an unchanged endpoint from the on-disk graph by its qn. */
+        if (real_src == 0) {
+            const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(gb, e->source_id);
+            if (src && src->qualified_name) {
+                cbm_node_t on_disk = {0};
+                if (cbm_store_find_node_by_qn(store, gb->project, src->qualified_name, &on_disk) ==
+                        CBM_STORE_OK &&
+                    on_disk.id > 0) {
+                    real_src = on_disk.id;
+                }
+                cbm_node_free_fields(&on_disk);
+            }
+        }
+        if (real_tgt == 0) {
+            const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_id(gb, e->target_id);
+            if (tgt && tgt->qualified_name) {
+                cbm_node_t on_disk = {0};
+                if (cbm_store_find_node_by_qn(store, gb->project, tgt->qualified_name, &on_disk) ==
+                        CBM_STORE_OK &&
+                    on_disk.id > 0) {
+                    real_tgt = on_disk.id;
+                }
+                cbm_node_free_fields(&on_disk);
+            }
+        }
+        if (real_src == 0 || real_tgt == 0) {
+            continue; /* endpoint truly absent (e.g. deleted file) — drop edge */
+        }
+
+        cbm_edge_t se = {
+            .project = gb->project,
+            .source_id = real_src,
+            .target_id = real_tgt,
+            .type = e->type,
+            .properties_json = e->properties_json,
+        };
+        cbm_store_insert_edge(store, &se);
+    }
+
+    free(temp_to_real);
+    return 0;
+}

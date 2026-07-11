@@ -628,27 +628,56 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
+/* Issue #4: per-file prune callback for the row-level incremental persist. */
+typedef struct {
+    cbm_store_t *store;
+    const char *project;
+} incr_prune_ctx_t;
+
+static void incr_free_key_cb(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    free(value); /* value == owned strdup of key */
+}
+
+static void incr_prune_file_cb(const char *key, void *value, void *userdata) {
+    (void)value;
+    incr_prune_ctx_t *ctx = (incr_prune_ctx_t *)userdata;
+    if (ctx && key) {
+        cbm_store_delete_nodes_by_file(ctx->store, ctx->project, key);
+    }
+}
+
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                              cbm_file_info_t *files, int file_count,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count) {
+                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
+                             const CBMHashTable *changed_paths) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-    cbm_unlink(db_path);
-    char wal[INCR_WAL_BUF];
-    char shm[INCR_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
-
-    int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
-    cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(t)));
-
+    /* Issue #4: incremental ROW-LEVEL persist. The old path unlinked the whole
+     * DB and rebuilt it from the full in-RAM graph via cbm_gbuf_dump_to_sqlite
+     * — an O(graph size) write on every single-file edit. Instead, open the
+     * existing DB, DELETE only the changed files' rows (edges cascade via
+     * ON DELETE CASCADE, foreign_keys=ON), then UPSERT only the changed-file
+     * subgraph. Rows for unchanged files are never touched. */
+    int dump_rc = CBM_STORE_ERR;
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
+        cbm_store_begin_bulk(hash_store);
+        cbm_store_begin(hash_store);
+        /* Prune changed + deleted files' stale rows (edges cascade). */
+        if (changed_paths) {
+            incr_prune_ctx_t prune = {.store = hash_store, .project = project};
+            cbm_ht_foreach(changed_paths, incr_prune_file_cb, &prune);
+        }
+        dump_rc = cbm_gbuf_merge_changed_into_store(gbuf, hash_store, changed_paths);
+        cbm_store_commit(hash_store);
+        cbm_store_end_bulk(hash_store);
+        cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "mode", "rowlevel", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
@@ -802,6 +831,31 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("incremental.edge_snapshot", "captured", itoa_buf(edge_cap.count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
+    /* Issue #4: persistent set of changed + deleted rel paths for the row-level
+     * dump. Owns strdup'd keys (changed_files/deleted are freed before dump).
+     * Freed after dump_and_persist. */
+    CBMHashTable *persist_changed =
+        cbm_ht_create((ci + deleted_count) > 0 ? (size_t)(ci + deleted_count) * PAIR_LEN
+                                               : CBM_SZ_64);
+    for (int i = 0; i < ci; i++) {
+        const char *rp = changed_files[i].rel_path;
+        if (rp && !cbm_ht_get(persist_changed, rp)) {
+            char *owned = strdup(rp); /* set stores pointer only; own the string */
+            if (owned) {
+                cbm_ht_set(persist_changed, owned, owned);
+            }
+        }
+    }
+    for (int i = 0; i < deleted_count; i++) {
+        const char *rp = deleted[i];
+        if (rp && !cbm_ht_get(persist_changed, rp)) {
+            char *owned = strdup(rp);
+            if (owned) {
+                cbm_ht_set(persist_changed, owned, owned);
+            }
+        }
+    }
+
     /* Step 2: Purge stale nodes */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     for (int i = 0; i < ci; i++) {
@@ -939,7 +993,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
     dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n);
+                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, persist_changed);
+    cbm_ht_foreach(persist_changed, incr_free_key_cb, NULL);
+    cbm_ht_free(persist_changed);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
