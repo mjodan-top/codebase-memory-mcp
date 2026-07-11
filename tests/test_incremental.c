@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <sys/time.h>
 
 /* ── Globals ──────────────────────────────────────────────────────── */
 
@@ -850,6 +851,85 @@ TEST(incr_accuracy_vs_full) {
 /* ══════════════════════════════════════════════════════════════════
  *  PHASE 7: Performance regression guards
  * ══════════════════════════════════════════════════════════════════ */
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Issue #6: mtime-only change (git checkout / worktree switch rewrites
+ *  file mtimes even when content is byte-identical) must NOT be treated
+ *  as a content change. Before the fix, dirty detection compared only
+ *  mtime+size, so a pure mtime bump re-parsed the file. After the fix,
+ *  the content-hash tiebreak proves the bytes are identical and skips it.
+ *
+ *  Ground-truth, deterministic asserts (no LLM):
+ *   - bump mtime only  -> node/edge counts identical to full (unchanged)
+ *   - change 1 byte of content -> counts differ (changed, still detected)
+ * ══════════════════════════════════════════════════════════════════ */
+TEST(incr_mtime_bump_only_is_unchanged) {
+    /* Self-contained: create our OWN probe file so no other test's edits to
+     * shared fixture files can pollute the baseline. Index once to record it,
+     * then bump ONLY its mtime (what `git checkout` does) and re-index. */
+    const char *rel = "fastapi/issue6_mtime_probe.py";
+    write_file_at(rel, "def issue6_probe_one(a: int) -> int:\n    return a + 1\n\n"
+                       "def issue6_probe_two(b: str) -> str:\n    return b.upper()\n");
+
+    double ms = 0; size_t peak_mb = 0;
+    char *r0 = index_repo_timed(&ms, &peak_mb);
+    ASSERT(r0 != NULL); ASSERT(strstr(r0, "indexed") != NULL); free(r0);
+    ASSERT(has_function("issue6_probe_one"));
+    int nodes_before = get_node_count();
+    int edges_before = get_edge_count();
+    ASSERT_GT(nodes_before, 0);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", g_repodir, rel);
+    struct stat st0;
+    ASSERT_EQ(stat(path, &st0), 0);
+    off_t size_before = st0.st_size;
+
+    /* Bump mtime forward ~1000s, bytes untouched. */
+    struct timeval tv[2];
+    tv[0].tv_sec = st0.st_mtime + 1000; tv[0].tv_usec = 0;
+    tv[1].tv_sec = st0.st_mtime + 1000; tv[1].tv_usec = 0;
+    ASSERT_EQ(utimes(path, tv), 0);
+    struct stat st1;
+    ASSERT_EQ(stat(path, &st1), 0);
+    ASSERT_EQ((long)st1.st_size, (long)size_before);
+    ASSERT(st1.st_mtime != st0.st_mtime);
+
+    char *r1 = index_repo_timed(&ms, &peak_mb);
+    ASSERT(r1 != NULL); ASSERT(strstr(r1, "indexed") != NULL); free(r1);
+
+    /* HARD GATE (issue #6): a pure mtime bump must leave the graph identical.
+     * Pre-fix (mtime+size only) this file would be re-parsed; the content-hash
+     * tiebreak now proves the bytes are identical and skips it. */
+    ASSERT_EQ(get_node_count(), nodes_before);
+    ASSERT_EQ(get_edge_count(), edges_before);
+    printf("    [issue#6] mtime-only bump: counts stable (%d nodes / %d edges), %.0fms\n",
+           nodes_before, edges_before, ms);
+    PASS();
+}
+
+TEST(incr_content_change_still_detected) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/issue6_mtime_probe.py", g_repodir);
+    /* Append a real new function -> content differs -> must be re-parsed. */
+    FILE *f = fopen(path, "a");
+    ASSERT(f != NULL);
+    fprintf(f, "\n\ndef incr_issue6_sentinel_fn(z: int) -> int:\n    return z * 2\n");
+    fclose(f);
+
+    double ms = 0; size_t peak_mb = 0;
+    char *resp = index_repo_timed(&ms, &peak_mb);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+
+    /* The new symbol must appear -> proves the changed file was re-parsed,
+     * i.e. the hash tiebreak did NOT wrongly classify a real change as clean. */
+    ASSERT(has_function("incr_issue6_sentinel_fn"));
+    printf("    [issue#6] 1-byte content change: re-parsed and detected, %.0fms\n", ms);
+    PASS();
+}
+
 
 TEST(incr_perf_single_file_fast) {
     /* Modifying one file should complete in <2s (not re-parse everything) */
@@ -2989,6 +3069,8 @@ SUITE(incremental) {
 
     /* Phase 7: Performance regression */
     RUN_TEST(incr_perf_single_file_fast);
+    RUN_TEST(incr_mtime_bump_only_is_unchanged);
+    RUN_TEST(incr_content_change_still_detected);
 
     /* Phase 8: list_projects + index_status + schema */
     RUN_TEST(tool_list_projects_basic);

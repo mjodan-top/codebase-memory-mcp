@@ -22,6 +22,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "discover/discover.h"
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
+#include "foundation/sha256.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
@@ -70,6 +71,41 @@ static int64_t stat_mtime_ns(const struct stat *st) {
 #endif
 }
 
+
+/* ── Content hash helper (issue #6) ──────────────────────────────────
+ * Compute the lowercase-hex SHA-256 of a file's bytes. Returns 0 on success
+ * and writes CBM_SHA256_HEX_LEN+1 chars into out; returns -1 on any I/O error
+ * (caller then falls back to treating the file as changed). Used only as a
+ * tiebreak when mtime/size disagree, so the common (unchanged) path never
+ * pays for it — same two-tier design Git's index uses for the racy case. */
+static int cbm_hash_file_hex(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return -1;
+    }
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        cbm_sha256_update(&ctx, buf, n);
+    }
+    int ferr = ferror(fp);
+    fclose(fp);
+    if (ferr) {
+        return -1;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hx[(digest[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hx[digest[i] & 0xF];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return 0;
+}
+
 /* ── File classification ─────────────────────────────────────────── */
 
 /* Classify discovered files against stored hashes using mtime+size.
@@ -108,12 +144,35 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
-            changed[i] = true;
-            n_changed++;
-        } else {
+        if (stat_mtime_ns(&st) == h->mtime_ns && st.st_size == h->size) {
+            /* Fast path: stat matches -> unchanged, no hashing (microseconds). */
             n_unchanged++;
+            continue;
         }
+
+        /* mtime or size differs. This is the case a branch/worktree switch
+         * hits for content-identical files (git rewrites mtimes). Fall back to
+         * a real content hash (issue #6) before deciding to re-parse.
+         *
+         * Compatibility with pre-#6 DBs: rows persisted before this fix stored
+         * sha256="" (unknown). When the stored hash is unknown we cannot prove
+         * the content is identical, so we keep the old mtime/size behaviour and
+         * treat the file as changed; the reparse then repopulates a real hash. */
+        if (h->sha256 && h->sha256[0] != '\0') {
+            char cur[CBM_SHA256_HEX_LEN + 1];
+            if (cbm_hash_file_hex(files[i].path, cur) == 0 &&
+                strcmp(cur, h->sha256) == 0) {
+                /* Content is byte-identical despite the mtime/size mismatch
+                 * (size can match here too; strcmp is authoritative). Skip the
+                 * reparse. The persist phase re-stats and rewrites the current
+                 * mtime for every discovered file, so next run hits the fast
+                 * path — equivalent to git "smudging" the stat back. */
+                n_unchanged++;
+                continue;
+            }
+        }
+        changed[i] = true;
+        n_changed++;
     }
 
     cbm_ht_free(ht);
@@ -458,7 +517,13 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
         if (stat(files[i].path, &st) != 0) {
             continue;
         }
-        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
+        /* issue #6: store the real content hash (not "") so a later branch/
+         * worktree switch that only bumps mtime is proven unchanged in
+         * classify_files without re-parsing. Hash failure -> "" (unknown),
+         * which safely degrades to the old mtime-only behaviour. */
+        char hexbuf[CBM_SHA256_HEX_LEN + 1];
+        const char *sha = (cbm_hash_file_hex(files[i].path, hexbuf) == 0) ? hexbuf : "";
+        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, sha,
                                             stat_mtime_ns(&st), st.st_size);
         if (rc != CBM_STORE_OK) {
             cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",

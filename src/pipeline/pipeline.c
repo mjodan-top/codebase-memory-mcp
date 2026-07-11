@@ -11,6 +11,7 @@
  *   7. Dump graph buffer to SQLite
  */
 #include "foundation/constants.h"
+#include "foundation/sha256.h"
 
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, PL_WAL_BUF = 1040 };
 #define PL_NSEC_PER_SEC 1000000000LL
@@ -1133,6 +1134,35 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
 }
 
 /* Get platform-specific mtime in nanoseconds. */
+/* issue #6: lowercase-hex SHA-256 of a file's bytes. 0 on success, -1 on I/O error. */
+static int cbm_pipeline_hash_file_hex(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return -1;
+    }
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        cbm_sha256_update(&ctx, buf, n);
+    }
+    int ferr = ferror(fp);
+    fclose(fp);
+    if (ferr) {
+        return -1;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hx[(digest[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hx[digest[i] & 0xF];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return 0;
+}
+
 static int64_t stat_mtime_ns(const struct stat *fst) {
 #ifdef __APPLE__
     return ((int64_t)fst->st_mtimespec.tv_sec * PL_NSEC_PER_SEC) +
@@ -1225,14 +1255,26 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         CBM_PROF_START(t_fh);
         cbm_file_hash_t *fhashes = (cbm_file_hash_t *)malloc(
             (size_t)(file_count > 0 ? file_count : 1) * sizeof(cbm_file_hash_t));
-        if (fhashes) {
+        /* issue #6: backing storage for each row's hex hash (fhashes[].sha256
+         * is a const char* view into this buffer; freed together below). */
+        char (*fh_hexbuf)[CBM_SHA256_HEX_LEN + 1] = (char (*)[CBM_SHA256_HEX_LEN + 1])malloc(
+            (size_t)(file_count > 0 ? file_count : 1) * (CBM_SHA256_HEX_LEN + 1));
+        if (fhashes && fh_hexbuf) {
             int fh_n = 0;
             for (int i = 0; i < file_count; i++) {
                 struct stat fst;
                 if (stat(files[i].path, &fst) == 0) {
                     fhashes[fh_n].project = p->project_name;
                     fhashes[fh_n].rel_path = files[i].rel_path;
-                    fhashes[fh_n].sha256 = "";
+                    /* issue #6: store the real content hash so a later branch/
+                     * worktree switch that only bumps mtime can be proven
+                     * unchanged without re-parsing. On hash failure fall back to
+                     * "" (unknown) — classify then keeps mtime-only behaviour. */
+                    if (cbm_pipeline_hash_file_hex(files[i].path, fh_hexbuf[fh_n]) == 0) {
+                        fhashes[fh_n].sha256 = fh_hexbuf[fh_n];
+                    } else {
+                        fhashes[fh_n].sha256 = "";
+                    }
                     fhashes[fh_n].mtime_ns = stat_mtime_ns(&fst);
                     fhashes[fh_n].size = fst.st_size;
                     fh_n++;
@@ -1243,7 +1285,10 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                               p->project_name);
             }
             free(fhashes);
+            free(fh_hexbuf);
         } else {
+            free(fhashes);
+            free(fh_hexbuf);
             /* OOM fallback: the original per-file path (identical result, slower). */
             for (int i = 0; i < file_count; i++) {
                 struct stat fst;
