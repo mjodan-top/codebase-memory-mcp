@@ -353,6 +353,13 @@ int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project);
 /* Delete nodes by file path. */
 int cbm_store_delete_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path);
 
+/* FTS5 incremental maintenance (issue #8): delete/insert nodes_fts rows for a
+ * single file's nodes. delete reads current `nodes` values (call BEFORE pruning
+ * node rows); insert reads fresh `nodes` values (call AFTER UPSERT). Keeps FTS
+ * maintenance proportional to the incremental change set. */
+int cbm_store_fts_delete_file(cbm_store_t *s, const char *project, const char *file_path);
+int cbm_store_fts_insert_file(cbm_store_t *s, const char *project, const char *file_path);
+
 /* Delete nodes by label. */
 int cbm_store_delete_nodes_by_label(cbm_store_t *s, const char *project, const char *label);
 

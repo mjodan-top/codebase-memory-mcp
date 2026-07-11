@@ -30,6 +30,10 @@
 
 /* ── Globals ──────────────────────────────────────────────────────── */
 
+/* Issue #8 test: mtime bump so single-file change detection can't miss it. */
+#ifndef INCR_FIX_SLEEP_NS
+#define INCR_FIX_SLEEP_NS (15L * 1000L * 1000L) /* 15ms */
+#endif
 static char g_tmpdir[256];
 static char g_repodir[512];
 static char g_dbpath[512];
@@ -184,6 +188,25 @@ static int has_function(const char *name_pattern) {
     int total = count_in_response(resp, "total");
     free(resp);
     return total > 0;
+}
+
+/* Issue #8: query the BM25 full-text path (search_graph {"query":...}), which
+ * is served by the contentless FTS5 index nodes_fts — the exact index the
+ * incremental per-file FTS maintenance touches. has_function() above uses
+ * name_pattern (a LIKE over the nodes table) and does NOT exercise nodes_fts,
+ * so a stale/zombie FTS row would slip past it. This helper closes that gap:
+ * it returns whether a BM25 search for `term` returns at least one hit. */
+static int bm25_hits(const char *term) {
+    char *resp = call_tool("search_graph", "{\"project\":\"%s\",\"query\":\"%s\"}",
+                           g_project, term);
+    if (!resp)
+        return 0;
+    /* The BM25 result envelope carries a "total" (hit count). Fall back to a
+     * substring check on the term itself if the count key is absent. */
+    int total = count_in_response(resp, "total");
+    int hit = (total > 0) || (total < 0 && strstr(resp, term) != NULL);
+    free(resp);
+    return hit;
 }
 
 static int count_by_label(const char *label) {
@@ -746,6 +769,75 @@ TEST(incr_replace_file_content) {
     ASSERT(has_function("replace_new_y"));
 
     delete_file_at("fastapi/incr_replace.py");
+    PASS();
+}
+
+TEST(incr_fts_bm25_consistency) {
+    /* Issue #8: the incremental path used to rebuild the WHOLE nodes_fts table
+     * (delete-all + full rescan) on every reindex. It now maintains FTS rows
+     * per-file (contentless FTS5 'delete' for changed/deleted files' old rows,
+     * re-insert for changed files' fresh rows). This test drives the BM25 path
+     * (search_graph {"query":...}) — the only path that reads nodes_fts — across
+     * a rename + add on ONE file, and asserts the FTS index is left exactly as a
+     * full reindex would leave it. The rename case is the critical one: a naive
+     * per-file delete that fails to remove the OLD contentless posting would let
+     * the renamed-away symbol still match — a zombie FTS row. */
+
+    /* fileA: a class method chargeCard; fileB: an unrelated helper. */
+    write_file_at("fastapi/incr_fts_a.py",
+                  "class PaymentGateway:\n"
+                  "    def chargeCardImmediately(self, amount):\n"
+                  "        return amount\n");
+    write_file_at("fastapi/incr_fts_b.py", "def betaHelperUnchanged(x):\n    return x + 1\n");
+
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    /* Baseline: old symbol is searchable via BM25, helper too. */
+    ASSERT(bm25_hits("chargeCardImmediately"));
+    ASSERT(bm25_hits("betaHelperUnchanged"));
+
+    /* Edit ONLY fileA: rename chargeCardImmediately -> refundCardImmediately and
+     * add a brand-new symbol. fileB is untouched. Newer mtime so change
+     * detection can't miss it. Then reindex WITHOUT deleting the DB → the
+     * incremental FTS maintenance path runs. */
+    struct timespec ts = {0, INCR_FIX_SLEEP_NS};
+    nanosleep(&ts, NULL);
+    write_file_at("fastapi/incr_fts_a.py",
+                  "class PaymentGateway:\n"
+                  "    def refundCardImmediately(self, amount):\n"
+                  "        return amount\n"
+                  "    def voidTransactionImmediately(self, tid):\n"
+                  "        return tid\n");
+
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+
+    /* CRITICAL: the renamed-away symbol must NO LONGER match via BM25 — the old
+     * contentless FTS row was deleted with its exact indexed value, leaving no
+     * zombie posting. This is precisely what a per-file FTS delete gets wrong if
+     * it does not pass the original column values. */
+    ASSERT(!bm25_hits("chargeCardImmediately"));
+
+    /* The changed file's new symbols are searchable. */
+    ASSERT(bm25_hits("refundCardImmediately"));
+    ASSERT(bm25_hits("voidTransactionImmediately"));
+
+    /* The UNCHANGED file's symbol still matches — its FTS rows were never
+     * touched (row-level dump keeps its nodes.id stable, so the existing FTS
+     * rowid remains valid). A regression to delete-all + partial reinsert would
+     * drop this. */
+    ASSERT(bm25_hits("betaHelperUnchanged"));
+
+    /* Cleanup so later ordered tests see a clean tree. */
+    delete_file_at("fastapi/incr_fts_a.py");
+    delete_file_at("fastapi/incr_fts_b.py");
+    resp = index_repo();
+    if (resp)
+        free(resp);
     PASS();
 }
 
@@ -3061,6 +3153,7 @@ SUITE(incremental) {
     /* Phase 5: Stress */
     RUN_TEST(incr_rapid_reindex);
     RUN_TEST(incr_replace_file_content);
+    RUN_TEST(incr_fts_bm25_consistency);
     RUN_TEST(incr_batch_add_delete);
 
     /* Phase 6: Recovery + accuracy */
