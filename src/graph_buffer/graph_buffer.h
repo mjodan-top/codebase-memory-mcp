@@ -108,6 +108,20 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
  * into this graph buffer. Returns 0 on success. */
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project);
 
+/* Partial load (issue #12): load ONLY the given changed files' nodes plus
+ * their 1-hop cross-file neighbor nodes (nodes reachable via one edge hop
+ * from a changed file's nodes), and only edges whose BOTH endpoints are in
+ * that loaded node set. This avoids the O(whole-graph) cost of
+ * cbm_gbuf_load_from_db when the change set is a small fraction of a large
+ * project. Edges whose other endpoint falls outside the loaded set are
+ * skipped here by design — the incremental caller is responsible for
+ * capturing/restoring those cross-file inbound edges separately (see
+ * incr_capture_inbound_edge / incr_restore_inbound_edges in
+ * pipeline_incremental.c), exactly as it already does for the full-load path.
+ * Returns 0 on success. */
+int cbm_gbuf_load_from_db_partial(cbm_gbuf_t *gb, const char *db_path, const char *project,
+                                  const char **changed_rel_paths, int changed_count);
+
 /* Iterate all live nodes (not deleted from QN index). */
 typedef void (*cbm_gbuf_node_visitor_fn)(const cbm_gbuf_node_t *node, void *userdata);
 void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, void *userdata);
