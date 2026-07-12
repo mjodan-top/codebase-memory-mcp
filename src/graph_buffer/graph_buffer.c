@@ -1027,15 +1027,24 @@ static int build_placeholders(char *buf, size_t buf_sz, int count) {
  * when `by_id` is true, `WHERE project = ? AND id IN (...)`) into gb,
  * remapping old ids into *old_to_new (grown/allocated by the caller to
  * max_old_id+1 entries). Returns 0 on success. */
-static int partial_load_nodes_where(cbm_gbuf_t *gb, sqlite3 *db, const char *project,
-                                    bool by_id, const char **rel_paths, const int64_t *ids,
-                                    int count, int64_t *old_to_new, int64_t max_old_id) {
-    if (count == 0) {
-        return 0;
-    }
+/* Batch size for chunked IN-list queries (issue #14). Capped well below
+ * SQLite\'s SQLITE_LIMIT_VARIABLE_NUMBER (default 32766, but historically as
+ * low as 999 on some builds) so a single batch\'s bound-parameter count is
+ * always safe regardless of compile-time limit, and so a fixed small stack
+ * buffer is always large enough for one batch\'s placeholder string (a batch
+ * of CBM_PARTIAL_BATCH_SIZE entries needs at most 2*N-1 bytes — comfortably
+ * under 4096). Splitting into batches (rather than growing the buffer) also
+ * keeps a single query\'s bound-parameter count bounded, which a bigger
+ * buffer alone would not fix. */
+enum { CBM_PARTIAL_BATCH_SIZE = 900 };
+
+static int partial_load_nodes_where_batch(cbm_gbuf_t *gb, sqlite3 *db, const char *project,
+                                          bool by_id, const char **rel_paths,
+                                          const int64_t *ids, int offset, int batch_count,
+                                          int64_t *old_to_new, int64_t max_old_id) {
     enum { PARTIAL_SQL_BUF = 4096 };
     char placeholders[PARTIAL_SQL_BUF];
-    if (build_placeholders(placeholders, sizeof(placeholders), count) < 0) {
+    if (build_placeholders(placeholders, sizeof(placeholders), batch_count) < 0) {
         return CBM_NOT_FOUND;
     }
     char sql[PARTIAL_SQL_BUF + 256];
@@ -1049,11 +1058,12 @@ static int partial_load_nodes_where(cbm_gbuf_t *gb, sqlite3 *db, const char *pro
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < batch_count; i++) {
         if (by_id) {
-            sqlite3_bind_int64(stmt, GB_COL_2 + i, ids[i]);
+            sqlite3_bind_int64(stmt, GB_COL_2 + i, ids[offset + i]);
         } else {
-            sqlite3_bind_text(stmt, GB_COL_2 + i, rel_paths[i], CBM_NOT_FOUND, SQLITE_STATIC);
+            sqlite3_bind_text(stmt, GB_COL_2 + i, rel_paths[offset + i], CBM_NOT_FOUND,
+                              SQLITE_STATIC);
         }
     }
 
@@ -1068,8 +1078,9 @@ static int partial_load_nodes_where(cbm_gbuf_t *gb, sqlite3 *db, const char *pro
         const char *props = (const char *)sqlite3_column_text(stmt, GB_COL_7);
 
         if (old_id > max_old_id || old_to_new[old_id] != 0) {
-            /* Already loaded (e.g. also a neighbor of another changed file) —
-             * upsert_node dedups by QN anyway, but skip the redundant call. */
+            /* Already loaded (e.g. also a neighbor of another changed file, or
+             * seen in an earlier batch) — upsert_node dedups by QN anyway,
+             * but skip the redundant call. */
             continue;
         }
         int64_t new_id = cbm_gbuf_upsert_node(gb, label, name, qn, fp, sl, el, props);
@@ -1081,20 +1092,59 @@ static int partial_load_nodes_where(cbm_gbuf_t *gb, sqlite3 *db, const char *pro
     return 0;
 }
 
-/* Collect the distinct 1-hop cross-file neighbor node ids reachable from
- * `seed_ids` (either direction of an edge). Appends new ids (not already
- * present in old_to_new) into *out_ids (caller frees), returns count. */
-static int collect_neighbor_ids(sqlite3 *db, const char *project, const int64_t *seed_ids,
-                                int seed_count, const int64_t *old_to_new, int64_t max_old_id,
-                                int64_t **out_ids) {
-    *out_ids = NULL;
-    if (seed_count == 0) {
+/* Load nodes matching `WHERE project = ? AND file_path IN (...)` (or,
+ * when `by_id` is true, `WHERE project = ? AND id IN (...)`) into gb,
+ * remapping old ids into *old_to_new (grown/allocated by the caller to
+ * max_old_id+1 entries). Chunks `count` entries into batches of
+ * CBM_PARTIAL_BATCH_SIZE so the IN-list never overflows the placeholder
+ * buffer or SQLite\'s bound-parameter limit, regardless of project size
+ * (issue #14). Returns 0 on success. */
+static int partial_load_nodes_where(cbm_gbuf_t *gb, sqlite3 *db, const char *project,
+                                    bool by_id, const char **rel_paths, const int64_t *ids,
+                                    int count, int64_t *old_to_new, int64_t max_old_id) {
+    if (count == 0) {
         return 0;
     }
+    for (int offset = 0; offset < count; offset += CBM_PARTIAL_BATCH_SIZE) {
+        int batch_count = count - offset;
+        if (batch_count > CBM_PARTIAL_BATCH_SIZE) {
+            batch_count = CBM_PARTIAL_BATCH_SIZE;
+        }
+        int rc = partial_load_nodes_where_batch(gb, db, project, by_id, rel_paths, ids, offset,
+                                                batch_count, old_to_new, max_old_id);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/* qsort comparator for int64_t, used to dedup neighbor ids collected across
+ * batches (issue #14: a neighbor of one batch\'s seeds can also be a
+ * neighbor of another batch\'s seeds, appearing in more than one batch\'s
+ * result set). */
+static int cmp_int64(const void *a, const void *b) {
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    if (va < vb) {
+        return -1;
+    }
+    if (va > vb) {
+        return 1;
+    }
+    return 0;
+}
+
+/* One batch of the neighbor-collection query below: seeds[offset..offset+
+ * batch_count) only. Appends matching ids (deduped later by the caller) into
+ * ids/n/cap (a growable array owned by the caller across all batches). */
+static void collect_neighbor_ids_batch(sqlite3 *db, const char *project, const int64_t *seed_ids,
+                                       int offset, int batch_count, const int64_t *old_to_new,
+                                       int64_t max_old_id, int64_t **ids, int *n, int *cap) {
     enum { NEIGH_SQL_BUF = 4096 };
     char placeholders[NEIGH_SQL_BUF];
-    if (build_placeholders(placeholders, sizeof(placeholders), seed_count) < 0) {
-        return 0;
+    if (build_placeholders(placeholders, sizeof(placeholders), batch_count) < 0) {
+        return;
     }
     char sql[NEIGH_SQL_BUF + 512];
     snprintf(sql, sizeof(sql),
@@ -1104,33 +1154,68 @@ static int collect_neighbor_ids(sqlite3 *db, const char *project, const int64_t 
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        return 0;
+        return;
     }
     int bi = SKIP_ONE;
     sqlite3_bind_text(stmt, bi++, project, CBM_NOT_FOUND, SQLITE_STATIC);
-    for (int i = 0; i < seed_count; i++) {
-        sqlite3_bind_int64(stmt, bi++, seed_ids[i]);
+    for (int i = 0; i < batch_count; i++) {
+        sqlite3_bind_int64(stmt, bi++, seed_ids[offset + i]);
     }
     sqlite3_bind_text(stmt, bi++, project, CBM_NOT_FOUND, SQLITE_STATIC);
-    for (int i = 0; i < seed_count; i++) {
-        sqlite3_bind_int64(stmt, bi++, seed_ids[i]);
+    for (int i = 0; i < batch_count; i++) {
+        sqlite3_bind_int64(stmt, bi++, seed_ids[offset + i]);
     }
 
-    int cap = 64;
-    int n = 0;
-    int64_t *ids = malloc((size_t)cap * sizeof(int64_t));
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         int64_t id = sqlite3_column_int64(stmt, 0);
         if (id <= 0 || id > max_old_id || old_to_new[id] != 0) {
             continue; /* already loaded or out of range */
         }
-        if (n >= cap) {
-            cap *= 2;
-            ids = realloc(ids, (size_t)cap * sizeof(int64_t));
+        if (*n >= *cap) {
+            *cap *= 2;
+            *ids = realloc(*ids, (size_t)(*cap) * sizeof(int64_t));
         }
-        ids[n++] = id;
+        (*ids)[(*n)++] = id;
     }
     sqlite3_finalize(stmt);
+}
+
+/* Collect the distinct 1-hop cross-file neighbor node ids reachable from
+ * `seed_ids` (either direction of an edge). Appends new ids (not already
+ * present in old_to_new) into *out_ids (caller frees), returns count. Chunks
+ * `seed_count` into batches of CBM_PARTIAL_BATCH_SIZE (issue #14) so the
+ * IN-list never overflows the placeholder buffer or SQLite\'s bound-parameter
+ * limit; ids collected across batches are sorted and deduped before
+ * returning, since a given neighbor can be reachable from more than one
+ * batch\'s seeds. */
+static int collect_neighbor_ids(sqlite3 *db, const char *project, const int64_t *seed_ids,
+                                int seed_count, const int64_t *old_to_new, int64_t max_old_id,
+                                int64_t **out_ids) {
+    *out_ids = NULL;
+    if (seed_count == 0) {
+        return 0;
+    }
+    int cap = 64;
+    int n = 0;
+    int64_t *ids = malloc((size_t)cap * sizeof(int64_t));
+    for (int offset = 0; offset < seed_count; offset += CBM_PARTIAL_BATCH_SIZE) {
+        int batch_count = seed_count - offset;
+        if (batch_count > CBM_PARTIAL_BATCH_SIZE) {
+            batch_count = CBM_PARTIAL_BATCH_SIZE;
+        }
+        collect_neighbor_ids_batch(db, project, seed_ids, offset, batch_count, old_to_new,
+                                   max_old_id, &ids, &n, &cap);
+    }
+    if (n > 1) {
+        qsort(ids, (size_t)n, sizeof(int64_t), cmp_int64);
+        int dedup_n = 1;
+        for (int i = 1; i < n; i++) {
+            if (ids[i] != ids[dedup_n - 1]) {
+                ids[dedup_n++] = ids[i];
+            }
+        }
+        n = dedup_n;
+    }
     *out_ids = ids;
     return n;
 }
@@ -1279,47 +1364,66 @@ int cbm_gbuf_load_from_db_partial(cbm_gbuf_t *gb, const char *db_path, const cha
         cbm_store_close(store);
         return 0;
     }
-    enum { EDGE_SQL_BUF = 8192 };
-    char edge_placeholders[EDGE_SQL_BUF];
-    if (build_placeholders(edge_placeholders, sizeof(edge_placeholders), loaded_count) < 0) {
-        free(loaded_ids);
-        free(old_to_new);
-        cbm_store_close(store);
-        return CBM_NOT_FOUND;
-    }
-    char edge_sql[EDGE_SQL_BUF + 512];
-    snprintf(edge_sql, sizeof(edge_sql),
-             "SELECT source_id, target_id, type, properties FROM edges "
-             "WHERE project = ? AND (source_id IN (%s) OR target_id IN (%s))",
-             edge_placeholders, edge_placeholders);
-    if (sqlite3_prepare_v2(db, edge_sql, CBM_NOT_FOUND, &mstmt, NULL) != SQLITE_OK) {
-        free(loaded_ids);
-        free(old_to_new);
-        cbm_store_close(store);
-        return CBM_NOT_FOUND;
-    }
-    int ebi = SKIP_ONE;
-    sqlite3_bind_text(mstmt, ebi++, project, CBM_NOT_FOUND, SQLITE_STATIC);
-    for (int i = 0; i < loaded_count; i++) {
-        sqlite3_bind_int64(mstmt, ebi++, loaded_ids[i]);
-    }
-    for (int i = 0; i < loaded_count; i++) {
-        sqlite3_bind_int64(mstmt, ebi++, loaded_ids[i]);
+    /* Batch the edge query over CBM_PARTIAL_BATCH_SIZE-sized chunks of
+     * loaded_ids (issue #14) — same reasoning as partial_load_nodes_where:
+     * a single unbatched IN-list (used twice, for source_id and target_id)
+     * both overflows a fixed placeholder buffer and can exceed SQLite\'s
+     * bound-parameter limit once a project has enough loaded nodes. Each
+     * batch queries `(source_id IN batch OR target_id IN batch)`, so an
+     * edge whose endpoints fall in two DIFFERENT batches is still found —
+     * every edge with at least one endpoint in the loaded set is emitted by
+     * the batch that contains that endpoint. cbm_gbuf_insert_edge dedups by
+     * (source,target,type,properties) key, so an edge whose BOTH endpoints
+     * are in the loaded set (and thus can be matched by more than one
+     * batch, or twice within a batch via the OR) is only inserted once. */
+    for (int offset = 0; offset < loaded_count; offset += CBM_PARTIAL_BATCH_SIZE) {
+        int batch_count = loaded_count - offset;
+        if (batch_count > CBM_PARTIAL_BATCH_SIZE) {
+            batch_count = CBM_PARTIAL_BATCH_SIZE;
+        }
+        enum { EDGE_SQL_BUF = 4096 };
+        char edge_placeholders[EDGE_SQL_BUF];
+        if (build_placeholders(edge_placeholders, sizeof(edge_placeholders), batch_count) < 0) {
+            free(loaded_ids);
+            free(old_to_new);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        char edge_sql[EDGE_SQL_BUF + 512];
+        snprintf(edge_sql, sizeof(edge_sql),
+                 "SELECT source_id, target_id, type, properties FROM edges "
+                 "WHERE project = ? AND (source_id IN (%s) OR target_id IN (%s))",
+                 edge_placeholders, edge_placeholders);
+        sqlite3_stmt *estmt = NULL;
+        if (sqlite3_prepare_v2(db, edge_sql, CBM_NOT_FOUND, &estmt, NULL) != SQLITE_OK) {
+            free(loaded_ids);
+            free(old_to_new);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        int ebi = SKIP_ONE;
+        sqlite3_bind_text(estmt, ebi++, project, CBM_NOT_FOUND, SQLITE_STATIC);
+        for (int i = 0; i < batch_count; i++) {
+            sqlite3_bind_int64(estmt, ebi++, loaded_ids[offset + i]);
+        }
+        for (int i = 0; i < batch_count; i++) {
+            sqlite3_bind_int64(estmt, ebi++, loaded_ids[offset + i]);
+        }
+        while (sqlite3_step(estmt) == SQLITE_ROW) {
+            int64_t old_src = sqlite3_column_int64(estmt, 0);
+            int64_t old_tgt = sqlite3_column_int64(estmt, SKIP_ONE);
+            const char *type = (const char *)sqlite3_column_text(estmt, GB_COL_2);
+            const char *props = (const char *)sqlite3_column_text(estmt, GB_COL_3);
+
+            int64_t new_src = (old_src > 0 && old_src <= max_old_id) ? old_to_new[old_src] : 0;
+            int64_t new_tgt = (old_tgt > 0 && old_tgt <= max_old_id) ? old_to_new[old_tgt] : 0;
+            if (new_src > 0 && new_tgt > 0) {
+                cbm_gbuf_insert_edge(gb, new_src, new_tgt, type, props);
+            }
+        }
+        sqlite3_finalize(estmt);
     }
     free(loaded_ids);
-    while (sqlite3_step(mstmt) == SQLITE_ROW) {
-        int64_t old_src = sqlite3_column_int64(mstmt, 0);
-        int64_t old_tgt = sqlite3_column_int64(mstmt, SKIP_ONE);
-        const char *type = (const char *)sqlite3_column_text(mstmt, GB_COL_2);
-        const char *props = (const char *)sqlite3_column_text(mstmt, GB_COL_3);
-
-        int64_t new_src = (old_src > 0 && old_src <= max_old_id) ? old_to_new[old_src] : 0;
-        int64_t new_tgt = (old_tgt > 0 && old_tgt <= max_old_id) ? old_to_new[old_tgt] : 0;
-        if (new_src > 0 && new_tgt > 0) {
-            cbm_gbuf_insert_edge(gb, new_src, new_tgt, type, props);
-        }
-    }
-    sqlite3_finalize(mstmt);
 
     free(old_to_new);
     cbm_store_close(store);

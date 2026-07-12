@@ -545,6 +545,92 @@ TEST(incr_partial_vs_full_load_new_cross_file_symbol) {
 }
 
 
+TEST(incr_partial_load_batched_large_symbol_count) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    enum { BULK_FILES = 5, FUNCS_PER_FILE = 220 };
+    for (int f = 0; f < BULK_FILES; f++) {
+        char path[128];
+        snprintf(path, sizeof(path), "fastapi/incr14_bulk_%d.py", f);
+        size_t cap = 64 * 1024;
+        char *content = malloc(cap);
+        size_t off = 0;
+        for (int i = 0; i < FUNCS_PER_FILE; i++) {
+            int n = snprintf(content + off, cap - off,
+                             "def incr14_bulk_%d_%d():\n    return %d\n", f, i, i);
+            off += (size_t)n;
+        }
+        write_file_at(path, content);
+        free(content);
+    }
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    struct timespec ts = {0, INCR_FIX_SLEEP_NS};
+    nanosleep(&ts, NULL);
+    write_file_at("fastapi/incr14_touch.py", "def incr14_touch():\n    return 1\n");
+
+    force_load_mode(true);
+    double partial_ms = 0;
+    size_t partial_peak = 0;
+    resp = index_repo_timed(&partial_ms, &partial_peak);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "\"error\"") == NULL);
+    free(resp);
+    char *partial_snapshot = dump_snapshot(g_dbpath, g_project);
+
+    unlink(g_dbpath);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    for (int f = 0; f < BULK_FILES; f++) {
+        char path[128];
+        snprintf(path, sizeof(path), "fastapi/incr14_bulk_%d.py", f);
+        size_t cap = 64 * 1024;
+        char *content = malloc(cap);
+        size_t off = 0;
+        for (int i = 0; i < FUNCS_PER_FILE; i++) {
+            int n = snprintf(content + off, cap - off,
+                             "def incr14_bulk_%d_%d():\n    return %d\n", f, i, i);
+            off += (size_t)n;
+        }
+        write_file_at(path, content);
+        free(content);
+    }
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    nanosleep(&ts, NULL);
+    write_file_at("fastapi/incr14_touch.py", "def incr14_touch():\n    return 1\n");
+    force_load_mode(false);
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    char *full_snapshot = dump_snapshot(g_dbpath, g_project);
+    reset_load_mode();
+
+    ASSERT(partial_snapshot != NULL);
+    ASSERT(full_snapshot != NULL);
+    ASSERT(strstr(partial_snapshot, "incr14_bulk_0_0") != NULL);
+    ASSERT(strcmp(partial_snapshot, full_snapshot) == 0);
+
+    free(partial_snapshot);
+    free(full_snapshot);
+    for (int f = 0; f < BULK_FILES; f++) {
+        char path[128];
+        snprintf(path, sizeof(path), "fastapi/incr14_bulk_%d.py", f);
+        delete_file_at(path);
+    }
+    delete_file_at("fastapi/incr14_touch.py");
+    resp = index_repo();
+    if (resp)
+        free(resp);
+    PASS();
+}
+
 static int count_by_label(const char *label) {
     char *resp =
         call_tool("search_graph", "{\"project\":\"%s\",\"label\":\"%s\"}", g_project, label);
@@ -3440,6 +3526,14 @@ SUITE(incremental) {
         printf("  SETUP FAILED — skipping incremental tests (network?)\n");
         return;
     }
+    if (getenv("CBM_ONLY_ISSUE14")) {
+        RUN_TEST(incr_full_index);
+        RUN_TEST(incr_partial_vs_full_load_single_file_cross_call);
+        RUN_TEST(incr_partial_load_batched_large_symbol_count);
+        RUN_TEST(incr_partial_vs_full_load_above_threshold_falls_back);
+        RUN_TEST(incr_partial_vs_full_load_new_cross_file_symbol);
+        return;
+    }
 
     /* Phase 1: Full index baseline (needed for tool tests below) */
     RUN_TEST(incr_full_index);
@@ -3491,6 +3585,7 @@ SUITE(incremental) {
     RUN_TEST(incr_replace_file_content);
     RUN_TEST(incr_fts_bm25_consistency);
     RUN_TEST(incr_partial_vs_full_load_single_file_cross_call);
+    RUN_TEST(incr_partial_load_batched_large_symbol_count);
     RUN_TEST(incr_partial_vs_full_load_above_threshold_falls_back);
     RUN_TEST(incr_partial_vs_full_load_new_cross_file_symbol);
     RUN_TEST(incr_batch_add_delete);
