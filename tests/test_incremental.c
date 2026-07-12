@@ -528,12 +528,6 @@ TEST(incr_partial_vs_full_load_new_cross_file_symbol) {
 
     ASSERT(partial_snapshot != NULL);
     ASSERT(full_snapshot != NULL);
-    {
-        FILE *fp1 = fopen("/tmp/dbg_partial.txt", "w");
-        if (fp1) { fputs(partial_snapshot, fp1); fclose(fp1); }
-        FILE *fp2 = fopen("/tmp/dbg_full.txt", "w");
-        if (fp2) { fputs(full_snapshot, fp2); fclose(fp2); }
-    }
     /* CRITICAL: the new CALLS edge from incr12_new_caller to
      * incr12_brand_new_symbol must appear in BOTH snapshots identically. A
      * registry seeding gap would silently drop it from the partial path only. */
@@ -3446,14 +3440,6 @@ SUITE(incremental) {
         printf("  SETUP FAILED — skipping incremental tests (network?)\n");
         return;
     }
-    if (getenv("CBM_ONLY_ISSUE12")) {
-        RUN_TEST(incr_full_index);
-        RUN_TEST(incr_partial_vs_full_load_single_file_cross_call);
-        RUN_TEST(incr_partial_vs_full_load_above_threshold_falls_back);
-        RUN_TEST(incr_partial_vs_full_load_new_cross_file_symbol);
-        return;
-    }
-
 
     /* Phase 1: Full index baseline (needed for tool tests below) */
     RUN_TEST(incr_full_index);
