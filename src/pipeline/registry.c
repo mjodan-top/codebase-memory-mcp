@@ -161,14 +161,29 @@ static int candidate_score(const char *candidate_qn, const char *module_qn) {
     return score;
 }
 
-/* Pick candidate with highest composite score (test-deprioritization + namespace proximity). */
+/* Pick candidate with highest composite score (test-deprioritization + namespace proximity).
+ *
+ * Issue #16 follow-up: on a score TIE, break deterministically by qualified_name
+ * lexical order (strcmp) instead of "keep the first one seen". The insertion
+ * order of same-name candidates into the registry depends on which SQL query
+ * populated it (registry_seed_from_db for partial-load vs cbm_gbuf_foreach_node
+ * for full-load) — the two paths are not guaranteed to enumerate rows in the
+ * same order (e.g. one lacked an explicit ORDER BY). Without a tie-break that
+ * is independent of insertion order, a same-simple-name / same-score tie
+ * (e.g. two modules both exporting a symbol named `Header`) could resolve to
+ * a DIFFERENT qualified_name under partial load than under full load for the
+ * identical project state, defeating the "full result == incremental result"
+ * invariant this issue exists to restore. strcmp gives a total order that is
+ * a pure function of the candidate set, so it is identical regardless of the
+ * order candidates were added in either load mode. */
 static const char *best_by_import_distance(const char **candidates, int count,
                                            const char *module_qn) {
     const char *best = NULL;
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
         int score = candidate_score(candidates[i], module_qn);
-        if (score > best_score) {
+        if (score > best_score || (score == best_score && best != NULL &&
+                                   strcmp(candidates[i], best) < 0)) {
             best_score = score;
             best = candidates[i];
         }
@@ -589,7 +604,7 @@ int cbm_registry_size(const cbm_registry_t *r) {
 /* Strategy 1: Import map lookup (exact → suffix fallback) */
 static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *prefix,
                                            const char *suffix, const char **keys, const char **vals,
-                                           int map_count) {
+                                           int map_count, const char *module_qn) {
     if (!keys || !vals || map_count <= 0) {
         return empty_result();
     }
@@ -649,12 +664,45 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         if (arr) {
             size_t rd_len = strlen(resolved_dot);
             size_t ds_len = strlen(dot_suffix);
-            for (int i = 0; i < arr->count; i++) {
+            /* Issue #16 follow-up (second SSOT gap): a re-exporting package
+             * import (e.g. `from fastapi import params` then `params.Header`,
+             * where `fastapi/__init__.py` re-exports several submodules) can
+             * have MULTIPLE candidate QNs that share this package prefix and
+             * this member suffix — e.g. both fastapi.params.Header and
+             * fastapi.openapi.models.Header start with "fastapi." and end
+             * with ".Header". The original code returned the FIRST match in
+             * `arr->items` order, which is a registry insertion order that
+             * differs between full-load (cbm_gbuf_foreach_node iteration
+             * order) and partial-load (registry_seed_from_db's SQL row
+             * order) — so this same-name/same-package tie could silently
+             * pick a DIFFERENT candidate under partial load than under full
+             * load for the identical project state, even after the Strategy
+             * 4 tie-break (best_by_import_distance) was fixed, because this
+             * Strategy-1 fallback returns before Strategy 4 is ever reached.
+             * Collect EVERY prefix/suffix match instead of stopping at the
+             * first one, and when more than one qualifies, break the tie
+             * with the same deterministic candidate_score ordering Strategy
+             * 4 uses (namespace proximity to module_qn, then lexical QN
+             * order) — a pure function of the candidate SET, independent of
+             * insertion order in either load mode. */
+            const char *matches[CBM_SZ_256];
+            int match_count = 0;
+            for (int i = 0; i < arr->count && match_count < CBM_SZ_256; i++) {
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
                 if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
                     strcmp(qn + klen - ds_len, dot_suffix) == 0) {
-                    return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
+                    matches[match_count++] = qn;
+                }
+            }
+            if (match_count == SKIP_ONE) {
+                return (cbm_resolution_t){matches[0], "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
+                                          REG_RESOLVED};
+            }
+            if (match_count > SKIP_ONE) {
+                const char *best = best_by_import_distance(matches, match_count, module_qn);
+                if (best) {
+                    return (cbm_resolution_t){best, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
                 }
             }
@@ -860,8 +908,8 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     }
 
     /* Strategy 1: import map */
-    cbm_resolution_t res =
-        resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
+    cbm_resolution_t res = resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals,
+                                              import_map_count, module_qn);
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
         res = resolve_same_module(r, callee_name, suffix, module_qn);

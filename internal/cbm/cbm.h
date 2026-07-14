@@ -647,4 +647,21 @@ void cbm_extract_k8s(CBMExtractCtx *ctx);
 // `label` may be NULL (returns false). Defined in helpers.c.
 bool cbm_label_is_type_like(const char *label);
 
+// True when `label` names a node that can be the TARGET of an IMPORTS edge —
+// i.e. a container or definition that an import/use statement can legitimately
+// resolve to (File/Module for whole-module imports, plus every definition
+// label a member import can point at). The canonical set is:
+//   Class, Interface, Function, Method, Module, Struct, Enum, Trait, Type, File.
+// Single source of truth for every consumer that must decide "what counts as
+// an importable node" — the IMPORTS-edge resolver (pass_pkgmap.c Strategy 1/4)
+// AND the incremental partial-load path that must pre-load exactly this same
+// node set into the in-RAM graph buffer so IMPORTS resolution sees identical
+// candidates regardless of load mode (issue #16: before this was unified, the
+// partial-load path only pre-loaded the narrower registry-symbol label set —
+// which deliberately excludes File/Module — so a partial reindex's IMPORTS
+// edge could resolve to a different-granularity target than a full reindex
+// of the same change). `label` may be NULL (returns false). Defined in
+// helpers.c.
+bool cbm_label_is_import_targetable(const char *label);
+
 #endif // CBM_H

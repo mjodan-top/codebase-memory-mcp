@@ -1250,19 +1250,14 @@ static const char *import_candidate_symbol(const char *module_path, char *out, s
 }
 
 /* True for node labels that represent an importable definition (so a symbol-name
- * fallback does not link to, e.g., a Variable or Field). */
+ * fallback does not link to, e.g., a Variable or Field). Delegates to the
+ * single source of truth in cbm.h (cbm_label_is_import_targetable) — see its
+ * doc comment for the issue #16 rationale: this predicate must stay identical
+ * to the one the incremental partial-load path uses to decide which nodes to
+ * pre-load, or the two load modes resolve IMPORTS edges to different-
+ * granularity targets for the same input. */
 static bool import_targetable_label(const char *label) {
-    if (!label) {
-        return false;
-    }
-    static const char *ok[] = {"Class", "Interface", "Function", "Method", "Module", "Struct",
-                               "Enum",  "Trait",     "Type",     "File",   NULL};
-    for (const char **l = ok; *l; l++) {
-        if (strcmp(*l, label) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return cbm_label_is_import_targetable(label);
 }
 
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
