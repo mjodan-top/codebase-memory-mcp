@@ -166,6 +166,25 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
+// Single source of truth for "what labels can an IMPORTS edge legitimately
+// target" (see cbm.h doc comment for the issue #16 rationale). Every
+// consumer that decides this — the resolver in pass_pkgmap.c and the
+// incremental partial-load pre-loader in graph_buffer.c — calls this one
+// function instead of each maintaining its own copy of the label set.
+bool cbm_label_is_import_targetable(const char *label) {
+    if (!label) {
+        return false;
+    }
+    static const char *ok[] = {"Class", "Interface", "Function", "Method", "Module",
+                               "Struct", "Enum",     "Trait",    "Type",   "File", NULL};
+    for (const char **l = ok; *l; l++) {
+        if (strcmp(*l, label) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;

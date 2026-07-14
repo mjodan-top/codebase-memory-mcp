@@ -26,6 +26,7 @@ enum {
 #include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
 #include "store/store.h"
 #include "sqlite_writer.h"
+#include "cbm.h" // cbm_label_is_import_targetable (issue #16 SSOT)
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
@@ -1262,6 +1263,67 @@ static int partial_load_registry_nodes(cbm_gbuf_t *gb, sqlite3 *db, const char *
     return 0;
 }
 
+/* Issue #16 SSOT fix: project-wide preload of every node label that
+ * cbm_label_is_import_targetable() accepts (File/Module plus every
+ * definition label an import statement can resolve to — see cbm.h doc
+ * comment). This is a SEPARATE concern from partial_load_registry_nodes
+ * above: that function preloads the registry-symbol label set (Function/
+ * Class/... — deliberately EXCLUDING File/Module, so type resolution
+ * doesn't collide a bare type name with a same-named module) for
+ * registry_seed_from_db's cross-file symbol resolution. This function
+ * preloads the import-TARGET label set for cbm_pipeline_resolve_import_node
+ * Strategy 1 (pass_pkgmap.c), which decides an IMPORTS edge's target
+ * granularity by checking whether a File/Module node exists in the
+ * in-RAM graph buffer.
+ *
+ * Before this function existed, the partial-load path never preloaded
+ * File/Module nodes project-wide, so Strategy 1 could miss a target the
+ * full-load path (cbm_gbuf_load_from_db, which loads EVERY node
+ * unconditionally) would find — causing the same IMPORTS edge to resolve
+ * to a coarser (File/Module) target under full load but a finer
+ * (specific-symbol) target under partial load for the identical input.
+ * The SQL IN-list below is only a query-plan-friendly pre-filter; the
+ * post-fetch cbm_label_is_import_targetable() call is the actual
+ * authority — mirroring how registry_seed_from_db() treats its own SQL
+ * list as a pre-filter with incr_label_is_registry_symbol() as the real
+ * predicate. This keeps the label set defined in exactly ONE place
+ * (cbm_label_is_import_targetable in helpers.c) instead of drifting
+ * copies between the SQL string and the C predicate. */
+static int partial_load_import_targetable_nodes(cbm_gbuf_t *gb, sqlite3 *db, const char *project,
+                                                 int64_t *old_to_new, int64_t max_old_id) {
+    const char *sql =
+        "SELECT id, label, name, qualified_name, file_path, start_line, end_line, properties "
+        "FROM nodes WHERE project = ? AND label IN ('Class','Interface','Function','Method',"
+        "'Module','Struct','Enum','Trait','Type','File')";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t old_id = sqlite3_column_int64(stmt, 0);
+        if (old_id <= 0 || old_id > max_old_id || old_to_new[old_id] != 0) {
+            continue; /* already loaded (e.g. by partial_load_registry_nodes) */
+        }
+        const char *label = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (!cbm_label_is_import_targetable(label)) {
+            continue; /* SQL list is a pre-filter only; this call is authoritative */
+        }
+        const char *name = (const char *)sqlite3_column_text(stmt, GB_COL_2);
+        const char *qn = (const char *)sqlite3_column_text(stmt, GB_COL_3);
+        const char *fp = (const char *)sqlite3_column_text(stmt, GB_COL_4);
+        int sl = sqlite3_column_int(stmt, GB_COL_5);
+        int el = sqlite3_column_int(stmt, GB_COL_6);
+        const char *props = (const char *)sqlite3_column_text(stmt, GB_COL_7);
+        int64_t new_id = cbm_gbuf_upsert_node(gb, label, name, qn, fp, sl, el, props);
+        if (new_id > 0) {
+            old_to_new[old_id] = new_id;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
 int cbm_gbuf_load_from_db_partial(cbm_gbuf_t *gb, const char *db_path, const char *project,
                                   const char **changed_rel_paths, int changed_count) {
     if (!gb || !db_path || !project || !changed_rel_paths || changed_count <= 0) {
@@ -1312,6 +1374,23 @@ int cbm_gbuf_load_from_db_partial(cbm_gbuf_t *gb, const char *db_path, const cha
      * neighbor of a changed file (e.g. a brand-new cross-file reference to a
      * previously-uncalled symbol). */
     if (partial_load_registry_nodes(gb, db, project, old_to_new, max_old_id) != 0) {
+        free(old_to_new);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Step 1.6 (issue #16 fix): also load every IMPORTS-edge-targetable node
+     * project-wide (File/Module plus the definition labels Step 1.5 above
+     * already covers) — same reasoning as Step 1.5, but for a DIFFERENT
+     * consumer: cbm_pipeline_resolve_import_node's Strategy 1 (pass_pkgmap.c)
+     * decides an IMPORTS edge's target granularity by checking whether a
+     * File/Module node for the imported path exists in THIS gbuf. Without
+     * this step, a changed file importing a module for the first time (no
+     * pre-existing edge, so the module's File node is never pulled in as a
+     * 1-hop neighbor either) would resolve that import to a finer-grained
+     * target than the full-load path — see partial_load_import_targetable_nodes
+     * doc comment and issue #16 for the full analysis. */
+    if (partial_load_import_targetable_nodes(gb, db, project, old_to_new, max_old_id) != 0) {
         free(old_to_new);
         cbm_store_close(store);
         return CBM_NOT_FOUND;

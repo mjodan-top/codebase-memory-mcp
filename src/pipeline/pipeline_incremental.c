@@ -648,10 +648,26 @@ static void registry_seed_from_db(cbm_store_t *store, const char *project, cbm_r
         return;
     }
     sqlite3_stmt *stmt = NULL;
+    /* Issue #16 follow-up: ORDER BY id is not cosmetic here. cbm_registry_add
+     * appends each same-simple-name candidate to a qn_array_t IN INSERTION
+     * ORDER (registry.c), and best_by_import_distance's tie-break keeps the
+     * FIRST candidate when two score equally (strict '>', not '>='). The
+     * full-load path builds its registry via cbm_gbuf_foreach_node, which
+     * iterates the gbuf's node array in the same order cbm_gbuf_load_from_db
+     * loaded it — and that query is itself "ORDER BY id". Without the same
+     * ORDER BY here, this DB-direct seed path (used only in partial-load
+     * mode) could hand SQLite's arbitrary row order to cbm_registry_add,
+     * making a same-name tie-break pick a DIFFERENT candidate than the
+     * full-load path for the identical project state — a second SSOT gap
+     * beyond the IMPORTS-edge one this issue originally reported (observed
+     * as sporadic CALLS/USAGE edges to a same-named symbol in a different
+     * module under partial load). Matching the ORDER BY makes both paths
+     * seed candidates in the identical sequence, so ties resolve identically
+     * regardless of load mode. */
     if (sqlite3_prepare_v2(db,
                            "SELECT name, qualified_name, label FROM nodes WHERE project = ? "
                            "AND label IN ('Function','Method','Variable','Field','Class',"
-                           "'Struct','Interface','Enum','Type','Trait')",
+                           "'Struct','Interface','Enum','Type','Trait') ORDER BY id",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         return;
     }

@@ -301,17 +301,27 @@ static char *dump_snapshot(const char *db_path, const char *project) {
 
     qsort(s.lines, (size_t)s.count, sizeof(char *), snapshot_cmp);
 
+    /* Perf note: repeated strcat() here is O(n^2) — each call rescans from
+     * the start of `out` to find the current end, so total cost grows
+     * quadratically with the accumulated output size. On a large project
+     * (thousands of nodes/edges) this made the whole suite appear to hang
+     * (CPU pegged, no forward progress for many minutes) even though nothing
+     * was actually deadlocked. Track the write cursor explicitly and
+     * memcpy() into it instead, so total cost is O(total output size). */
     size_t total = 1;
     for (int i = 0; i < s.count; i++) {
         total += strlen(s.lines[i]) + 1;
     }
     char *out = malloc(total);
-    out[0] = '\0';
+    char *cursor = out;
     for (int i = 0; i < s.count; i++) {
-        strcat(out, s.lines[i]);
-        strcat(out, "\n");
+        size_t len = strlen(s.lines[i]);
+        memcpy(cursor, s.lines[i], len);
+        cursor += len;
+        *cursor++ = '\n';
         free(s.lines[i]);
     }
+    *cursor = '\0';
     free(s.lines);
     return out;
 }
