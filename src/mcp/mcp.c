@@ -1356,10 +1356,32 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     cbm_project_t *projs = NULL;
     int n = 0;
     bool ok = false;
-    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK && n == 1 && projs[0].name &&
-        projs[0].name[0]) {
-        snprintf(name_out, name_sz, "%s", projs[0].name);
-        ok = true;
+    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
+        /* #963 introduced "<project>::missed" shadow rows in the same
+         * projects table (coverage miss-graph, cbm_store_coverage_shadow_project).
+         * They must not count toward the "exactly one real project" check
+         * below, or every db with any coverage gaps loses its internal
+         * name and vanishes from list_projects (issue #20). */
+        int real_idx = -1;
+        int real_count = 0;
+        for (int i = 0; i < n; i++) {
+            const char *name = projs[i].name;
+            if (!name) {
+                continue;
+            }
+            size_t len = strlen(name);
+            static const char kMissedSuffix[] = "::missed";
+            size_t suffix_len = sizeof(kMissedSuffix) - 1;
+            if (len >= suffix_len && strcmp(name + len - suffix_len, kMissedSuffix) == 0) {
+                continue; /* shadow coverage row — not a real project */
+            }
+            real_count++;
+            real_idx = i;
+        }
+        if (real_count == 1 && projs[real_idx].name && projs[real_idx].name[0]) {
+            snprintf(name_out, name_sz, "%s", projs[real_idx].name);
+            ok = true;
+        }
     }
     cbm_store_free_projects(projs, n);
     if (ok && out_store) {
