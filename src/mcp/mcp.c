@@ -49,6 +49,7 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
+#include "foundation/xlock.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -4428,13 +4429,66 @@ static int maybe_persist_project_alias(const char *repo_path, const char *projec
     return rc;
 }
 
+/* Issue #22: cross-process singleflight gate. Tries the OS-level flock keyed
+ * by the resolved project name BEFORE we do anything else (including the
+ * in-process supervisor dispatch below), so two independent server processes
+ * asked to index the SAME project at the SAME time never both spawn a worker.
+ *
+ * - Acquired immediately (OWNER_INDEXING): proceed exactly as before; caller
+ *   marks the xlock done + releases once the index actually finishes.
+ * - Already held elsewhere: block until the holder releases (WAITING). If it
+ *   finished cleanly AFTER our attempt started, the marker is fresh — reuse
+ *   its result instead of re-indexing (REUSED). If it died mid-run (crash),
+ *   the marker is stale/missing — we now legitimately hold the lock
+ *   ourselves and proceed to index for real (CRASH_RECLAIMED). */
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    /* Lock key = the repo's own canonical path (best-effort: falls back to the
+     * raw repo_path arg when it does not exist / cannot be canonicalized —
+     * still stable across calls for the same literal path, just not across
+     * symlink/worktree aliases of it). This matches the issue's "仓库的
+     * canonical 路径" recommendation and needs no project-name derivation
+     * (that logic lives inside cbm_pipeline_new and stays untouched). */
+    char *xlock_key = cbm_mcp_get_string_arg(args, "repo_path");
+    if (xlock_key) {
+        cbm_normalize_path_sep(xlock_key);
+        char *canon = canonicalize_repo_path_if_exists(xlock_key);
+        if (canon) {
+            free(xlock_key);
+            xlock_key = canon;
+        }
+    }
+    const char *xlock_key_or_default = (xlock_key && xlock_key[0]) ? xlock_key : "default";
+
+    cbm_xlock_t xlk;
+    bool xlk_is_owner = cbm_xlock_try_acquire(&xlk, xlock_key_or_default);
+    if (!xlk_is_owner) {
+        cbm_log_info("xlock.waiting", "project", xlock_key_or_default);
+        if (cbm_xlock_wait_for_release(&xlk, xlock_key_or_default) &&
+            xlk.state == CBM_XLOCK_STATE_REUSED) {
+            cbm_log_info("xlock.reused", "project", xlock_key_or_default);
+            cbm_xlock_release(&xlk);
+            free(xlock_key);
+            return cbm_mcp_text_result(
+                "{\"status\":\"reused\",\"hint\":\"another process just finished indexing this "
+                "project; reusing its result instead of re-indexing\"}",
+                false);
+        }
+        /* CRASH_RECLAIMED (or hard wait error, in which case we still hold no
+         * lock but proceed in-process rather than leaving the caller stuck —
+         * the in-process cbm_pipeline_lock below still serialises this
+         * process's own concurrent calls). Fall through to index for real. */
+        cbm_log_info("xlock.crash_reclaimed", "project", xlock_key_or_default);
+    }
+    free(xlock_key);
+
     /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
      * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
      * is set. On spawn failure, fall through to the in-process path (degrade). */
     if (cbm_index_supervisor_should_wrap()) {
         char *supervised = index_run_supervised(srv, args);
         if (supervised) {
+            cbm_xlock_mark_done(&xlk);
+            cbm_xlock_release(&xlk);
             return supervised;
         }
     }
@@ -6544,6 +6598,24 @@ static void *autoindex_thread(void *arg) {
 
     cbm_log_info("autoindex.start", "project", srv->session_project, "path", srv->session_root);
 
+    /* Issue #22: same cross-process singleflight gate as handle_index_repository.
+     * A session's auto-index and another process's explicit index_repository
+     * call (or another session's auto-index) can race on the SAME repo path;
+     * without this, both would spawn a full-index worker concurrently. */
+    cbm_xlock_t xlk;
+    bool xlk_is_owner =
+        cbm_xlock_try_acquire(&xlk, srv->session_root[0] ? srv->session_root : "default");
+    if (!xlk_is_owner) {
+        cbm_log_info("xlock.waiting", "project", srv->session_project);
+        if (cbm_xlock_wait_for_release(&xlk, srv->session_root) && xlk.state == CBM_XLOCK_STATE_REUSED) {
+            cbm_log_info("xlock.reused", "project", srv->session_project);
+            cbm_xlock_release(&xlk);
+            register_watcher_if_enabled(srv);
+            return NULL;
+        }
+        cbm_log_info("xlock.crash_reclaimed", "project", srv->session_project);
+    }
+
     /* #832: prefer the supervised worker subprocess. Indexing the whole session in
      * this long-lived server thread ratchets RSS (mimalloc v3 does not reclaim the
      * pages worker threads abandon at exit); running it in a child that exits hands
@@ -6553,6 +6625,8 @@ static void *autoindex_thread(void *arg) {
         char *resp = index_run_supervised_path(srv, srv->session_root);
         if (resp) {
             free(resp);
+            cbm_xlock_mark_done(&xlk);
+            cbm_xlock_release(&xlk);
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
@@ -6570,6 +6644,7 @@ static void *autoindex_thread(void *arg) {
     }
     if (!p) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
+        cbm_xlock_release(&xlk);
         return NULL;
     }
 
@@ -6582,11 +6657,13 @@ static void *autoindex_thread(void *arg) {
     cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
+        cbm_xlock_mark_done(&xlk);
         cbm_log_info("autoindex.done", "project", srv->session_project);
         register_watcher_if_enabled(srv);
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
     }
+    cbm_xlock_release(&xlk);
     return NULL;
 }
 

@@ -22,6 +22,7 @@
 #include "cli/cli.h"
 #include "cli/progress_sink.h"
 #include "foundation/constants.h"
+#include "foundation/xlock.h"
 
 enum {
     MAIN_MIN_ARGC = 1,
@@ -171,6 +172,16 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         return 0;
     }
 
+    /* Issue #22: cross-process gate, same non-blocking "skip and retry next
+     * cycle" style as the in-process check above — the watcher never blocks
+     * on another process's run, it just tries again in 5-60s. */
+    cbm_xlock_t xlk;
+    if (!cbm_xlock_try_acquire(&xlk, root_path)) {
+        cbm_log_info("watcher.skip", "project", project_name, "reason", "xlock_busy_other_process");
+        cbm_pipeline_unlock();
+        return 0;
+    }
+
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
 
     /* #832: route the re-index through the supervised worker subprocess so this
@@ -184,6 +195,8 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         char *resp = cbm_mcp_index_run_supervised_path(root_path);
         if (resp) {
             free(resp);
+            cbm_xlock_mark_done(&xlk);
+            cbm_xlock_release(&xlk);
             cbm_pipeline_unlock();
             return 0;
         }
@@ -195,12 +208,17 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         (void)cbm_pipeline_apply_project_alias(p, project_name);
     }
     if (!p) {
+        cbm_xlock_release(&xlk);
         cbm_pipeline_unlock();
         return CBM_NOT_FOUND;
     }
 
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
+    if (rc == 0) {
+        cbm_xlock_mark_done(&xlk);
+    }
+    cbm_xlock_release(&xlk);
     cbm_pipeline_unlock();
     return rc;
 }
@@ -333,10 +351,93 @@ static bool cli_first_nonspace_is_brace(const char *s) {
     return *s == '{';
 }
 
+/* ── xlock e2e probe (issue #22) ───────────────────────────────────
+ * `cli --xlock-probe <project>` drives ONLY the cross-process lock state
+ * machine (cbm_xlock_t) — no indexing pipeline involved — so the per-state
+ * e2e suite gets deterministic, sub-second, real-multi-process coverage of
+ * every state without paying for a real full index. Behaviour is controlled
+ * by env vars so the test harness can spawn many real OS processes with
+ * different roles:
+ *   CBM_XLOCK_PROBE_HOLD_MS  — ms to hold the lock once acquired as owner
+ *                              (default 300).
+ *   CBM_XLOCK_PROBE_CRASH    — "1": after the hold, _exit WITHOUT releasing
+ *                              or marking done (simulates a crashed holder;
+ *                              the kernel still drops the flock on exit).
+ * Prints exactly one line of JSON to stdout describing the FINAL state
+ * reached: {"state":"OWNER_INDEXING|RELEASED|WAITING|REUSED|CRASH_RECLAIMED"}
+ * (WAITING is only the parting line printed on crash-simulation exit, since
+ * that path never reaches RELEASED itself). Exit code 0 on any completed,
+ * well-defined outcome. */
+static int run_xlock_probe(const char *project) {
+    int hold_ms = 300;
+    const char *hold_env = getenv("CBM_XLOCK_PROBE_HOLD_MS");
+    if (hold_env && hold_env[0]) {
+        int v = atoi(hold_env);
+        if (v >= 0) {
+            hold_ms = v;
+        }
+    }
+    bool simulate_crash = false;
+    const char *crash_env = getenv("CBM_XLOCK_PROBE_CRASH");
+    if (crash_env && strcmp(crash_env, "1") == 0) {
+        simulate_crash = true;
+    }
+
+    cbm_xlock_t lk;
+    bool got = cbm_xlock_try_acquire(&lk, project);
+    if (got) {
+        printf("{\"state\":\"OWNER_INDEXING\",\"pid\":%d}\n", (int)getpid());
+        fflush(stdout);
+        if (hold_ms > 0) {
+            cbm_usleep((unsigned int)hold_ms * 1000);
+        }
+        if (simulate_crash) {
+            printf("{\"state\":\"CRASH_RELEASE\",\"pid\":%d}\n", (int)getpid());
+            fflush(stdout);
+            /* Do NOT release or mark done — exit abruptly. The kernel still
+             * drops the flock on process exit (that is the whole point). */
+            _Exit(1);
+        }
+        cbm_xlock_mark_done(&lk);
+        cbm_xlock_release(&lk);
+        printf("{\"state\":\"RELEASED\",\"pid\":%d}\n", (int)getpid());
+        return 0;
+    }
+
+    printf("{\"state\":\"WAITING\",\"pid\":%d}\n", (int)getpid());
+    fflush(stdout);
+    if (!cbm_xlock_wait_for_release(&lk, project)) {
+        printf("{\"state\":\"ERROR\",\"pid\":%d}\n", (int)getpid());
+        return 1;
+    }
+    if (lk.state == CBM_XLOCK_STATE_REUSED) {
+        printf("{\"state\":\"REUSED\",\"pid\":%d}\n", (int)getpid());
+        cbm_xlock_release(&lk);
+        return 0;
+    }
+    /* CRASH_RECLAIMED: the previous holder died without finishing. We now
+     * legitimately hold the flock ourselves — become the new owner and (in
+     * this probe) simply finish the run instead of the real holder. */
+    printf("{\"state\":\"CRASH_RECLAIMED\",\"pid\":%d}\n", (int)getpid());
+    fflush(stdout);
+    if (hold_ms > 0) {
+        cbm_usleep((unsigned int)hold_ms * 1000);
+    }
+    cbm_xlock_mark_done(&lk);
+    cbm_xlock_release(&lk);
+    printf("{\"state\":\"RELEASED\",\"pid\":%d}\n", (int)getpid());
+    return 0;
+}
+
 static int run_cli(int argc, char **argv) {
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
         return SKIP_ONE;
+    }
+
+    const char *xlock_probe_project = cli_strip_flag_value(&argc, argv, "--xlock-probe");
+    if (xlock_probe_project) {
+        return run_xlock_probe(xlock_probe_project);
     }
 
     bool progress = cli_strip_flag(&argc, argv, "--progress");
