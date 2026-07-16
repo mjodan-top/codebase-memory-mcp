@@ -344,7 +344,8 @@ TEST_CYPHER_SRCS = \
 TEST_DAEMON_SRCS = tests/test_uds_lifecycle.c
 
 TEST_MCP_SRCS = \
-    tests/test_mcp.c
+    tests/test_mcp.c \
+    tests/test_mcp_session.c
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \

@@ -91,6 +91,13 @@ char *cbm_mcp_get_arguments(const char *params_json);
 
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
+typedef enum cbm_mcp_session_phase {
+    CBM_MCP_SESSION_NEW = 0,
+    CBM_MCP_SESSION_INITIALIZING,
+    CBM_MCP_SESSION_READY,
+    CBM_MCP_SESSION_CLOSED
+} cbm_mcp_session_phase_t;
+
 /* Create an MCP server. store_path is the SQLite database directory. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 
@@ -110,6 +117,10 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
 /* Process a single JSON-RPC request line and return the response.
  * Returns heap-allocated JSON response string, or NULL for notifications. */
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
+
+/* Current connection lifecycle phase. Existing stdio callers remain permissive;
+ * daemon connections use this state to keep initialize/ready isolated. */
+cbm_mcp_session_phase_t cbm_mcp_server_session_phase(const cbm_mcp_server_t *srv);
 
 /* ── Tool handler dispatch (for testing) ──────────────────────── */
 

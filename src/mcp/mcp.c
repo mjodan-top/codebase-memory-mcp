@@ -890,6 +890,18 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  *  MCP SERVER
  * ══════════════════════════════════════════════════════════════════ */
 
+typedef struct cbm_mcp_session_state {
+    char root[CBM_SZ_1K];
+    char project[CBM_SZ_256];
+    bool detected;
+    cbm_thread_t autoindex_tid;
+    bool autoindex_active;
+    cbm_pipeline_t *active_pipeline;
+    int64_t active_request_id;
+    char *active_request_id_str;
+    cbm_mcp_session_phase_t phase;
+} cbm_mcp_session_state_t;
+
 struct cbm_mcp_server {
     cbm_store_t *store;             /* currently open project store (or NULL) */
     bool owns_store;                /* true if we opened the store */
@@ -900,19 +912,10 @@ struct cbm_mcp_server {
     cbm_thread_t update_tid;        /* background update check thread */
     bool update_thread_active;      /* true if update thread was started and needs joining */
 
-    /* Session + auto-index state */
-    char session_root[CBM_SZ_1K];     /* detected project root path */
-    char session_project[CBM_SZ_256]; /* derived project name */
-    bool session_detected;            /* true after first detection attempt */
-    struct cbm_watcher *watcher;      /* external watcher ref (not owned) */
-    struct cbm_config *config;        /* external config ref (not owned) */
-    cbm_thread_t autoindex_tid;
-    bool autoindex_active; /* true if auto-index thread was started */
-
-    /* Active pipeline tracking for cancellation support */
-    cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
-    int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
-    char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
+    /* Per-connection state, separate from process-level store/router refs. */
+    cbm_mcp_session_state_t session;
+    struct cbm_watcher *watcher; /* external process-level ref (not owned) */
+    struct cbm_config *config;   /* external process-level ref (not owned) */
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -930,6 +933,8 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
         srv->store = cbm_store_open_memory();
     }
     srv->owns_store = true;
+    srv->session.active_request_id = CBM_NOT_FOUND;
+    srv->session.phase = CBM_MCP_SESSION_NEW;
 
     return srv;
 }
@@ -965,14 +970,15 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (srv->update_thread_active) {
         cbm_thread_join(&srv->update_tid);
     }
-    if (srv->autoindex_active) {
-        cbm_thread_join(&srv->autoindex_tid);
+    if (srv->session.autoindex_active) {
+        cbm_thread_join(&srv->session.autoindex_tid);
     }
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
     }
     free(srv->current_project);
-    free(srv->active_request_id_str);
+    free(srv->session.active_request_id_str);
+    srv->session.phase = CBM_MCP_SESSION_CLOSED;
     free(srv);
 }
 
@@ -1007,7 +1013,11 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
 }
 
 cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
-    return srv ? srv->active_pipeline : NULL;
+    return srv ? srv->session.active_pipeline : NULL;
+}
+
+cbm_mcp_session_phase_t cbm_mcp_server_session_phase(const cbm_mcp_server_t *srv) {
+    return srv ? srv->session.phase : CBM_MCP_SESSION_CLOSED;
 }
 
 /* ── Cache dir + project DB path helpers ───────────────────────── */
@@ -4589,9 +4599,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * Track active pipeline so signal handler and notifications/cancelled
      * can cancel it mid-run. */
     cbm_pipeline_lock();
-    srv->active_pipeline = p;
+    srv->session.active_pipeline = p;
     int rc = cbm_pipeline_run(p);
-    srv->active_pipeline = NULL;
+    srv->session.active_pipeline = NULL;
     cbm_pipeline_unlock();
 
     /* Capture the excluded-subtree list (#411) while the pipeline (which owns
@@ -6542,10 +6552,10 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
 
 /* Detect session root from CWD (fallback: single indexed project from DB). */
 static void detect_session(cbm_mcp_server_t *srv) {
-    if (srv->session_detected) {
+    if (srv->session.detected) {
         return;
     }
-    srv->session_detected = true;
+    srv->session.detected = true;
 
     /* 1. Try CWD */
     char cwd[CBM_SZ_1K];
@@ -6553,16 +6563,16 @@ static void detect_session(cbm_mcp_server_t *srv) {
         const char *home = cbm_get_home_dir();
         /* Skip useless roots: / and $HOME */
         if (strcmp(cwd, "/") != 0 && (home == NULL || strcmp(cwd, home) != 0)) {
-            snprintf(srv->session_root, sizeof(srv->session_root), "%s", cwd);
+            snprintf(srv->session.root, sizeof(srv->session.root), "%s", cwd);
             cbm_log_info("session.root.cwd", "path", cwd);
         }
     }
 
     /* Derive project name using the same alias-aware logic as the pipeline. */
-    if (srv->session_root[0]) {
-        char *pname = cbm_pipeline_project_name_for_path(srv->session_root);
+    if (srv->session.root[0]) {
+        char *pname = cbm_pipeline_project_name_for_path(srv->session.root);
         if (pname) {
-            snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
+            snprintf(srv->session.project, sizeof(srv->session.project), "%s", pname);
             free(pname);
         }
     }
@@ -6581,22 +6591,22 @@ static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
 /* Register the session project with the background watcher for ongoing
  * change detection — unless auto_watch is disabled. */
 static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
-    if (!srv->watcher || srv->session_project[0] == '\0' || srv->session_root[0] == '\0') {
+    if (!srv->watcher || srv->session.project[0] == '\0' || srv->session.root[0] == '\0') {
         return;
     }
     if (!auto_watch_enabled(srv)) {
         cbm_log_info("watcher.register.skipped", "reason", "auto_watch_off", "project",
-                     srv->session_project);
+                     srv->session.project);
         return;
     }
-    cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+    cbm_watcher_watch(srv->watcher, srv->session.project, srv->session.root);
 }
 
 /* Background auto-index thread function */
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
-    cbm_log_info("autoindex.start", "project", srv->session_project, "path", srv->session_root);
+    cbm_log_info("autoindex.start", "project", srv->session.project, "path", srv->session.root);
 
     /* Issue #22: same cross-process singleflight gate as handle_index_repository.
      * A session's auto-index and another process's explicit index_repository
@@ -6604,16 +6614,16 @@ static void *autoindex_thread(void *arg) {
      * without this, both would spawn a full-index worker concurrently. */
     cbm_xlock_t xlk;
     bool xlk_is_owner =
-        cbm_xlock_try_acquire(&xlk, srv->session_root[0] ? srv->session_root : "default");
+        cbm_xlock_try_acquire(&xlk, srv->session.root[0] ? srv->session.root : "default");
     if (!xlk_is_owner) {
-        cbm_log_info("xlock.waiting", "project", srv->session_project);
-        if (cbm_xlock_wait_for_release(&xlk, srv->session_root) && xlk.state == CBM_XLOCK_STATE_REUSED) {
-            cbm_log_info("xlock.reused", "project", srv->session_project);
+        cbm_log_info("xlock.waiting", "project", srv->session.project);
+        if (cbm_xlock_wait_for_release(&xlk, srv->session.root) && xlk.state == CBM_XLOCK_STATE_REUSED) {
+            cbm_log_info("xlock.reused", "project", srv->session.project);
             cbm_xlock_release(&xlk);
             register_watcher_if_enabled(srv);
             return NULL;
         }
-        cbm_log_info("xlock.crash_reclaimed", "project", srv->session_project);
+        cbm_log_info("xlock.crash_reclaimed", "project", srv->session.project);
     }
 
     /* #832: prefer the supervised worker subprocess. Indexing the whole session in
@@ -6622,12 +6632,12 @@ static void *autoindex_thread(void *arg) {
      * 100% of that memory back to the OS every cycle. Degrade to the in-process
      * pipeline below when the supervisor is off (kill switch) or the spawn fails. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *resp = index_run_supervised_path(srv, srv->session_root);
+        char *resp = index_run_supervised_path(srv, srv->session.root);
         if (resp) {
             free(resp);
             cbm_xlock_mark_done(&xlk);
             cbm_xlock_release(&xlk);
-            cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
+            cbm_log_info("autoindex.done", "project", srv->session.project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
              * `if (srv->watcher)` would register even when the user set
@@ -6638,9 +6648,9 @@ static void *autoindex_thread(void *arg) {
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
     }
 
-    cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
-    if (p && srv->session_project[0]) {
-        (void)cbm_pipeline_apply_project_alias(p, srv->session_project);
+    cbm_pipeline_t *p = cbm_pipeline_new(srv->session.root, NULL, CBM_MODE_FULL);
+    if (p && srv->session.project[0]) {
+        (void)cbm_pipeline_apply_project_alias(p, srv->session.project);
     }
     if (!p) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
@@ -6658,7 +6668,7 @@ static void *autoindex_thread(void *arg) {
 
     if (rc == 0) {
         cbm_xlock_mark_done(&xlk);
-        cbm_log_info("autoindex.done", "project", srv->session_project);
+        cbm_log_info("autoindex.done", "project", srv->session.project);
         register_watcher_if_enabled(srv);
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
@@ -6669,7 +6679,7 @@ static void *autoindex_thread(void *arg) {
 
 /* Start auto-indexing if configured and project not yet indexed. */
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
-    if (srv->session_root[0] == '\0') {
+    if (srv->session.root[0] == '\0') {
         return; /* no session root detected */
     }
 
@@ -6678,11 +6688,11 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (home) {
         char db_check[CBM_SZ_1K];
         snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
-                 srv->session_project);
+                 srv->session.project);
         if (cbm_file_size(db_check) >= 0) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
-                         srv->session_project);
+                         srv->session.project);
             register_watcher_if_enabled(srv);
             return;
         }
@@ -6707,12 +6717,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 
     /* Quick file count check to avoid OOM on massive repos */
-    if (!cbm_validate_shell_arg(srv->session_root)) {
+    if (!cbm_validate_shell_arg(srv->session.root)) {
         cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
         return;
     }
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
+    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session.root);
     FILE *fp = cbm_popen(cmd, "r");
     if (fp) {
         char line[CBM_SZ_64];
@@ -6729,8 +6739,8 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 
     /* Launch auto-index in background */
-    if (cbm_thread_create(&srv->autoindex_tid, 0, autoindex_thread, srv) == 0) {
-        srv->autoindex_active = true;
+    if (cbm_thread_create(&srv->session.autoindex_tid, 0, autoindex_thread, srv) == 0) {
+        srv->session.autoindex_active = true;
     }
 }
 
@@ -6853,11 +6863,14 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
 
     /* Notifications (no id) → handle cancellation, then no response */
     if (!req.has_id) {
-        if (req.method && strcmp(req.method, "notifications/cancelled") == 0) {
-            if (srv->active_pipeline &&
-                cbm_mcp_cancel_request_matches(req.params_raw, srv->active_request_id,
-                                               srv->active_request_id_str)) {
-                cbm_pipeline_cancel(srv->active_pipeline);
+        if (req.method && strcmp(req.method, "notifications/initialized") == 0 &&
+            srv->session.phase == CBM_MCP_SESSION_INITIALIZING) {
+            srv->session.phase = CBM_MCP_SESSION_READY;
+        } else if (req.method && strcmp(req.method, "notifications/cancelled") == 0) {
+            if (srv->session.active_pipeline &&
+                cbm_mcp_cancel_request_matches(req.params_raw, srv->session.active_request_id,
+                                               srv->session.active_request_id_str)) {
+                cbm_pipeline_cancel(srv->session.active_pipeline);
                 cbm_log_info("mcp.cancelled", "match", "true");
             }
         }
@@ -6871,6 +6884,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     bool request_logged = false;
 
     if (strcmp(req.method, "initialize") == 0) {
+        srv->session.phase = CBM_MCP_SESSION_INITIALIZING;
         result_json = cbm_mcp_initialize_response(req.params_raw);
         start_update_check(srv);
         detect_session(srv);
@@ -6883,16 +6897,16 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
             req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
-        srv->active_request_id = req.id;
-        free(srv->active_request_id_str);
-        srv->active_request_id_str = req.id_str ? heap_strdup(req.id_str) : NULL;
+        srv->session.active_request_id = req.id;
+        free(srv->session.active_request_id_str);
+        srv->session.active_request_id_str = req.id_str ? heap_strdup(req.id_str) : NULL;
 
         struct timespec t0;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
         result_json = cbm_mcp_handle_tool(srv, tool_name, tool_args);
-        srv->active_request_id = CBM_NOT_FOUND;
-        free(srv->active_request_id_str);
-        srv->active_request_id_str = NULL;
+        srv->session.active_request_id = CBM_NOT_FOUND;
+        free(srv->session.active_request_id_str);
+        srv->session.active_request_id_str = NULL;
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - t0.tv_sec) * MCP_S_TO_US) +
