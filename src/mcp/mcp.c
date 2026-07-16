@@ -902,65 +902,134 @@ typedef struct cbm_mcp_session_state {
     cbm_mcp_session_phase_t phase;
 } cbm_mcp_session_state_t;
 
-struct cbm_mcp_server {
+struct cbm_mcp_core {
     cbm_store_t *store;             /* currently open project store (or NULL) */
-    bool owns_store;                /* true if we opened the store */
+    bool owns_store;                /* true if the core opened the store */
     char *current_project;          /* which project store is open for (heap) */
-    time_t store_last_used;         /* last time resolve_store was called for a named project */
+    time_t store_last_used;         /* last named-project access */
+    struct cbm_watcher *watcher;    /* external process-level ref (not owned) */
+    struct cbm_config *config;      /* external process-level ref (not owned) */
+    cbm_mutex_t mutex;              /* serializes shared resource access */
+    size_t refs;                    /* owner + attached server references */
+};
+
+struct cbm_mcp_server {
+    cbm_mcp_core_t *core;           /* shared process-level resources */
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
     bool update_thread_active;      /* true if update thread was started and needs joining */
 
-    /* Per-connection state, separate from process-level store/router refs. */
+    /* Per-connection state: never shared through cbm_mcp_core. */
     cbm_mcp_session_state_t session;
-    struct cbm_watcher *watcher; /* external process-level ref (not owned) */
-    struct cbm_config *config;   /* external process-level ref (not owned) */
 };
 
-cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
-    cbm_mcp_server_t *srv = calloc(CBM_ALLOC_ONE, sizeof(*srv));
-    if (!srv) {
+cbm_mcp_core_t *cbm_mcp_core_new(const char *store_path) {
+    cbm_mcp_core_t *core = calloc(CBM_ALLOC_ONE, sizeof(*core));
+    if (!core) {
         return NULL;
     }
+    cbm_mutex_init(&core->mutex);
+    core->refs = SKIP_ONE; /* caller ownership */
 
     /* If a store_path is given, open that project directly.
      * Otherwise, create an in-memory store for test/embedded use. */
     if (store_path) {
-        srv->store = cbm_store_open(store_path);
-        srv->current_project = heap_strdup(store_path);
+        core->store = cbm_store_open(store_path);
+        core->current_project = heap_strdup(store_path);
     } else {
-        srv->store = cbm_store_open_memory();
+        core->store = cbm_store_open_memory();
     }
-    srv->owns_store = true;
+    core->owns_store = true;
+    if (!core->store) {
+        free(core->current_project);
+        cbm_mutex_destroy(&core->mutex);
+        free(core);
+        return NULL;
+    }
+    return core;
+}
+
+static void mcp_core_retain(cbm_mcp_core_t *core) {
+    cbm_mutex_lock(&core->mutex);
+    core->refs++;
+    cbm_mutex_unlock(&core->mutex);
+}
+
+void cbm_mcp_core_free(cbm_mcp_core_t *core) {
+    if (!core) {
+        return;
+    }
+    cbm_mutex_lock(&core->mutex);
+    core->refs--;
+    bool destroy = core->refs == 0;
+    cbm_mutex_unlock(&core->mutex);
+    if (!destroy) {
+        return;
+    }
+    if (core->owns_store && core->store) {
+        cbm_store_close(core->store);
+    }
+    free(core->current_project);
+    cbm_mutex_destroy(&core->mutex);
+    free(core);
+}
+
+cbm_mcp_server_t *cbm_mcp_server_new_with_core(cbm_mcp_core_t *core) {
+    if (!core) {
+        return NULL;
+    }
+    cbm_mcp_server_t *srv = calloc(CBM_ALLOC_ONE, sizeof(*srv));
+    if (!srv) {
+        return NULL;
+    }
+    mcp_core_retain(core);
+    srv->core = core;
     srv->session.active_request_id = CBM_NOT_FOUND;
     srv->session.phase = CBM_MCP_SESSION_NEW;
+    return srv;
+}
 
+cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
+    cbm_mcp_core_t *core = cbm_mcp_core_new(store_path);
+    if (!core) {
+        return NULL;
+    }
+    cbm_mcp_server_t *srv = cbm_mcp_server_new_with_core(core);
+    cbm_mcp_core_free(core); /* transfer the caller reference to the server */
     return srv;
 }
 
 cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv) {
-    return srv ? srv->store : NULL;
+    return (srv && srv->core) ? srv->core->store : NULL;
 }
 
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
-    if (!srv) {
+    if (!srv || !srv->core) {
         return;
     }
-    free(srv->current_project);
-    srv->current_project = project ? heap_strdup(project) : NULL;
+    cbm_mutex_lock(&srv->core->mutex);
+    free(srv->core->current_project);
+    srv->core->current_project = project ? heap_strdup(project) : NULL;
+    cbm_mutex_unlock(&srv->core->mutex);
 }
 
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
-    if (srv) {
-        srv->watcher = w;
+    if (!srv || !srv->core) {
+        return;
     }
+    cbm_mutex_lock(&srv->core->mutex);
+    srv->core->watcher = w;
+    cbm_mutex_unlock(&srv->core->mutex);
 }
 
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
-    if (srv) {
-        srv->config = cfg;
+    if (!srv || !srv->core) {
+        return;
     }
+    cbm_mutex_lock(&srv->core->mutex);
+    srv->core->config = cfg;
+    cbm_mutex_unlock(&srv->core->mutex);
 }
 
 void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
@@ -973,43 +1042,49 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (srv->session.autoindex_active) {
         cbm_thread_join(&srv->session.autoindex_tid);
     }
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-    }
-    free(srv->current_project);
     free(srv->session.active_request_id_str);
     srv->session.phase = CBM_MCP_SESSION_CLOSED;
+    cbm_mcp_core_free(srv->core);
     free(srv);
 }
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
-    if (!srv || !srv->store) {
+    if (!srv || !srv->core) {
         return;
     }
-    /* Protect initial in-memory stores that were never accessed via a named project.
-     * store_last_used stays 0 until resolve_store is called with a non-NULL project. */
-    if (srv->store_last_used == 0) {
+    cbm_mutex_lock(&srv->core->mutex);
+    if (!srv->core->store || srv->core->store_last_used == 0) {
+        /* Protect initial in-memory stores that were never accessed via a named project. */
+        cbm_mutex_unlock(&srv->core->mutex);
         return;
     }
 
     time_t now = time(NULL);
-    if ((now - srv->store_last_used) < timeout_s) {
+    if ((now - srv->core->store_last_used) < timeout_s) {
+        cbm_mutex_unlock(&srv->core->mutex);
         return;
     }
 
-    if (srv->owns_store) {
-        cbm_store_close(srv->store);
+    if (srv->core->owns_store) {
+        cbm_store_close(srv->core->store);
     }
-    srv->store = NULL;
-    free(srv->current_project);
-    srv->current_project = NULL;
-    srv->store_last_used = 0;
+    srv->core->store = NULL;
+    free(srv->core->current_project);
+    srv->core->current_project = NULL;
+    srv->core->store_last_used = 0;
+    cbm_mutex_unlock(&srv->core->mutex);
 }
 
 bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
-    return (srv && srv->store != NULL) != 0;
+    if (!srv || !srv->core) {
+        return false;
+    }
+    cbm_mutex_lock(&srv->core->mutex);
+    bool has_store = srv->core->store != NULL;
+    cbm_mutex_unlock(&srv->core->mutex);
+    return has_store;
 }
 
 cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
@@ -1070,31 +1145,32 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         return NULL; /* project is required — no implicit fallback */
     }
 
-    srv->store_last_used = time(NULL);
+    srv->core->store_last_used = time(NULL);
 
     /* Already open for this project? */
-    if (srv->current_project && strcmp(srv->current_project, project) == 0 && srv->store) {
-        return srv->store;
+    if (srv->core->current_project && strcmp(srv->core->current_project, project) == 0 &&
+        srv->core->store) {
+        return srv->core->store;
     }
 
     /* Close old store */
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    if (srv->core->owns_store && srv->core->store) {
+        cbm_store_close(srv->core->store);
+        srv->core->store = NULL;
     }
 
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
      * prevent ghost .db file creation for unknown/unindexed projects. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path_query(path);
-    if (srv->store) {
+    srv->core->store = cbm_store_open_path_query(path);
+    if (srv->core->store) {
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
-        if (!cbm_store_check_integrity(srv->store)) {
+        if (!cbm_store_check_integrity(srv->core->store)) {
             cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
                           "backing up corrupt db to .corrupt — re-index required");
-            cbm_store_close(srv->store);
-            srv->store = NULL;
+            cbm_store_close(srv->core->store);
+            srv->core->store = NULL;
             /* #557 (data loss): rename the corrupt DB to a .corrupt backup instead
              * of unlinking it, so the user's graph is recoverable / reportable.
              * Re-index rebuilds a fresh DB at `path`. WAL/SHM are transient. */
@@ -1118,18 +1194,18 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
          * Linux where unlink defers actual removal). Opening an empty/deleted
          * store without closing it leaks the SQLite connection. */
         cbm_project_t proj_verify = {0};
-        if (cbm_store_get_project(srv->store, project, &proj_verify) == CBM_STORE_OK) {
+        if (cbm_store_get_project(srv->core->store, project, &proj_verify) == CBM_STORE_OK) {
             cbm_project_free_fields(&proj_verify);
-            srv->owns_store = true;
-            free(srv->current_project);
-            srv->current_project = heap_strdup(project);
-            return srv->store; /* fast path: filename == internal name */
+            srv->core->owns_store = true;
+            free(srv->core->current_project);
+            srv->core->current_project = heap_strdup(project);
+            return srv->core->store; /* fast path: filename == internal name */
         }
         /* #704: <project>.db exists but its INTERNAL project name differs from
          * the passed name (a copied/renamed db, or a legacy '.'-vs-'-' username
          * twin). Close it and fall through to the cache-dir scan below. */
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+        cbm_store_close(srv->core->store);
+        srv->core->store = NULL;
     }
 
     /* #704 fallback: either <project>.db is absent or its internal name drifted
@@ -1140,13 +1216,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
      * No match → NULL (a genuine typo stays not-found). */
     cbm_store_t *scanned = resolve_store_fallback_scan(project);
     if (scanned) {
-        srv->store = scanned;
-        srv->owns_store = true;
-        free(srv->current_project);
-        srv->current_project = heap_strdup(project);
+        srv->core->store = scanned;
+        srv->core->owns_store = true;
+        free(srv->core->current_project);
+        srv->core->current_project = heap_strdup(project);
     }
 
-    return srv->store;
+    return srv->core->store;
 }
 
 /* Forward decl — definition lives below alongside list_projects. */
@@ -2605,18 +2681,19 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Close store if it's the project being deleted */
-    if (srv->current_project && strcmp(srv->current_project, name) == 0) {
-        if (srv->owns_store && srv->store) {
-            cbm_store_close(srv->store);
-            srv->store = NULL;
+    if (srv->core->current_project && strcmp(srv->core->current_project, name) == 0) {
+        if (srv->core->owns_store && srv->core->store) {
+            cbm_store_close(srv->core->store);
+            srv->core->store = NULL;
         }
-        free(srv->current_project);
-        srv->current_project = NULL;
+        free(srv->core->current_project);
+        srv->core->current_project = NULL;
     }
 
     cbm_project_t proj_info = {0};
     bool have_proj_info = false;
-    if (srv->owns_store && srv->store && cbm_store_get_project(srv->store, name, &proj_info) == CBM_STORE_OK) {
+    if (srv->core->owns_store && srv->core->store &&
+        cbm_store_get_project(srv->core->store, name, &proj_info) == CBM_STORE_OK) {
         have_proj_info = true;
     }
 
@@ -2671,8 +2748,8 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_pipeline_unlock();
 
-    if (srv->watcher) {
-        cbm_watcher_unwatch(srv->watcher, name);
+    if (srv->core->watcher) {
+        cbm_watcher_unwatch(srv->core->watcher, name);
     }
 
     cbm_mem_collect(); /* return freed pages to OS after closing database */
@@ -4085,12 +4162,12 @@ static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
     }
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    if (srv->core->owns_store && srv->core->store) {
+        cbm_store_close(srv->core->store);
+        srv->core->store = NULL;
     }
-    free(srv->current_project);
-    srv->current_project = NULL;
+    free(srv->core->current_project);
+    srv->core->current_project = NULL;
 }
 
 /* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>
@@ -4588,12 +4665,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     try_artifact_bootstrap(project_name, repo_path);
 
     /* Close cached store — pipeline will delete + recreate the .db file */
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    if (srv->core->owns_store && srv->core->store) {
+        cbm_store_close(srv->core->store);
+        srv->core->store = NULL;
     }
-    free(srv->current_project);
-    srv->current_project = NULL;
+    free(srv->core->current_project);
+    srv->core->current_project = NULL;
 
     /* Serialize pipeline runs to prevent concurrent writes.
      * Track active pipeline so signal handler and notifications/cancelled
@@ -4620,12 +4697,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_mem_collect(); /* return mimalloc pages to OS after large indexing */
 
     /* Invalidate cached store so next query reopens the fresh database */
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    if (srv->core->owns_store && srv->core->store) {
+        cbm_store_close(srv->core->store);
+        srv->core->store = NULL;
     }
-    free(srv->current_project);
-    srv->current_project = NULL;
+    free(srv->core->current_project);
+    srv->core->current_project = NULL;
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -4998,7 +5075,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_doc *props_doc = enrich_node_properties(doc, root_obj, node->properties_json);
 
     /* Caller/callee counts — store already resolved by calling handler */
-    cbm_store_t *store = srv->store;
+    cbm_store_t *store = srv->core->store;
     int in_deg = 0;
     int out_deg = 0;
     cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
@@ -5081,7 +5158,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Default to current project (same as all other tools) */
-    const char *effective_project = project ? project : srv->current_project;
+    const char *effective_project = project ? project : srv->core->current_project;
 
     /* Tier 1: Exact QN match */
     cbm_node_t node = {0};
@@ -6203,7 +6280,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *impacted = yyjson_mut_arr(doc);
 
     /* resolve_store already called via get_project_root above */
-    cbm_store_t *store = srv->store;
+    cbm_store_t *store = srv->core->store;
 
     char line[CBM_SZ_1K];
     int file_count = 0;
@@ -6488,7 +6565,8 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
-char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+static char *mcp_handle_tool_unlocked(cbm_mcp_server_t *srv, const char *tool_name,
+                                      const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }
@@ -6548,6 +6626,16 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     return cbm_mcp_text_result(msg, true);
 }
 
+char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+    if (!srv || !srv->core) {
+        return cbm_mcp_text_result("MCP server is required", true);
+    }
+    cbm_mutex_lock(&srv->core->mutex);
+    char *result = mcp_handle_tool_unlocked(srv, tool_name, args_json);
+    cbm_mutex_unlock(&srv->core->mutex);
+    return result;
+}
+
 /* ── Session detection + auto-index ────────────────────────────── */
 
 /* Detect session root from CWD (fallback: single indexed project from DB). */
@@ -6582,16 +6670,16 @@ static void detect_session(cbm_mcp_server_t *srv) {
  * Multi-project users can contain a session to its own project with
  * `config set auto_watch false`. */
 static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
-    if (!srv->config) {
+    if (!srv->core->config) {
         return true; /* default on */
     }
-    return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_WATCH, true);
+    return cbm_config_get_bool(srv->core->config, CBM_CONFIG_AUTO_WATCH, true);
 }
 
 /* Register the session project with the background watcher for ongoing
  * change detection — unless auto_watch is disabled. */
 static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
-    if (!srv->watcher || srv->session.project[0] == '\0' || srv->session.root[0] == '\0') {
+    if (!srv->core->watcher || srv->session.project[0] == '\0' || srv->session.root[0] == '\0') {
         return;
     }
     if (!auto_watch_enabled(srv)) {
@@ -6599,7 +6687,7 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
                      srv->session.project);
         return;
     }
-    cbm_watcher_watch(srv->watcher, srv->session.project, srv->session.root);
+    cbm_watcher_watch(srv->core->watcher, srv->session.project, srv->session.root);
 }
 
 /* Background auto-index thread function */
@@ -6626,6 +6714,11 @@ static void *autoindex_thread(void *arg) {
         cbm_log_info("xlock.crash_reclaimed", "project", srv->session.project);
     }
 
+    /* Shared stores/router state must not be invalidated while another connection
+     * is using them. Cross-process xlock above handles writers; this mutex handles
+     * in-process connection sharing. */
+    cbm_mutex_lock(&srv->core->mutex);
+
     /* #832: prefer the supervised worker subprocess. Indexing the whole session in
      * this long-lived server thread ratchets RSS (mimalloc v3 does not reclaim the
      * pages worker threads abandon at exit); running it in a child that exits hands
@@ -6640,8 +6733,9 @@ static void *autoindex_thread(void *arg) {
             cbm_log_info("autoindex.done", "project", srv->session.project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
-             * `if (srv->watcher)` would register even when the user set
-             * `config set auto_watch false`, since srv->watcher is always set. */
+             * `if (srv->core->watcher)` would register even when the user set
+             * `config set auto_watch false`, since srv->core->watcher is always set. */
+            cbm_mutex_unlock(&srv->core->mutex);
             register_watcher_if_enabled(srv);
             return NULL;
         }
@@ -6654,6 +6748,7 @@ static void *autoindex_thread(void *arg) {
     }
     if (!p) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
+        cbm_mutex_unlock(&srv->core->mutex);
         cbm_xlock_release(&xlk);
         return NULL;
     }
@@ -6665,6 +6760,7 @@ static void *autoindex_thread(void *arg) {
 
     cbm_pipeline_free(p);
     cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
+    cbm_mutex_unlock(&srv->core->mutex);
 
     if (rc == 0) {
         cbm_xlock_mark_done(&xlk);
@@ -6704,10 +6800,10 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     /* Check auto_index config */
     bool auto_index = false;
     int file_limit = DEFAULT_AUTO_INDEX_LIMIT;
-    if (srv->config) {
-        auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, false);
-        file_limit =
-            cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT, DEFAULT_AUTO_INDEX_LIMIT);
+    if (srv->core->config) {
+        auto_index = cbm_config_get_bool(srv->core->config, CBM_CONFIG_AUTO_INDEX, false);
+        file_limit = cbm_config_get_int(srv->core->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                        DEFAULT_AUTO_INDEX_LIMIT);
     }
 
     if (!auto_index) {

@@ -89,6 +89,7 @@ char *cbm_mcp_get_arguments(const char *params_json);
 
 /* ── MCP Server ───────────────────────────────────────────────── */
 
+typedef struct cbm_mcp_core cbm_mcp_core_t;
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
 typedef enum cbm_mcp_session_phase {
@@ -98,7 +99,19 @@ typedef enum cbm_mcp_session_phase {
     CBM_MCP_SESSION_CLOSED
 } cbm_mcp_session_phase_t;
 
-/* Create an MCP server. store_path is the SQLite database directory. */
+/* Create a process-level MCP core holding shared store/router resources.
+ * The returned owner reference must be released with cbm_mcp_core_free(). */
+cbm_mcp_core_t *cbm_mcp_core_new(const char *store_path);
+
+/* Release one core owner/server reference. The shared resources close after
+ * the final attached server (and owner) releases its reference. */
+void cbm_mcp_core_free(cbm_mcp_core_t *core);
+
+/* Create a connection server attached to an existing shared core. Session
+ * lifecycle, request/cancellation state, and auto-index state stay isolated. */
+cbm_mcp_server_t *cbm_mcp_server_new_with_core(cbm_mcp_core_t *core);
+
+/* Compatibility constructor: creates a private core for one server. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 
 /* Free an MCP server. */
