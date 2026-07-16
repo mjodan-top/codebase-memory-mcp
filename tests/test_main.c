@@ -164,6 +164,7 @@ extern void suite_store_nodes(void);
 extern void suite_store_edges(void);
 extern void suite_store_search(void);
 extern void suite_cypher(void);
+extern void suite_uds_lifecycle(void);
 extern void suite_mcp(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
@@ -305,6 +306,9 @@ int main(int argc, char **argv) {
 
     /* Cypher (M6) */
     RUN_SELECTED_SUITE(cypher);
+
+    /* Daemon UDS lifecycle (Issue #25) */
+    RUN_SELECTED_SUITE(uds_lifecycle);
 
     /* MCP Server (M9) */
     RUN_SELECTED_SUITE(mcp);
