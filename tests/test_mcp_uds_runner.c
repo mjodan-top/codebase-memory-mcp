@@ -7,6 +7,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "daemon/mcp_uds_runner.h"
+#include "foundation/compat.h"
+#include "foundation/constants.h"
+#include "foundation/log.h"
+#include "foundation/platform.h"
+#include "pipeline/pipeline.h"
 #include "test_framework.h"
 
 #ifndef _WIN32
@@ -17,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -84,6 +90,44 @@ static int round_trip_contains(FILE *in, FILE *out, const char *request, const c
     int ok = response && strstr(response, expected) != NULL;
     free(response);
     return ok ? 0 : -1;
+}
+
+static int round_trip_has_id_and_not(FILE *in, FILE *out, const char *request, int expected_id,
+                                     int forbidden_a, int forbidden_b) {
+    if (send_request(out, request) != 0)
+        return -1;
+    char *response = read_response(in);
+    char expected[48];
+    char forbidden_one[48];
+    char forbidden_two[48];
+    int ok = response && snprintf(expected, sizeof(expected), "\"id\":%d", expected_id) > 0 &&
+             snprintf(forbidden_one, sizeof(forbidden_one), "\"id\":%d", forbidden_a) > 0 &&
+             snprintf(forbidden_two, sizeof(forbidden_two), "\"id\":%d", forbidden_b) > 0 &&
+             strstr(response, expected) != NULL && strstr(response, forbidden_one) == NULL &&
+             strstr(response, forbidden_two) == NULL;
+    free(response);
+    return ok ? 0 : -1;
+}
+
+static atomic_flag g_session_log_lock = ATOMIC_FLAG_INIT;
+static char g_session_logs[CBM_SZ_16K];
+
+static void capture_session_log(const char *line) {
+    if (!line ||
+        (strstr(line, "session.root.cwd") == NULL && strstr(line, "autoindex.skip") == NULL))
+        return;
+    while (atomic_flag_test_and_set(&g_session_log_lock)) {}
+    size_t used = strlen(g_session_logs);
+    size_t left = sizeof(g_session_logs) - used;
+    if (left > 1)
+        (void)snprintf(g_session_logs + used, left, "%s\n", line);
+    atomic_flag_clear(&g_session_log_lock);
+}
+
+static void reset_session_logs(void) {
+    while (atomic_flag_test_and_set(&g_session_log_lock)) {}
+    g_session_logs[0] = '\0';
+    atomic_flag_clear(&g_session_log_lock);
 }
 
 static int client_process(const char *path, int ready_fd, int command_fd, int client_id) {
@@ -159,6 +203,128 @@ static int client_process(const char *path, int ready_fd, int command_fd, int cl
     fclose(out);
     fclose(in);
     return 0;
+}
+
+typedef struct concurrent_client_ids {
+    int initialize_id;
+    int list_id;
+    int tool_id;
+    int ping_id;
+    int forbidden_a;
+    int forbidden_b;
+} concurrent_client_ids_t;
+
+static int concurrent_client_process(const char *path, int ready_fd, int command_fd,
+                                     concurrent_client_ids_t ids) {
+    int fd = connect_pathname_uds(path);
+    if (fd < 0)
+        return 30;
+    int write_fd = dup(fd);
+    if (write_fd < 0) {
+        close(fd);
+        return 31;
+    }
+    FILE *in = fdopen(fd, "rb");
+    FILE *out = fdopen(write_fd, "wb");
+    if (!in || !out) {
+        if (in)
+            fclose(in);
+        else
+            close(fd);
+        if (out)
+            fclose(out);
+        else
+            close(write_fd);
+        return 31;
+    }
+    setvbuf(out, NULL, _IONBF, 0);
+
+    char command = 0;
+    if (read(command_fd, &command, 1) != 1 || command != 'I') {
+        fclose(out);
+        fclose(in);
+        return 32;
+    }
+
+    char initialize[160];
+    char list[128];
+    if (snprintf(initialize, sizeof(initialize),
+                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"initialize\",\"params\":{}}",
+                 ids.initialize_id) <= 0 ||
+        snprintf(list, sizeof(list),
+                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/list\",\"params\":{}}",
+                 ids.list_id) <= 0 ||
+        round_trip_has_id_and_not(in, out, initialize, ids.initialize_id, ids.forbidden_a,
+                                  ids.forbidden_b) != 0 ||
+        send_request(out, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}") != 0 ||
+        round_trip_has_id_and_not(in, out, list, ids.list_id, ids.forbidden_a, ids.forbidden_b) !=
+            0) {
+        fclose(out);
+        fclose(in);
+        return 33;
+    }
+
+    if (write(ready_fd, "R", 1) != 1 || read(command_fd, &command, 1) != 1 || command != 'G') {
+        fclose(out);
+        fclose(in);
+        return 34;
+    }
+
+    char tool[256];
+    char cancel[160];
+    char ping[96];
+    if (snprintf(tool, sizeof(tool),
+                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}",
+                 ids.tool_id) <= 0 ||
+        snprintf(cancel, sizeof(cancel),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\","
+                 "\"params\":{\"requestId\":%d}}",
+                 ids.tool_id) <= 0 ||
+        snprintf(ping, sizeof(ping), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"ping\"}",
+                 ids.ping_id) <= 0 ||
+        send_request(out, tool) != 0 || send_request(out, cancel) != 0) {
+        fclose(out);
+        fclose(in);
+        return 35;
+    }
+
+    char *tool_response = read_response(in);
+    char own_id[48];
+    char forbidden_one[48];
+    char forbidden_two[48];
+    int ok =
+        tool_response && snprintf(own_id, sizeof(own_id), "\"id\":%d", ids.tool_id) > 0 &&
+        snprintf(forbidden_one, sizeof(forbidden_one), "\"id\":%d", ids.forbidden_a) > 0 &&
+        snprintf(forbidden_two, sizeof(forbidden_two), "\"id\":%d", ids.forbidden_b) > 0 &&
+        strstr(tool_response, own_id) != NULL && strstr(tool_response, forbidden_one) == NULL &&
+        strstr(tool_response, forbidden_two) == NULL && strstr(tool_response, "projects") != NULL;
+    free(tool_response);
+    if (!ok || round_trip_has_id_and_not(in, out, ping, ids.ping_id, ids.forbidden_a,
+                                         ids.forbidden_b) != 0) {
+        fclose(out);
+        fclose(in);
+        return 36;
+    }
+
+    fclose(out);
+    fclose(in);
+    return 0;
+}
+
+static pid_t spawn_concurrent_client(const char *path, int ready_pipe[2], int command_pipe[2],
+                                     concurrent_client_ids_t ids, const cbm_uds_owner_t *owner) {
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+    close(ready_pipe[0]);
+    close(command_pipe[1]);
+    close(owner->listen_fd);
+    close(owner->claim_fd);
+    int rc = concurrent_client_process(path, ready_pipe[1], command_pipe[0], ids);
+    close(ready_pipe[1]);
+    close(command_pipe[0]);
+    _exit(rc);
 }
 
 static pid_t spawn_client(const char *path, int ready_pipe[2], int command_pipe[2], int id,
@@ -317,6 +483,133 @@ TEST(mcp_uds_two_process_clients_share_core_but_isolate_sessions) {
 #endif
 }
 
+TEST(mcp_uds_three_process_clients_isolate_roots_ids_and_cancel) {
+#ifdef _WIN32
+    SKIP_PLATFORM("pathname UDS runner is Unix-only");
+#else
+    char original_cwd[CBM_SZ_1K];
+    ASSERT_NOT_NULL(getcwd(original_cwd, sizeof(original_cwd)));
+    char dir_template[] = "/tmp/cbm-mcp-three-XXXXXX";
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    char socket_path[108];
+    char roots[3][CBM_SZ_1K];
+    char canonical_roots[3][CBM_SZ_1K];
+    char *projects[3] = {0};
+    char db_paths[3][CBM_SZ_1K];
+    char cache_dir[CBM_SZ_1K];
+    char saved_cache[CBM_SZ_1K];
+    int had_cache =
+        cbm_safe_getenv("CBM_CACHE_DIR", saved_cache, sizeof(saved_cache), NULL) != NULL;
+    ASSERT_TRUE(snprintf(socket_path, sizeof(socket_path), "%s/daemon.sock", dir) > 0);
+    ASSERT_TRUE(snprintf(cache_dir, sizeof(cache_dir), "%s/cache", dir) > 0);
+    ASSERT_EQ(mkdir(cache_dir, 0700), 0);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache_dir, 1), 0);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(snprintf(roots[i], sizeof(roots[i]), "%s/client-%c", dir, 'a' + i) > 0);
+        ASSERT_EQ(mkdir(roots[i], 0700), 0);
+        ASSERT_NOT_NULL(realpath(roots[i], canonical_roots[i]));
+        projects[i] = cbm_pipeline_project_name_for_path(canonical_roots[i]);
+        ASSERT_NOT_NULL(projects[i]);
+        ASSERT_TRUE(snprintf(db_paths[i], sizeof(db_paths[i]), "%s/%s.db", cache_dir, projects[i]) >
+                    0);
+        FILE *db = fopen(db_paths[i], "wb");
+        ASSERT_NOT_NULL(db);
+        ASSERT_EQ(fclose(db), 0);
+    }
+
+    cbm_uds_owner_t owner;
+    cbm_uds_owner_configure(&owner, (unsigned long)-1, NULL, NULL);
+    ASSERT_EQ(cbm_uds_owner_open(&owner, socket_path, 8), 0);
+    cbm_mcp_core_t *core = cbm_mcp_core_new(NULL);
+    ASSERT_NOT_NULL(core);
+
+    int ready[3][2];
+    int command[3][2];
+    pid_t children[3];
+    cbm_mcp_uds_worker_t workers[3];
+    concurrent_client_ids_t ids[3] = {
+        {.initialize_id = 101,
+         .list_id = 102,
+         .tool_id = 103,
+         .ping_id = 104,
+         .forbidden_a = 203,
+         .forbidden_b = 303},
+        {.initialize_id = 201,
+         .list_id = 202,
+         .tool_id = 203,
+         .ping_id = 204,
+         .forbidden_a = 103,
+         .forbidden_b = 303},
+        {.initialize_id = 301,
+         .list_id = 302,
+         .tool_id = 303,
+         .ping_id = 304,
+         .forbidden_a = 103,
+         .forbidden_b = 203},
+    };
+
+    reset_session_logs();
+    cbm_log_set_sink_ex(capture_session_log, CBM_LOG_SINK_TEE);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(pipe(ready[i]), 0);
+        ASSERT_EQ(pipe(command[i]), 0);
+        children[i] = spawn_concurrent_client(socket_path, ready[i], command[i], ids[i], &owner);
+        ASSERT_TRUE(children[i] > 0);
+        close(ready[i][1]);
+        close(command[i][0]);
+        ASSERT_EQ(cbm_mcp_uds_accept_start(&owner, core, &workers[i]), 0);
+
+        /* CWD is process-global, so initialize clients one at a time. The
+         * response barrier proves detect_session captured this root before
+         * moving to the next one; later tool/cancel traffic runs concurrently. */
+        ASSERT_EQ(chdir(roots[i]), 0);
+        ASSERT_EQ(write(command[i][1], "I", 1), 1);
+        char ready_byte = 0;
+        ASSERT_EQ(read(ready[i][0], &ready_byte, 1), 1);
+        ASSERT_EQ(ready_byte, 'R');
+    }
+    ASSERT_EQ(chdir(original_cwd), 0);
+
+    while (atomic_flag_test_and_set(&g_session_log_lock)) {}
+    for (int i = 0; i < 3; i++) {
+        ASSERT_NOT_NULL(strstr(g_session_logs, canonical_roots[i]));
+        ASSERT_NOT_NULL(strstr(g_session_logs, projects[i]));
+    }
+    atomic_flag_clear(&g_session_log_lock);
+
+    /* Release all clients together. Each queues a tools/call immediately
+     * followed by a cancellation targeting its own request. Responses and
+     * subsequent ping ids must remain connection-local. */
+    for (int i = 0; i < 3; i++)
+        ASSERT_EQ(write(command[i][1], "G", 1), 1);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(child_succeeded(children[i]));
+        ASSERT_EQ(cbm_mcp_uds_worker_join(&workers[i]), 0);
+        close(ready[i][0]);
+        close(command[i][1]);
+    }
+    cbm_log_set_sink(NULL);
+
+    cbm_mcp_core_free(core);
+    cbm_uds_owner_close(&owner);
+    remove_socket_lock(socket_path);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(unlink(db_paths[i]), 0);
+        ASSERT_EQ(rmdir(roots[i]), 0);
+        free(projects[i]);
+    }
+    if (had_cache)
+        ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", saved_cache, 1), 0);
+    else
+        ASSERT_EQ(cbm_unsetenv("CBM_CACHE_DIR"), 0);
+    ASSERT_EQ(rmdir(cache_dir), 0);
+    ASSERT_EQ(rmdir(dir), 0);
+    PASS();
+#endif
+}
+
 TEST(mcp_uds_serve_detaches_and_reclaims_completed_sessions) {
 #ifdef _WIN32
     SKIP_PLATFORM("pathname UDS runner is Unix-only");
@@ -358,6 +651,7 @@ TEST(mcp_uds_serve_detaches_and_reclaims_completed_sessions) {
 
 SUITE(mcp_uds_runner) {
     RUN_TEST(mcp_uds_two_process_clients_share_core_but_isolate_sessions);
+    RUN_TEST(mcp_uds_three_process_clients_isolate_roots_ids_and_cancel);
     RUN_TEST(mcp_uds_serve_detaches_and_reclaims_completed_sessions);
 }
 
