@@ -2697,6 +2697,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         have_proj_info = true;
     }
 
+    cbm_project_t proj_info = {0};
+    bool have_proj_info = false;
+    if (srv->owns_store && srv->store && cbm_store_get_project(srv->store, name, &proj_info) == CBM_STORE_OK) {
+        have_proj_info = true;
+    }
+
     /* Wait for any in-progress pipeline to finish before deleting */
     cbm_pipeline_lock();
 
@@ -4636,6 +4642,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
 
+    if (project_alias && maybe_persist_project_alias(repo_path, project_alias) != 0) {
+        free(repo_path);
+        free(project_alias);
+        return cbm_mcp_text_result("failed to persist project_alias into git-common-dir", true);
+    }
+
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
         free(name_override);
@@ -4660,6 +4672,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_set_persistence(p, persistence);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
+    free(project_alias);
 
     /* Bootstrap from artifact if no local DB exists */
     try_artifact_bootstrap(project_name, repo_path);

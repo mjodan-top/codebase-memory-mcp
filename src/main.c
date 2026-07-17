@@ -160,6 +160,74 @@ static void *parent_watchdog_thread(void *arg) {
 }
 #endif
 
+/* ── Watcher background thread ──────────────────────────────────── */
+
+static void *watcher_thread(void *arg) {
+    cbm_watcher_t *w = arg;
+#define WATCHER_BASE_INTERVAL_MS 5000
+
+    cbm_watcher_run(w, WATCHER_BASE_INTERVAL_MS);
+    return NULL;
+}
+
+/* ── HTTP UI background thread ──────────────────────────────────── */
+
+static void *http_thread(void *arg) {
+    cbm_http_server_t *srv = arg;
+    cbm_http_server_run(srv);
+    return NULL;
+}
+
+/* ── Index callback for watcher ─────────────────────────────────── */
+
+static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
+    (void)user_data;
+
+    /* Skip indexing if shutdown is in progress */
+    if (atomic_load(&g_shutdown)) {
+        return 0;
+    }
+
+    /* Non-blocking: skip if another pipeline is already running.
+     * Watcher will retry on next poll cycle (5-60s). */
+    if (!cbm_pipeline_try_lock()) {
+        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
+        return 0;
+    }
+
+    cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
+
+    /* #832: route the re-index through the supervised worker subprocess so this
+     * long-lived server process hands its RSS back to the OS on every cycle
+     * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
+     * threads abandon at exit). The child writes the DB; the parent only needs the
+     * return code. The pipeline lock (already held) still serialises re-indexes.
+     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
+     * or the spawn fails. */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *resp = cbm_mcp_index_run_supervised_path(root_path);
+        if (resp) {
+            free(resp);
+            cbm_pipeline_unlock();
+            return 0;
+        }
+        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
+    if (p && project_name && project_name[0]) {
+        (void)cbm_pipeline_apply_project_alias(p, project_name);
+    }
+    if (!p) {
+        cbm_pipeline_unlock();
+        return CBM_NOT_FOUND;
+    }
+
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    cbm_pipeline_unlock();
+    return rc;
+}
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
 #define CLI_USAGE "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [json_args]\n"
