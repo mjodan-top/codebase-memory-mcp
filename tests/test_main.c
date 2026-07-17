@@ -166,6 +166,7 @@ extern void suite_store_search(void);
 extern void suite_cypher(void);
 extern void suite_uds_lifecycle(void);
 extern void suite_mcp(void);
+extern void suite_mcp_session(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
 extern void suite_gitignore(void);
@@ -309,6 +310,9 @@ int main(int argc, char **argv) {
 
     /* Daemon UDS lifecycle (Issue #25) */
     RUN_SELECTED_SUITE(uds_lifecycle);
+
+    /* MCP connection session boundary (Issue #26) */
+    RUN_SELECTED_SUITE(mcp_session);
 
     /* MCP Server (M9) */
     RUN_SELECTED_SUITE(mcp);

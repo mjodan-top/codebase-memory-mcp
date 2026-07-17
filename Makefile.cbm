@@ -175,7 +175,7 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # Daemon transport lifecycle (Issue #25; no MCP handler wiring)
-DAEMON_SRCS = src/daemon/uds_lifecycle.c
+DAEMON_SRCS = src/daemon/uds_lifecycle.c src/daemon/mcp_uds_runner.c
 
 # MCP server module (new)
 MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c
@@ -344,7 +344,8 @@ TEST_CYPHER_SRCS = \
 TEST_DAEMON_SRCS = tests/test_uds_lifecycle.c
 
 TEST_MCP_SRCS = \
-    tests/test_mcp.c
+    tests/test_mcp.c \
+    tests/test_mcp_session.c
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
@@ -508,7 +509,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan test-uds-lifecycle cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-repro test-foundation test-tsan test-uds-lifecycle test-mcp-uds-runner cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -520,6 +521,16 @@ $(BUILD_DIR)/cbm-uds-owner: tests/helpers/cbm_uds_owner.c src/daemon/uds_lifecyc
 
 test-uds-lifecycle: $(BUILD_DIR)/cbm-uds-owner
 	cd $(CURDIR) && OWNER=$(BUILD_DIR)/cbm-uds-owner tests/e2e/test_uds_dual_owner.sh
+
+$(BUILD_DIR)/test-mcp-uds-runner: tests/test_mcp_uds_runner.c $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -DCBM_MCP_UDS_RUNNER_MAIN -Itests -Itests/repro -o $@ \
+		tests/test_mcp_uds_runner.c $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_TEST) \
+		$(LDFLAGS_TEST)
+
+test-mcp-uds-runner: $(BUILD_DIR)/test-mcp-uds-runner
+	cd $(CURDIR) && $(BUILD_DIR)/test-mcp-uds-runner
 
 # ── Foundation-only test (fast, no extraction) ───────────────────
 
@@ -641,7 +652,7 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 
 TEST_PLATFORM_TARGETS :=
 ifneq ($(IS_MINGW),yes)
-TEST_PLATFORM_TARGETS += test-uds-lifecycle
+TEST_PLATFORM_TARGETS += test-uds-lifecycle test-mcp-uds-runner
 endif
 
 test: $(BUILD_DIR)/test-runner $(TEST_PLATFORM_TARGETS)
