@@ -5,10 +5,16 @@
 
 #include "daemon/mcp_uds_runner.h"
 
+#include "daemon/shim_handshake.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+enum {
+    CBM_MCP_UDS_HANDSHAKE_TIMEOUT_MS = 3000,
+};
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -31,6 +37,22 @@ static void finish_task(cbm_mcp_uds_task_t *task) {
 static void *run_client_stream(void *arg) {
     cbm_mcp_uds_task_t *task = (cbm_mcp_uds_task_t *)arg;
     int read_fd = task->connection.fd;
+
+    /* Issue #27: negotiate the shim<->daemon version/capability handshake on
+     * the raw fd BEFORE any MCP framing begins. A failed/mismatched/timed-out
+     * handshake closes the connection here without ever reaching
+     * cbm_mcp_server_run — the peer (shim) observes this as a clean close and
+     * fails closed on its own side (VERSION_MISMATCH / HANDSHAKE_ERROR exit). */
+    cbm_shim_hs_result_t hs = cbm_shim_handshake_server(read_fd, CBM_MCP_UDS_HANDSHAKE_TIMEOUT_MS);
+    if (hs != CBM_SHIM_HS_OK) {
+        close(read_fd);
+        task->connection.fd = -1;
+        task->result = -1;
+        if (task->self_cleanup)
+            finish_task(task);
+        return NULL;
+    }
+
     int write_fd = dup(read_fd);
     FILE *in = NULL;
     FILE *out = NULL;

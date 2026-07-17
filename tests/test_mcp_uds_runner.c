@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "daemon/mcp_uds_runner.h"
+#include "daemon/shim_handshake.h"
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
@@ -49,6 +50,18 @@ static int connect_pathname_uds(const char *path) {
         int saved = errno;
         close(fd);
         errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+static int connect_mcp_uds(const char *path) {
+    int fd = connect_pathname_uds(path);
+    if (fd < 0)
+        return -1;
+    if (cbm_shim_handshake_client(fd, 3000) != CBM_SHIM_HS_OK) {
+        close(fd);
+        errno = EPROTO;
         return -1;
     }
     return fd;
@@ -131,7 +144,7 @@ static void reset_session_logs(void) {
 }
 
 static int client_process(const char *path, int ready_fd, int command_fd, int client_id) {
-    int fd = connect_pathname_uds(path);
+    int fd = connect_mcp_uds(path);
     if (fd < 0)
         return 10;
     int write_fd = dup(fd);
@@ -216,7 +229,7 @@ typedef struct concurrent_client_ids {
 
 static int concurrent_client_process(const char *path, int ready_fd, int command_fd,
                                      concurrent_client_ids_t ids) {
-    int fd = connect_pathname_uds(path);
+    int fd = connect_mcp_uds(path);
     if (fd < 0)
         return 30;
     int write_fd = dup(fd);
@@ -366,7 +379,7 @@ static void *serve_thread_main(void *userdata) {
 }
 
 static int run_short_client(const char *path, int request_id) {
-    int fd = connect_pathname_uds(path);
+    int fd = connect_mcp_uds(path);
     if (fd < 0)
         return -1;
     int write_fd = dup(fd);

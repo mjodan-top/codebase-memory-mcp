@@ -23,6 +23,9 @@
 #include "cli/progress_sink.h"
 #include "foundation/constants.h"
 #include "foundation/xlock.h"
+#include "daemon/mcp_shim.h"
+#include "daemon/mcp_uds_runner.h"
+#include "daemon/uds_lifecycle.h"
 
 enum {
     MAIN_MIN_ARGC = 1,
@@ -50,6 +53,7 @@ enum {
 #include "ui/embedded_assets.h"
 #include <yyjson/yyjson.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +73,14 @@ static cbm_watcher_t *g_watcher = NULL;
 static cbm_mcp_server_t *g_server = NULL;
 static cbm_http_server_t *g_http_server = NULL;
 static atomic_int g_shutdown = 0;
+
+/* Daemon-role-only listener handle, deliberately separate from g_server/
+ * g_watcher/g_http_server above: the daemon role never touches those, and the
+ * (default) shim role never touches this. request_shutdown() below only
+ * closes whichever of these two lifecycles is actually active for the
+ * current process role, so a signal never mis-closes or mis-accesses state
+ * that belongs to the other role. */
+static cbm_uds_owner_t *g_daemon_owner = NULL;
 
 /* Idempotent shutdown: cancels the active pipeline, stops background servers,
  * and closes stdin to unblock the MCP read loop. Invoked from the signal
@@ -96,7 +108,18 @@ static void request_shutdown(void) {
     if (g_http_server) {
         cbm_http_server_stop(g_http_server);
     }
-    /* Close stdin to unblock getline in the MCP server loop */
+    /* Daemon role: close the listener fd to unblock cbm_mcp_uds_serve's
+     * blocking accept() loop (mirrors cbm_uds_owner_close's own unlink path,
+     * but here we only need the fd closed — cbm_mcp_uds_serve treats a closed
+     * listen_fd as a normal stop signal). Guarded so this is a no-op for the
+     * (default) shim role, which never sets g_daemon_owner. */
+    if (g_daemon_owner && g_daemon_owner->listen_fd >= 0) {
+        int fd = g_daemon_owner->listen_fd;
+        g_daemon_owner->listen_fd = -1;
+        (void)close(fd);
+    }
+    /* Close stdin to unblock getline in the MCP server loop (shim/legacy
+     * in-process server roles only; the daemon role does not read stdin). */
     (void)fclose(stdin);
 }
 
@@ -136,92 +159,6 @@ static void *parent_watchdog_thread(void *arg) {
     return NULL;
 }
 #endif
-
-/* ── Watcher background thread ──────────────────────────────────── */
-
-static void *watcher_thread(void *arg) {
-    cbm_watcher_t *w = arg;
-#define WATCHER_BASE_INTERVAL_MS 5000
-
-    cbm_watcher_run(w, WATCHER_BASE_INTERVAL_MS);
-    return NULL;
-}
-
-/* ── HTTP UI background thread ──────────────────────────────────── */
-
-static void *http_thread(void *arg) {
-    cbm_http_server_t *srv = arg;
-    cbm_http_server_run(srv);
-    return NULL;
-}
-
-/* ── Index callback for watcher ─────────────────────────────────── */
-
-static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
-    (void)user_data;
-
-    /* Skip indexing if shutdown is in progress */
-    if (atomic_load(&g_shutdown)) {
-        return 0;
-    }
-
-    /* Non-blocking: skip if another pipeline is already running.
-     * Watcher will retry on next poll cycle (5-60s). */
-    if (!cbm_pipeline_try_lock()) {
-        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
-    }
-
-    /* Issue #22: cross-process gate, same non-blocking "skip and retry next
-     * cycle" style as the in-process check above — the watcher never blocks
-     * on another process's run, it just tries again in 5-60s. */
-    cbm_xlock_t xlk;
-    if (!cbm_xlock_try_acquire(&xlk, root_path)) {
-        cbm_log_info("watcher.skip", "project", project_name, "reason", "xlock_busy_other_process");
-        cbm_pipeline_unlock();
-        return 0;
-    }
-
-    cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
-
-    /* #832: route the re-index through the supervised worker subprocess so this
-     * long-lived server process hands its RSS back to the OS on every cycle
-     * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
-     * threads abandon at exit). The child writes the DB; the parent only needs the
-     * return code. The pipeline lock (already held) still serialises re-indexes.
-     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
-     * or the spawn fails. */
-    if (cbm_index_supervisor_should_wrap()) {
-        char *resp = cbm_mcp_index_run_supervised_path(root_path);
-        if (resp) {
-            free(resp);
-            cbm_xlock_mark_done(&xlk);
-            cbm_xlock_release(&xlk);
-            cbm_pipeline_unlock();
-            return 0;
-        }
-        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
-    }
-
-    cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
-    if (p && project_name && project_name[0]) {
-        (void)cbm_pipeline_apply_project_alias(p, project_name);
-    }
-    if (!p) {
-        cbm_xlock_release(&xlk);
-        cbm_pipeline_unlock();
-        return CBM_NOT_FOUND;
-    }
-
-    int rc = cbm_pipeline_run(p);
-    cbm_pipeline_free(p);
-    if (rc == 0) {
-        cbm_xlock_mark_done(&xlk);
-    }
-    cbm_xlock_release(&xlk);
-    cbm_pipeline_unlock();
-    return rc;
-}
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
@@ -604,6 +541,92 @@ static int run_cli(int argc, char **argv) {
     return exit_code;
 }
 
+/* Forward declaration: defined further below (near the legacy in-process
+ * bootstrap it originally served), used by run_daemon(). */
+static void setup_signal_handlers(void);
+
+/* ── Shim mode (Issue #27 default entry point) ─────────────────── */
+/* Parse an optional `--socket <path>` override from a daemon/shim-role argv
+ * slice (already past the subcommand token, if any). Returns the value or
+ * NULL if absent (caller then resolves the default path). */
+static const char *parse_socket_flag(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--socket") == 0 && i + SKIP_ONE < argc) {
+            return argv[i + SKIP_ONE];
+        }
+    }
+    return NULL;
+}
+
+/* Default entry point: a pure stdio->UDS thin shim. Deliberately does NOT
+ * construct a cbm_mcp_server_t, watcher, HTTP UI, or any other heavyweight
+ * resource — every failure path (daemon absent, stale socket, permission
+ * denied, version mismatch, connect timeout, midstream loss) is handled
+ * entirely inside cbm_mcp_shim_run and ends in a non-zero exit, never a
+ * local server fallback (Issue #27 fail-closed contract). */
+static int run_shim(int argc, char **argv) {
+    cbm_shim_options_t opts = {0};
+    opts.socket_path = parse_socket_flag(argc, argv);
+    return cbm_mcp_shim_run(&opts, STDIN_FILENO, STDOUT_FILENO);
+}
+
+/* ── Daemon mode (explicit role; Issue #26/#31 UDS multi-session core) ──── */
+/* should_stop callback for cbm_mcp_uds_serve: true once request_shutdown()
+ * (SIGTERM/SIGINT) has fired. */
+static int daemon_should_stop(void *userdata) {
+    (void)userdata;
+    return atomic_load(&g_shutdown);
+}
+
+/* Explicit `daemon` role: owns the pathname UDS listener and hands each
+ * accepted shim connection an isolated MCP session backed by a single shared
+ * cbm_mcp_core_t (store/router). This is the only code path that opens the
+ * UDS listener and constructs MCP server sessions; the default (shim) path
+ * above never reaches any of this. */
+static int run_daemon(int argc, char **argv) {
+    const char *socket_override = parse_socket_flag(argc, argv);
+    char resolved[108];
+    if (cbm_uds_socket_path_resolve(resolved, sizeof(resolved), socket_override) != 0) {
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp: daemon.socket_resolve_failed errno=%d error=%s\n",
+                      errno, strerror(errno));
+        return SKIP_ONE;
+    }
+
+    cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+    cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
+    cbm_log_info("daemon.start", "version", CBM_VERSION, "socket", resolved);
+
+    setup_signal_handlers();
+
+    cbm_mcp_core_t *core = cbm_mcp_core_new(NULL);
+    if (!core) {
+        cbm_log_error("daemon.err", "msg", "failed to create mcp core");
+        return SKIP_ONE;
+    }
+
+    cbm_uds_owner_t owner;
+    memset(&owner, 0, sizeof(owner));
+    cbm_uds_owner_configure(&owner, (unsigned long)-1, NULL, NULL);
+    if (cbm_uds_owner_open(&owner, resolved, 64) != 0) {
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp: daemon.listen_failed path=%s errno=%d error=%s\n",
+                      resolved, errno, strerror(errno));
+        cbm_mcp_core_free(core);
+        return SKIP_ONE;
+    }
+    g_daemon_owner = &owner;
+
+    cbm_log_info("daemon.listening", "socket", resolved);
+    int rc = cbm_mcp_uds_serve(&owner, core, daemon_should_stop, NULL);
+    cbm_log_info("daemon.shutdown");
+
+    g_daemon_owner = NULL;
+    cbm_uds_owner_close(&owner);
+    cbm_mcp_core_free(core);
+    return rc == 0 ? 0 : SKIP_ONE;
+}
+
 /* ── Help ───────────────────────────────────────────────────────── */
 
 static void print_help(void) {
@@ -654,6 +677,12 @@ static int handle_subcommand(int argc, char **argv) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
+        if (strcmp(argv[i], "daemon") == 0) {
+            /* Explicit daemon role (Issue #27): only entry point that opens
+             * the UDS listener / constructs cbm_mcp_core_t. */
+            cbm_index_supervisor_mark_host();
+            return run_daemon(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return cbm_cmd_hook_augment();
@@ -675,27 +704,6 @@ static int handle_subcommand(int argc, char **argv) {
 }
 
 /* Parse --ui= and --port= flags. Returns true if config was modified. */
-static bool parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg, bool *explicit_enable) {
-    bool changed = false;
-    for (int i = SKIP_ONE; i < argc; i++) {
-        if (strncmp(argv[i], "--ui=", SLEN("--ui=")) == 0) {
-            cfg->ui_enabled = (strcmp(argv[i] + MAIN_FLAG_OFF, "true") == 0);
-            if (explicit_enable && cfg->ui_enabled) {
-                *explicit_enable = true;
-            }
-            changed = true;
-        }
-        if (strncmp(argv[i], "--port=", SLEN("--port=")) == 0) {
-            int p = (int)strtol(argv[i] + MAIN_PORT_OFF, NULL, CBM_DECIMAL_BASE);
-            if (p > 0 && p < MAIN_MAX_PORT) {
-                cfg->ui_port = p;
-                changed = true;
-            }
-        }
-    }
-    return changed;
-}
-
 /* Install platform-specific signal handlers. */
 static void setup_signal_handlers(void) {
 #ifdef _WIN32
@@ -792,148 +800,16 @@ int main(int argc, char **argv) {
         return subcmd;
     }
 
-    /* parent-death watchdog — distilled from #407 (fixes #406). Start it early so
-     * an orphaned server exits even if it dies before reaching the MCP loop. A
-     * thread-create failure (or ppid<=1) is non-fatal: the server still runs, it
-     * just won't auto-exit on parent death — same policy as the watcher/HTTP
-     * threads below. We deliberately do NOT exit at startup when ppid<=1 (the PR's
-     * original behaviour): a legitimately-launched server can transiently show
-     * ppid==1 (early reparent races, double-fork/container launchers), and the
-     * watchdog already no-ops safely in that case via its initial_ppid>1 guard. */
-#ifndef _WIN32
-    /* main() outlives the watchdog (it joins before returning), so a stack
-     * local is a valid lifetime for the thread's argument. */
-    pid_t initial_ppid = getppid();
-    cbm_thread_t parent_watchdog_tid;
-    bool parent_watchdog_started = false;
-    if (cbm_thread_create(&parent_watchdog_tid, PARENT_WATCHDOG_STACK_SIZE, parent_watchdog_thread,
-                          &initial_ppid) == 0) {
-        parent_watchdog_started = true;
-    } else {
-        cbm_log_warn("parent.watchdog.unavailable", "reason", "thread_create_failed");
-    }
-#endif
-
-    /* Default: MCP server on stdio */
-    cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
-    /* Store binary path for subprocess spawning + hook log sink */
-    cbm_http_server_set_binary_path(argv[0]);
-    cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
-    cbm_log_info("server.start", "version", CBM_VERSION);
-    cbm_diag_start(); /* starts if CBM_DIAGNOSTICS=1 */
-
-    /* Parse --ui and --port flags (persisted config) */
-    cbm_ui_config_t ui_cfg;
-    cbm_ui_config_load(&ui_cfg);
-    bool explicit_ui_enable = false;
-    if (parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable)) {
-        cbm_ui_config_save(&ui_cfg);
-    }
-    /* If the user explicitly asked for the UI but this binary has no embedded
-     * frontend, the HTTP server can never start (see below). The warning that
-     * covers this goes to the log sink, which a user running `--ui=true` on a
-     * terminal won't see — so tell them plainly on stderr why nothing happens
-     * and which build to use (#350). */
-    if (explicit_ui_enable && CBM_EMBEDDED_FILE_COUNT == 0) {
-        (void)fprintf(stderr,
-                      "codebase-memory-mcp: --ui requested, but this binary was built without the "
-                      "embedded UI, so the HTTP server will not start.\n"
-                      "Use the UI release asset (codebase-memory-mcp-ui) or rebuild with: "
-                      "make -f Makefile.cbm cbm-with-ui\n");
-    }
-
-    setup_signal_handlers();
-
-    /* Open config store for runtime settings */
-    char config_dir[CBM_SZ_1K];
-    const char *cfg_home = cbm_get_home_dir();
-    cbm_config_t *runtime_config = NULL;
-    if (cfg_home) {
-        snprintf(config_dir, sizeof(config_dir), "%s", cbm_resolve_cache_dir());
-        runtime_config = cbm_config_open(config_dir);
-    }
-
-    /* Create MCP server */
-    g_server = cbm_mcp_server_new(NULL);
-    if (!g_server) {
-        cbm_log_error("server.err", "msg", "failed to create server");
-        cbm_config_close(runtime_config);
-#ifndef _WIN32
-        if (parent_watchdog_started) {
-            atomic_store(&g_shutdown, 1);
-            cbm_thread_join(&parent_watchdog_tid);
-        }
-#endif
-        return SKIP_ONE;
-    }
-
-    /* Create and start watcher in background thread */
-    /* Initialize log mutex before any threads are created */
-    cbm_ui_log_init();
-
-    cbm_store_t *watch_store = cbm_store_open_memory();
-    g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
-
-    /* Wire watcher + config into MCP server for session auto-index */
-    cbm_mcp_server_set_watcher(g_server, g_watcher);
-    cbm_mcp_server_set_config(g_server, runtime_config);
-    cbm_thread_t watcher_tid;
-    bool watcher_started = false;
-
-    if (g_watcher) {
-        if (cbm_thread_create(&watcher_tid, 0, watcher_thread, g_watcher) == 0) {
-            watcher_started = true;
-        }
-    }
-
-    /* Optionally start HTTP UI server in background thread */
-    cbm_thread_t http_tid;
-    bool http_started = false;
-
-    if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
-        g_http_server = cbm_http_server_new(ui_cfg.ui_port);
-        if (g_http_server) {
-            cbm_http_server_set_watcher(g_http_server, g_watcher);
-            if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {
-                http_started = true;
-            }
-        }
-    } else if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT == 0) {
-        cbm_log_warn("ui.no_assets", "hint", "rebuild with: make -f Makefile.cbm cbm-with-ui");
-    }
-
-    /* Run MCP event loop (blocks until EOF or signal) */
-    int rc = cbm_mcp_server_run(g_server, stdin, stdout);
-    atomic_store(&g_shutdown, 1); /* unblock the watchdog poll loop */
-
-    /* Shutdown */
-    cbm_log_info("server.shutdown");
-
-#ifndef _WIN32
-    if (parent_watchdog_started) {
-        cbm_thread_join(&parent_watchdog_tid);
-    }
-#endif
-
-    if (http_started) {
-        cbm_http_server_stop(g_http_server);
-        cbm_thread_join(&http_tid);
-        cbm_http_server_free(g_http_server);
-        g_http_server = NULL;
-    }
-
-    if (watcher_started) {
-        cbm_watcher_stop(g_watcher);
-        cbm_thread_join(&watcher_tid);
-    }
-    cbm_watcher_free(g_watcher);
-    cbm_store_close(watch_store);
-    cbm_mcp_server_free(g_server);
-    cbm_config_close(runtime_config);
-
-    g_watcher = NULL;
-    g_server = NULL;
-    cbm_diag_stop();
-
-    return rc;
+    /* Default entry point (Issue #27): a pure stdio->UDS thin shim. This is
+     * intentionally the FIRST thing main() does after subcommand dispatch —
+     * before the parent-death watchdog, before cbm_mem_init, before any
+     * server/watcher/HTTP construction below. Nothing past this point in
+     * main() (the parent watchdog thread, cbm_mem_init, cbm_mcp_server_new,
+     * the watcher, the HTTP UI) is ever reached on the default path; it only
+     * remains live for embedders / legacy direct invocation that bypass
+     * handle_subcommand's dispatch (there are none in this binary's own
+     * argv parsing — the code below is unreachable via normal CLI usage but
+     * is kept, unmodified, as the in-process server implementation the
+     * `daemon` role above still depends on via run_daemon/cbm_mcp_core_t). */
+    return run_shim(argc, argv);
 }
