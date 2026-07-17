@@ -15,11 +15,18 @@
 
 typedef struct cbm_http_server cbm_http_server_t;
 struct cbm_watcher;
+struct cbm_mcp_core;
 
 /* Create an HTTP server on the given port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
  * Returns NULL on failure (e.g. port in use). */
 cbm_http_server_t *cbm_http_server_new(int port);
+
+/* Create an HTTP server whose /rpc MCP server shares the given core
+ * (daemon-owned store registry / router). The core is borrowed, not owned:
+ * the daemon retains ownership and must outlive this server (#28).
+ * Returns NULL on failure (e.g. port in use). */
+cbm_http_server_t *cbm_http_server_new_with_core(int port, struct cbm_mcp_core *core);
 
 /* Free the HTTP server (call after thread has been joined). */
 void cbm_http_server_free(cbm_http_server_t *srv);

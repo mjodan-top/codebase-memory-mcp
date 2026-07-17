@@ -7,6 +7,8 @@
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
+#include "../src/foundation/xlock.h"
+#include "../src/git/git_context.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -4271,6 +4273,156 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
 #undef ROQ_PROJECT
 
 /* ══════════════════════════════════════════════════════════════════
+ *  Issue #28 follow-ups — xlock worker ownership + alias lifetime
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(index_repository_project_alias_lifetime_issue28) {
+#ifndef _WIN32
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-idx28-alias-repo-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idx28-alias-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_sv = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sv_copy = saved_sv ? strdup(saved_sv) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1); /* isolate alias lifetime in-process */
+
+    char src[512];
+    snprintf(src, sizeof(src), "%s/main.py", repo);
+    ASSERT_EQ(th_write_file(src, "def issue28_alias_fn():\n    return 28\n"), 0);
+    char cmd[CBM_SZ_4K];
+    snprintf(cmd, sizeof(cmd),
+             "git -C '%s' -c init.defaultBranch=main init -q && "
+             "git -C '%s' -c user.name=t -c user.email=t@t.io add main.py && "
+             "git -C '%s' -c user.name=t -c user.email=t@t.io "
+             "-c commit.gpgsign=false commit -q -m init",
+             repo, repo, repo);
+    ASSERT_EQ(system(cmd), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *alias = "issue28-alias-owned";
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"project_alias\":\"%s\"}", repo, alias);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    ASSERT(response_contains_json_fragment(resp, "\"project\":\"issue28-alias-owned\""));
+    free(resp);
+
+    cbm_git_context_t ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(repo, &ctx), 0);
+    char *persisted = cbm_git_context_read_project_alias(&ctx);
+    ASSERT_NOT_NULL(persisted);
+    ASSERT_STR_EQ(persisted, alias);
+    free(persisted);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, alias);
+    if (saved_sv_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sv_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_sv_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+#endif
+    PASS();
+}
+
+#ifndef _WIN32
+static int idx28_supervised_error_marker_check(const char *repo, const char *allowed) {
+    cbm_index_supervisor_mark_host();
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "15", 1);
+    cbm_setenv("CBM_ALLOWED_ROOT", allowed, 1); /* repo is deliberately outside */
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return 71;
+    }
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    int code = 0;
+    if (!resp || !response_contains_json_fragment(resp, "\"isError\":true")) {
+        code = 72;
+    }
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    char lock_path[CBM_SZ_1K];
+    char marker_path[CBM_SZ_1K];
+    cbm_xlock_paths_for_project(repo, lock_path, sizeof(lock_path), marker_path,
+                                sizeof(marker_path));
+    if (code == 0 && access(marker_path, F_OK) == 0) {
+        code = 73; /* an error response must never publish a success marker */
+    }
+    cbm_xlock_t probe;
+    if (code == 0 && !cbm_xlock_try_acquire(&probe, repo)) {
+        code = 74; /* neither supervisor parent nor exited worker may retain the lock */
+    } else if (code == 0) {
+        cbm_xlock_release(&probe);
+    }
+    cbm_unsetenv("CBM_ALLOWED_ROOT");
+    return code;
+}
+#endif
+
+TEST(index_supervisor_error_does_not_mark_xlock_done_issue28) {
+#ifdef _WIN32
+    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+#else
+    char repo[256];
+    char allowed[256];
+    char cache[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-idx28-error-repo-XXXXXX");
+    snprintf(allowed, sizeof(allowed), "/tmp/cbm-idx28-allowed-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idx28-error-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    ASSERT_NOT_NULL(cbm_mkdtemp(allowed));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    fflush(NULL);
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        alarm(45); /* RED path: parent-held xlock deadlocks its worker */
+        _exit(idx28_supervised_error_marker_check(repo, allowed));
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : 75;
+
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(allowed);
+    th_rmtree(repo);
+    if (code != 0) {
+        printf("    child exit %d (72=response, 73=marker, 74=lock, 75=signal)\n", code);
+    }
+    ASSERT_EQ(code, 0);
+    PASS();
+#endif
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  #823 — CLI/supervised index_repository must preserve name override
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -5373,6 +5525,8 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
+    RUN_TEST(index_repository_project_alias_lifetime_issue28);
+    RUN_TEST(index_supervisor_error_does_not_mark_xlock_done_issue28);
     RUN_TEST(index_repository_cli_name_override_issue823);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);

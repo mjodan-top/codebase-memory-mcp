@@ -1849,6 +1849,10 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 /* ── Public API ───────────────────────────────────────────────── */
 
 cbm_http_server_t *cbm_http_server_new(int port) {
+    return cbm_http_server_new_with_core(port, NULL);
+}
+
+cbm_http_server_t *cbm_http_server_new_with_core(int port, struct cbm_mcp_core *core) {
     cbm_http_server_t *srv = calloc(1, sizeof(*srv));
     if (!srv)
         return NULL;
@@ -1856,8 +1860,9 @@ cbm_http_server_t *cbm_http_server_new(int port) {
     srv->port = port;
     atomic_store(&srv->stop_flag, 0);
 
-    /* Create a dedicated MCP server for HTTP (own SQLite connection) */
-    srv->mcp = cbm_mcp_server_new(NULL);
+    /* /rpc MCP server: share the daemon-owned core when given (#28), else
+     * create a dedicated one with its own SQLite connection (legacy path). */
+    srv->mcp = core ? cbm_mcp_server_new_with_core(core) : cbm_mcp_server_new(NULL);
     if (!srv->mcp) {
         cbm_log_error("ui.http.mcp_fail", "reason", "cannot create MCP instance");
         free(srv);
