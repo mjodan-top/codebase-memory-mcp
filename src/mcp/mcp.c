@@ -2697,12 +2697,6 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         have_proj_info = true;
     }
 
-    cbm_project_t proj_info = {0};
-    bool have_proj_info = false;
-    if (srv->owns_store && srv->store && cbm_store_get_project(srv->store, name, &proj_info) == CBM_STORE_OK) {
-        have_proj_info = true;
-    }
-
     /* Wait for any in-progress pipeline to finish before deleting */
     cbm_pipeline_lock();
 
