@@ -14,7 +14,10 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <stddef.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -143,6 +146,98 @@ TEST(uds_owner_open_close_tracks_lifecycle_and_inode) {
     PASS();
 }
 
+/* Issue #29: adopting a manager-bound listening fd (launchd socket
+ * activation shape) must enter the normal lifecycle, serve real accepts, and
+ * must NOT unlink the manager-owned socket inode on close. */
+TEST(uds_owner_adopt_inherited_listener_serves_and_preserves_inode) {
+    char root[64];
+    ASSERT_EQ(make_case_dir(root, sizeof(root)), 0);
+    ASSERT_EQ(chmod(root, 0700), 0);
+
+    char socket_path[108];
+    ASSERT_LT(snprintf(socket_path, sizeof(socket_path), "%s/daemon.sock", root),
+              (int)sizeof(socket_path));
+
+    /* Play the service manager: bind + listen before the "daemon" runs. */
+    int manager_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_TRUE(manager_fd >= 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, socket_path, strlen(socket_path) + 1);
+    socklen_t addr_len =
+        (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(socket_path) + 1);
+    ASSERT_EQ(bind(manager_fd, (const struct sockaddr *)&addr, addr_len), 0);
+    ASSERT_EQ(chmod(socket_path, 0600), 0);
+    ASSERT_EQ(listen(manager_fd, 4), 0);
+
+    state_trace_t trace = {0};
+    cbm_uds_owner_t owner;
+    cbm_uds_owner_configure(&owner, (unsigned long)-1, record_state, &trace);
+    ASSERT_EQ(cbm_uds_owner_adopt(&owner, manager_fd, socket_path), 0);
+    ASSERT_EQ(owner.listen_fd, manager_fd);
+    ASSERT_EQ(trace.count, 3);
+    ASSERT_EQ(trace.states[0], CBM_UDS_D_STARTING);
+    ASSERT_EQ(trace.states[1], CBM_UDS_D_BIND_CLAIM);
+    ASSERT_EQ(trace.states[2], CBM_UDS_D_LISTENING);
+    /* Manager owns the inode: adopt must not record it for unlink-on-close. */
+    ASSERT_EQ(owner.socket_ino, 0);
+
+    /* A real client connect must be accepted through the adopted fd. */
+    int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_TRUE(client_fd >= 0);
+    ASSERT_EQ(connect(client_fd, (const struct sockaddr *)&addr, addr_len), 0);
+    cbm_uds_connection_t conn;
+    ASSERT_EQ(cbm_uds_owner_accept(&owner, &conn), 0);
+    ASSERT_EQ(conn.peer_uid, (unsigned long)geteuid());
+    cbm_uds_connection_close(&conn);
+    close(client_fd);
+
+    cbm_uds_owner_close(&owner);
+    /* Socket inode survives close: launchd needs it for re-activation. */
+    struct stat st;
+    ASSERT_EQ(lstat(socket_path, &st), 0);
+    ASSERT_TRUE(S_ISSOCK(st.st_mode));
+
+    ASSERT_EQ(unlink(socket_path), 0);
+    char lock_path[114];
+    ASSERT_LT(snprintf(lock_path, sizeof(lock_path), "%s.lock", socket_path),
+              (int)sizeof(lock_path));
+    ASSERT_EQ(unlink(lock_path), 0);
+    ASSERT_EQ(rmdir(root), 0);
+    PASS();
+}
+
+/* Adopt must refuse fds that are not listening AF_UNIX sockets. */
+TEST(uds_owner_adopt_rejects_non_listening_fd) {
+    char root[64];
+    ASSERT_EQ(make_case_dir(root, sizeof(root)), 0);
+    ASSERT_EQ(chmod(root, 0700), 0);
+
+    char socket_path[108];
+    ASSERT_LT(snprintf(socket_path, sizeof(socket_path), "%s/daemon.sock", root),
+              (int)sizeof(socket_path));
+
+    cbm_uds_owner_t owner;
+    cbm_uds_owner_configure(&owner, (unsigned long)-1, NULL, NULL);
+
+    /* Not a socket at all. */
+    errno = 0;
+    ASSERT_EQ(cbm_uds_owner_adopt(&owner, STDIN_FILENO, socket_path), -1);
+    ASSERT_TRUE(errno != 0);
+
+    /* AF_UNIX socket that never listen()ed. */
+    int plain_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_TRUE(plain_fd >= 0);
+    errno = 0;
+    ASSERT_EQ(cbm_uds_owner_adopt(&owner, plain_fd, socket_path), -1);
+    ASSERT_EQ(errno, EINVAL);
+    close(plain_fd);
+
+    ASSERT_EQ(rmdir(root), 0);
+    PASS();
+}
+
 #endif /* !_WIN32 */
 
 SUITE(uds_lifecycle) {
@@ -152,5 +247,7 @@ SUITE(uds_lifecycle) {
     RUN_TEST(uds_path_resolve_creates_private_parent);
     RUN_TEST(uds_path_resolve_rejects_public_parent);
     RUN_TEST(uds_owner_open_close_tracks_lifecycle_and_inode);
+    RUN_TEST(uds_owner_adopt_inherited_listener_serves_and_preserves_inode);
+    RUN_TEST(uds_owner_adopt_rejects_non_listening_fd);
 #endif
 }
