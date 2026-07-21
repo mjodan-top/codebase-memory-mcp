@@ -8,6 +8,18 @@ Uses the production binary in all three roles:
 
 No fixed sleeps are used for readiness or state transitions: every wait is a
 bounded condition poll with diagnostics on timeout.
+
+Issue #29 additions (both off by default; the default path is unchanged):
+  * --activation launchd: instead of Popen-ing the daemon, install a throwaway
+    LaunchAgent plist (shape copied from tests/e2e/test_launchd_activation.sh)
+    into gui/$UID. launchd binds the UDS and the FIRST real shim connection
+    spawns the daemon; R_DAEMON_RESTARTED becomes SIGKILL + launchd respawn on
+    the next connection (the socket stays launchd-owned, never unlinked here).
+    macOS only; elsewhere the mode SKIPs explicitly (exit 0).
+  * --soak N: after the full state pass, N rounds of 2 concurrent shims
+    (initialize + tools/call index_status + close) with per-round evidence and
+    leak assertions (daemon pid set, fd count, RSS) against the first-round
+    baseline.
 """
 from __future__ import annotations
 
@@ -193,7 +205,7 @@ class Shim:
                         if self.proc.poll() is not None:
                             fail(f"shim exited before response\n{self.diagnostics()}")
 
-    def initialize(self) -> None:
+    def initialize(self, timeout: float = 10.0) -> None:
         self.request(
             "initialize",
             {
@@ -201,6 +213,7 @@ class Shim:
                 "capabilities": {},
                 "clientInfo": {"name": "per-state-live-e2e", "version": "1"},
             },
+            timeout=timeout,
         )
         if self.proc.stdin is None:
             fail("shim stdin unavailable")
@@ -299,12 +312,172 @@ def stop_daemon(proc: subprocess.Popen[str], log: Any) -> None:
         fail(f"daemon exited rc={proc.returncode}")
 
 
+LAUNCHD_ENV_KEYS = (
+    "CBM_CACHE_DIR",
+    "CBM_LOG_LEVEL",
+    "CBM_TEST_HANG_ON",
+    "CBM_INDEX_SINGLE_THREAD",
+    "CBM_INDEX_MARKER_FILE",
+)
+
+
+def write_launchd_plist(
+    plist_path: Path,
+    label: str,
+    binary: Path,
+    socket_path: Path,
+    log_path: Path,
+    env: dict[str, str],
+    home: Path,
+) -> None:
+    # Shape copied from tests/e2e/test_launchd_activation.sh: throwaway label,
+    # `daemon --launchd --socket`, launchd-owned <Sockets> listener (0600),
+    # temp HOME. Test-only CBM_* knobs ride in EnvironmentVariables because in
+    # this mode launchd (not this runner) is the daemon's parent.
+    env_entries = "".join(
+        f"        <key>{key}</key><string>{env[key]}</string>\n"
+        for key in LAUNCHD_ENV_KEYS
+        if key in env
+    )
+    plist_path.write_text(
+        f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{binary}</string>
+        <string>daemon</string>
+        <string>--launchd</string>
+        <string>--socket</string>
+        <string>{socket_path}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>{home}</string>
+{env_entries}    </dict>
+    <key>Sockets</key>
+    <dict>
+        <key>Listeners</key>
+        <dict>
+            <key>SockPathName</key><string>{socket_path}</string>
+            <key>SockPathMode</key><integer>384</integer>
+        </dict>
+    </dict>
+    <key>StandardOutPath</key><string>{log_path}</string>
+    <key>StandardErrorPath</key><string>{log_path}</string>
+</dict>
+</plist>
+""",
+        encoding="utf-8",
+    )
+
+
+def launchd_bootout(label: str) -> None:
+    # Cleanup is part of the contract: a failed bootout is a test failure,
+    # never swallowed.
+    target = f"gui/{os.getuid()}/{label}"
+    proc = subprocess.run(["launchctl", "bootout", target], capture_output=True, text=True)
+    if proc.returncode != 0:
+        fail(f"launchctl bootout {target} rc={proc.returncode}: {proc.stderr.strip()}")
+
+
+def daemon_pids(pattern: str) -> list[int]:
+    proc = subprocess.run(["pgrep", "-f", "--", pattern], capture_output=True, text=True)
+    return [int(line) for line in proc.stdout.split()]
+
+
+def fd_count(pid: int) -> int:
+    proc_fd = Path(f"/proc/{pid}/fd")
+    if proc_fd.is_dir():
+        return len(list(proc_fd.iterdir()))
+    proc = subprocess.run(["lsof", "-p", str(pid)], capture_output=True, text=True)
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        fail(f"lsof -p {pid} returned no fd table rc={proc.returncode}: {proc.stderr.strip()}")
+    return len(lines) - 1  # minus the lsof header row
+
+
+def rss_kb(pid: int) -> int:
+    proc = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True)
+    value = proc.stdout.strip()
+    if proc.returncode != 0 or not value:
+        fail(f"ps -o rss= -p {pid} failed rc={proc.returncode}")
+    return int(value)
+
+
+def run_soak(
+    rounds: int,
+    binary: Path,
+    socket_path: Path,
+    env: dict[str, str],
+    log_path: Path,
+    project: str,
+    pattern: str,
+    timeout: float,
+    shims: list[Shim],
+) -> None:
+    pids = daemon_pids(pattern)
+    if len(pids) != 1:
+        fail(f"soak baseline expected exactly 1 daemon for {pattern!r}, got {pids!r}")
+    base_pid = pids[0]
+    base_fds: int | None = None
+    base_rss: int | None = None
+    for round_no in range(1, rounds + 1):
+        pair = []
+        for _ in range(2):
+            shim = Shim(binary, socket_path, env, log_path)
+            shims.append(shim)
+            pair.append(shim)
+        for shim in pair:
+            shim.initialize()
+        for shim in pair:
+            result = shim.tool("index_status", {"project": project})
+            if project not in json.dumps(result):
+                fail(f"soak round {round_no} index_status lost project: {result!r}")
+        for shim in pair:
+            shim.close()
+            shims.remove(shim)
+
+        pids = daemon_pids(pattern)
+        if pids != [base_pid]:
+            fail(
+                f"soak round {round_no}: daemon process set changed to {pids!r}"
+                f" (baseline single pid {base_pid})"
+            )
+        if base_fds is None:
+            base_fds = fds = fd_count(base_pid)
+            base_rss = rss = rss_kb(base_pid)
+        else:
+            fd_limit = base_fds + 8
+            fds = poll(
+                f"soak round {round_no} daemon fds <= {fd_limit}",
+                timeout,
+                lambda: (value if (value := fd_count(base_pid)) <= fd_limit else None),
+            )
+            rss = rss_kb(base_pid)
+            if rss > 2 * base_rss:
+                fail(f"soak round {round_no}: rss {rss} KiB > 2x baseline {base_rss} KiB")
+        print(
+            f"[soak] round={round_no}/{rounds} pids={len(pids)} fds={fds} rss_kb={rss}",
+            flush=True,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin", default="build/codebase-memory-mcp")
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--fixture-files", type=int, default=1200)
+    parser.add_argument("--activation", choices=("launchd",), default=None)
+    parser.add_argument("--soak", type=int, default=0)
     args = parser.parse_args()
+
+    if args.activation == "launchd" and sys.platform != "darwin":
+        print("SKIP per-state live E2E --activation launchd: launchd only exists on macOS")
+        return 0
 
     binary = Path(args.bin).resolve()
     if not binary.is_file():
@@ -315,6 +488,8 @@ def main() -> int:
     daemon_log: Any = None
     shims: list[Shim] = []
     passed: list[str] = []
+    bootstrap_label: str | None = None
+    rc = 1
     try:
         cache_dir = tmp / "cache"
         socket_path = tmp / "daemon.sock"
@@ -333,13 +508,54 @@ def main() -> int:
         env["CBM_INDEX_SINGLE_THREAD"] = "1"
         env["CBM_INDEX_MARKER_FILE"] = str(inflight_marker)
 
-        daemon, daemon_log = start_daemon(binary, socket_path, env, log_path)
-        poll("daemon UDS listener", args.timeout, lambda: socket_path.exists() or None)
-        poll(
-            "R_UI_SERVING",
-            args.timeout,
-            lambda: daemon_http_ready(daemon, port, log_path),
-        )
+        pgrep_pattern = f"{binary} daemon --socket {socket_path}"
+        shim1: Shim | None = None
+        if args.activation == "launchd":
+            pgrep_pattern = f"{binary} daemon --launchd --socket {socket_path}"
+            home = tmp / "home"
+            # In activation mode the daemon reads config from the temp HOME's
+            # cache dir; the HTTP UI must be enabled there for the R_UI_SERVING
+            # / /api assertions to stay unchanged.
+            write_ui_config(home / ".cache" / "codebase-memory-mcp", port)
+            label = f"dev.codebase-memory.perstate-e2e.{os.getpid()}"
+            plist_path = tmp / f"{label}.plist"
+            write_launchd_plist(plist_path, label, binary, socket_path, log_path, env, home)
+            bootstrap = subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+                capture_output=True,
+                text=True,
+            )
+            if bootstrap.returncode != 0:
+                fail(
+                    f"launchctl bootstrap rc={bootstrap.returncode}:"
+                    f" {bootstrap.stderr.strip()}"
+                )
+            bootstrap_label = label
+            poll(
+                "launchd-bound UDS listener",
+                args.timeout,
+                lambda: socket_path.exists() or None,
+            )
+            if daemon_pids(pgrep_pattern):
+                fail("daemon already running before first connection (not on-demand)")
+            # The FIRST real shim connection is what makes launchd spawn the
+            # daemon: no manual Popen in this mode.
+            shim1 = Shim(binary, socket_path, env, log_path)
+            shims.append(shim1)
+            shim1.initialize(timeout=args.timeout)
+            poll(
+                "R_UI_SERVING (launchd-activated)",
+                args.timeout,
+                lambda: index_status(port) is not None,
+            )
+        else:
+            daemon, daemon_log = start_daemon(binary, socket_path, env, log_path)
+            poll("daemon UDS listener", args.timeout, lambda: socket_path.exists() or None)
+            poll(
+                "R_UI_SERVING",
+                args.timeout,
+                lambda: daemon_http_ready(daemon, port, log_path),
+            )
         rpc_init = http_rpc(
             port,
             9001,
@@ -352,7 +568,7 @@ def main() -> int:
         )
         if not isinstance(rpc_init, dict) or "capabilities" not in rpc_init:
             fail(f"HTTP /rpc initialize returned invalid result: {rpc_init!r}")
-        if daemon.poll() is not None:
+        if daemon is not None and daemon.poll() is not None:
             fail(f"daemon exited after HTTP /rpc initialize rc={daemon.returncode}")
         passed.append("R_UI_SERVING")
 
@@ -361,9 +577,10 @@ def main() -> int:
             fail(f"R_EMPTY expected [], got {empty!r}")
         passed.append("R_EMPTY")
 
-        shim1 = Shim(binary, socket_path, env, log_path)
-        shims.append(shim1)
-        shim1.initialize()
+        if shim1 is None:
+            shim1 = Shim(binary, socket_path, env, log_path)
+            shims.append(shim1)
+            shim1.initialize()
 
         http_json(port, "/api/index", {"root_path": str(repo), "project_name": project})
         poll("R_PROJECT_OPEN", args.timeout, lambda: status_for(port, project))
@@ -441,18 +658,47 @@ def main() -> int:
 
         shim2.close()
         shims.remove(shim2)
-        stop_daemon(daemon, daemon_log)
-        daemon = None
-        daemon_log = None
+        if args.activation == "launchd":
+            # Launchd owns the socket: SIGKILL the daemon and let the NEXT real
+            # connection re-activate it. No manual unlink/restart here.
+            pids = daemon_pids(pgrep_pattern)
+            if len(pids) != 1:
+                fail(f"expected exactly 1 launchd-spawned daemon, got {pids!r}")
+            killed_pid = pids[0]
+            os.kill(killed_pid, signal.SIGKILL)
+            poll(
+                "SIGKILLed daemon gone",
+                args.timeout,
+                lambda: (True if killed_pid not in daemon_pids(pgrep_pattern) else None),
+            )
+            shim3 = Shim(binary, socket_path, env, log_path)
+            shims.append(shim3)
+            shim3.initialize(timeout=args.timeout)
+            respawned = poll(
+                "launchd respawned daemon",
+                args.timeout,
+                lambda: daemon_pids(pgrep_pattern) or None,
+            )
+            if len(respawned) != 1 or respawned[0] == killed_pid:
+                fail(f"launchd respawn expected 1 new pid, got {respawned!r} (old {killed_pid})")
+            poll(
+                "restarted HTTP server (launchd)",
+                args.timeout,
+                lambda: index_status(port) is not None,
+            )
+        else:
+            stop_daemon(daemon, daemon_log)
+            daemon = None
+            daemon_log = None
 
-        if socket_path.exists():
-            socket_path.unlink()
-        daemon, daemon_log = start_daemon(binary, socket_path, env, log_path)
-        poll("restarted daemon UDS listener", args.timeout, lambda: socket_path.exists() or None)
-        poll("restarted HTTP server", args.timeout, lambda: index_status(port) is not None)
-        shim3 = Shim(binary, socket_path, env, log_path)
-        shims.append(shim3)
-        shim3.initialize()
+            if socket_path.exists():
+                socket_path.unlink()
+            daemon, daemon_log = start_daemon(binary, socket_path, env, log_path)
+            poll("restarted daemon UDS listener", args.timeout, lambda: socket_path.exists() or None)
+            poll("restarted HTTP server", args.timeout, lambda: index_status(port) is not None)
+            shim3 = Shim(binary, socket_path, env, log_path)
+            shims.append(shim3)
+            shim3.initialize()
         result = shim3.tool("index_status", {"project": project})
         if project not in json.dumps(result):
             fail(f"R_DAEMON_RESTARTED did not reopen persisted project: {result!r}")
@@ -461,14 +707,28 @@ def main() -> int:
         if set(passed) != set(STATES):
             fail(f"state coverage mismatch passed={passed!r}")
         print("PASS per-state live E2E: " + " ".join(STATES))
-        return 0
+
+        if args.soak > 0:
+            run_soak(
+                args.soak,
+                binary,
+                socket_path,
+                env,
+                log_path,
+                project,
+                pgrep_pattern,
+                args.timeout,
+                shims,
+            )
+            print(f"PASS soak: {args.soak} rounds (pids/fds/rss within bounds)")
+        rc = 0
     except Exception as exc:
         print(f"FAIL per-state live E2E: {exc}", file=sys.stderr)
         log_path = tmp / "daemon.log"
         if log_path.exists():
             print("--- daemon.log tail ---", file=sys.stderr)
             print("\n".join(log_path.read_text(errors="replace").splitlines()[-120:]), file=sys.stderr)
-        return 1
+        rc = 1
     finally:
         for shim in shims:
             try:
@@ -480,10 +740,18 @@ def main() -> int:
                 stop_daemon(daemon, daemon_log)
             except Exception:
                 pass
+        if bootstrap_label is not None:
+            # bootout failures must surface, not be swallowed by cleanup.
+            try:
+                launchd_bootout(bootstrap_label)
+            except Exception as exc:
+                print(f"FAIL launchd cleanup: {exc}", file=sys.stderr)
+                rc = 1
         if os.environ.get("CBM_KEEP_E2E_TMP") == "1":
             print(f"kept fixture: {tmp}", file=sys.stderr)
         else:
             shutil.rmtree(tmp, ignore_errors=True)
+    return rc
 
 
 if __name__ == "__main__":
