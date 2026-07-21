@@ -31,6 +31,23 @@ extern "C" {
  * changes in an incompatible way. */
 #define CBM_SHIM_PROTOCOL_VERSION 1
 
+/* Version-injection seam for the Issue #29 I_UPGRADED live E2E (an approved
+ * "时间/版本号注入" seam in the issue contract). When the environment variable
+ * CBM_SHIM_PROTOCOL_VERSION_OVERRIDE is set, BOTH handshake roles advertise
+ * and enforce that version instead of CBM_SHIM_PROTOCOL_VERSION, which lets a
+ * test spawn a genuinely incompatible "old" shim against a current daemon.
+ *
+ * Strict fail-closed parsing: the override must be a full decimal integer in
+ * [1, 1000000]. A set-but-malformed override makes the handshake fail with
+ * CBM_SHIM_HS_MALFORMED instead of silently falling back to the compiled-in
+ * version (never guess what a test meant). */
+#define CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV "CBM_SHIM_PROTOCOL_VERSION_OVERRIDE"
+
+/* Effective protocol version for this process: the override when validly set,
+ * else CBM_SHIM_PROTOCOL_VERSION. Returns 0 on success; -1 with errno=EINVAL
+ * when the override env var is set but malformed/out-of-range. */
+int cbm_shim_effective_protocol_version(int *out_version);
+
 typedef enum cbm_shim_hs_result {
     CBM_SHIM_HS_OK = 0,
     CBM_SHIM_HS_VERSION_MISMATCH,

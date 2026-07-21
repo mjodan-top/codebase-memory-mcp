@@ -175,7 +175,7 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # Daemon transport lifecycle (Issue #25; no MCP handler wiring)
-DAEMON_SRCS = src/daemon/uds_lifecycle.c src/daemon/mcp_uds_runner.c src/daemon/shim_handshake.c src/daemon/mcp_shim.c
+DAEMON_SRCS = src/daemon/uds_lifecycle.c src/daemon/launchd_activation.c src/daemon/systemd_activation.c src/daemon/mcp_uds_runner.c src/daemon/shim_handshake.c src/daemon/mcp_shim.c
 
 # MCP server module (new)
 MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c

@@ -312,6 +312,75 @@ int cbm_uds_owner_open(cbm_uds_owner_t *owner, const char *socket_path, int back
     return 0;
 }
 
+int cbm_uds_owner_adopt(cbm_uds_owner_t *owner, int listen_fd, const char *socket_path) {
+    if (!owner || listen_fd < 0 || !socket_path || socket_path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    cbm_uds_state_callback_t callback = owner->state_callback;
+    void *userdata = owner->state_userdata;
+    unsigned long expected_uid = owner->expected_peer_uid;
+    owner_reset_runtime(owner);
+    owner->state_callback = callback;
+    owner->state_userdata = userdata;
+    owner->expected_peer_uid =
+        expected_uid == (unsigned long)-1 ? (unsigned long)geteuid() : expected_uid;
+    emit_state(owner, CBM_UDS_D_STARTING);
+
+    size_t path_len = strlen(socket_path);
+    if (path_len >= sizeof(owner->socket_path) ||
+        path_len >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    /* The inherited fd must really be a listening AF_UNIX socket — never
+     * adopt an arbitrary fd handed to us by a misconfigured manager. */
+    struct sockaddr_un bound;
+    socklen_t bound_len = (socklen_t)sizeof(bound);
+    memset(&bound, 0, sizeof(bound));
+    if (getsockname(listen_fd, (struct sockaddr *)&bound, &bound_len) < 0)
+        return -1;
+    if (bound.sun_family != AF_UNIX ||
+        bound_len <= (socklen_t)offsetof(struct sockaddr_un, sun_path) ||
+        bound.sun_path[0] == '\0') {
+        /* Unbound/unnamed sockets are never a manager-provided listener. */
+        errno = EINVAL;
+        return -1;
+    }
+    /* macOS does not support SO_ACCEPTCONN on AF_UNIX (ENOPROTOOPT), so
+     * verify listener-ness with an idempotent listen(): succeeds on a socket
+     * launchd already listen()ed (and on a bound one it simply starts the
+     * queue we need anyway), fails EINVAL on an unbound socket. */
+    if (listen(listen_fd, 64) < 0)
+        return -1;
+    if (set_cloexec(listen_fd) < 0)
+        return -1;
+
+    memcpy(owner->socket_path, socket_path, path_len + 1);
+    owner->claim_fd = claim_single_owner(socket_path);
+    if (owner->claim_fd < 0) {
+        int saved = errno;
+        if (saved == EADDRINUSE)
+            emit_state(owner, CBM_UDS_D_SINGLETON_LOSER);
+        owner_reset_runtime(owner);
+        owner->state_callback = callback;
+        owner->state_userdata = userdata;
+        owner->expected_peer_uid = expected_uid;
+        errno = saved;
+        return -1;
+    }
+    emit_state(owner, CBM_UDS_D_BIND_CLAIM);
+
+    /* socket_dev/socket_ino intentionally stay 0: the service manager owns
+     * the socket inode, so cbm_uds_owner_close() must not unlink it (launchd
+     * needs the path in place to re-activate the daemon on the next
+     * connection). */
+    owner->listen_fd = listen_fd;
+    emit_state(owner, CBM_UDS_D_LISTENING);
+    return 0;
+}
+
 static int peer_uid(int fd, unsigned long *uid_out) {
 #if defined(__APPLE__) || defined(__FreeBSD__)
     uid_t uid;
@@ -443,6 +512,13 @@ int cbm_uds_owner_open(cbm_uds_owner_t *owner, const char *socket_path, int back
     (void)owner;
     (void)socket_path;
     (void)backlog;
+    errno = ENOTSUP;
+    return -1;
+}
+int cbm_uds_owner_adopt(cbm_uds_owner_t *owner, int listen_fd, const char *socket_path) {
+    (void)owner;
+    (void)listen_fd;
+    (void)socket_path;
     errno = ENOTSUP;
     return -1;
 }
