@@ -23,6 +23,7 @@
 #include "cli/progress_sink.h"
 #include "foundation/constants.h"
 #include "foundation/xlock.h"
+#include "daemon/launchd_activation.h"
 #include "daemon/mcp_shim.h"
 #include "daemon/mcp_uds_runner.h"
 #include "daemon/uds_lifecycle.h"
@@ -616,14 +617,39 @@ static int daemon_watcher_index_fn(const char *project_name, const char *root_pa
     return succeeded ? 0 : CBM_NOT_FOUND;
 }
 
+/* Issue #29: `daemon --launchd` means we were spawned by launchd socket
+ * activation. launchd already bound + listens on the plist <Sockets> UDS;
+ * fetch that fd via the official launch_activate_socket API and adopt it.
+ * Fail-closed: if activation fails we exit instead of silently binding our
+ * own socket (which would fake activation and fight launchd over the path). */
+static bool parse_launchd_flag(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--launchd") == 0)
+            return true;
+    }
+    return false;
+}
+
 static int run_daemon(int argc, char **argv) {
     const char *socket_override = parse_socket_flag(argc, argv);
+    bool launchd_activated = parse_launchd_flag(argc, argv);
     char resolved[108];
     if (cbm_uds_socket_path_resolve(resolved, sizeof(resolved), socket_override) != 0) {
         (void)fprintf(stderr,
                       "codebase-memory-mcp: daemon.socket_resolve_failed errno=%d error=%s\n",
                       errno, strerror(errno));
         return SKIP_ONE;
+    }
+    int launchd_fd = -1;
+    if (launchd_activated) {
+        launchd_fd = cbm_launchd_activation_fd(NULL);
+        if (launchd_fd < 0) {
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp: daemon.launchd_activation_failed errno=%d "
+                          "error=%s\n",
+                          errno, strerror(errno));
+            return SKIP_ONE;
+        }
     }
 
     cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
@@ -641,10 +667,20 @@ static int run_daemon(int argc, char **argv) {
     cbm_uds_owner_t owner;
     memset(&owner, 0, sizeof(owner));
     cbm_uds_owner_configure(&owner, (unsigned long)-1, NULL, NULL);
-    if (cbm_uds_owner_open(&owner, resolved, 64) != 0) {
+    int open_rc;
+    if (launchd_activated) {
+        open_rc = cbm_uds_owner_adopt(&owner, launchd_fd, resolved);
+        if (open_rc == 0)
+            cbm_log_info("daemon.launchd.adopted", "socket", resolved);
+    } else {
+        open_rc = cbm_uds_owner_open(&owner, resolved, 64);
+    }
+    if (open_rc != 0) {
         (void)fprintf(stderr,
                       "codebase-memory-mcp: daemon.listen_failed path=%s errno=%d error=%s\n",
                       resolved, errno, strerror(errno));
+        if (launchd_fd >= 0)
+            close(launchd_fd);
         cbm_mcp_core_free(core);
         return SKIP_ONE;
     }
