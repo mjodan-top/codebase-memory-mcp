@@ -378,7 +378,7 @@ def main() -> int:
         shim2 = Shim(binary, socket_path, env, log_path)
         shims.append(shim2)
         shim2.initialize()
-        result = shim2.tool("index_status", {"Project": project})
+        result = shim2.tool("index_status", {"project": project})
         if project not in json.dumps(result):
             fail(f"R_REUSED second shim did not resolve indexed project: {result!r}")
         passed.append("R_REUSED")
@@ -396,7 +396,7 @@ def main() -> int:
                 value
                 if "issue28_watch_event" in json.dumps(
                     value := shim2.tool(
-                        "search_graph", {"Project": project, "name_pattern": "issue28_watch_event"}
+                        "search_graph", {"project": project, "name_pattern": "issue28_watch_event"}
                     )
                 )
                 else None
@@ -453,7 +453,7 @@ def main() -> int:
         shim3 = Shim(binary, socket_path, env, log_path)
         shims.append(shim3)
         shim3.initialize()
-        result = shim3.tool("index_status", {"Project": project})
+        result = shim3.tool("index_status", {"project": project})
         if project not in json.dumps(result):
             fail(f"R_DAEMON_RESTARTED did not reopen persisted project: {result!r}")
         passed.append("R_DAEMON_RESTARTED")
