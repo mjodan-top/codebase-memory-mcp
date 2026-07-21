@@ -24,6 +24,7 @@
 #include "foundation/constants.h"
 #include "foundation/xlock.h"
 #include "daemon/launchd_activation.h"
+#include "daemon/systemd_activation.h"
 #include "daemon/mcp_shim.h"
 #include "daemon/mcp_uds_runner.h"
 #include "daemon/uds_lifecycle.h"
@@ -630,9 +631,29 @@ static bool parse_launchd_flag(int argc, char **argv) {
     return false;
 }
 
+/* Issue #29: `daemon --systemd` means we were spawned by a Linux user
+ * systemd `.socket` unit. systemd already bound + listens on the unit's
+ * ListenStream UDS and passes it per the sd_listen_fds contract
+ * (LISTEN_PID/LISTEN_FDS, first fd == 3); validate and adopt it.
+ * Fail-closed: if activation fails we exit instead of silently binding our
+ * own socket (which would fake activation and fight systemd over the path). */
+static bool parse_systemd_flag(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--systemd") == 0)
+            return true;
+    }
+    return false;
+}
+
 static int run_daemon(int argc, char **argv) {
     const char *socket_override = parse_socket_flag(argc, argv);
     bool launchd_activated = parse_launchd_flag(argc, argv);
+    bool systemd_activated = parse_systemd_flag(argc, argv);
+    if (launchd_activated && systemd_activated) {
+        (void)fprintf(stderr, "codebase-memory-mcp: daemon.activation_flags_conflict "
+                              "(--launchd and --systemd are mutually exclusive)\n");
+        return SKIP_ONE;
+    }
     char resolved[108];
     if (cbm_uds_socket_path_resolve(resolved, sizeof(resolved), socket_override) != 0) {
         (void)fprintf(stderr,
@@ -646,6 +667,17 @@ static int run_daemon(int argc, char **argv) {
         if (launchd_fd < 0) {
             (void)fprintf(stderr,
                           "codebase-memory-mcp: daemon.launchd_activation_failed errno=%d "
+                          "error=%s\n",
+                          errno, strerror(errno));
+            return SKIP_ONE;
+        }
+    }
+    int systemd_fd = -1;
+    if (systemd_activated) {
+        systemd_fd = cbm_systemd_activation_fd();
+        if (systemd_fd < 0) {
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp: daemon.systemd_activation_failed errno=%d "
                           "error=%s\n",
                           errno, strerror(errno));
             return SKIP_ONE;
@@ -672,6 +704,10 @@ static int run_daemon(int argc, char **argv) {
         open_rc = cbm_uds_owner_adopt(&owner, launchd_fd, resolved);
         if (open_rc == 0)
             cbm_log_info("daemon.launchd.adopted", "socket", resolved);
+    } else if (systemd_activated) {
+        open_rc = cbm_uds_owner_adopt(&owner, systemd_fd, resolved);
+        if (open_rc == 0)
+            cbm_log_info("daemon.systemd.adopted", "socket", resolved);
     } else {
         open_rc = cbm_uds_owner_open(&owner, resolved, 64);
     }
@@ -681,6 +717,8 @@ static int run_daemon(int argc, char **argv) {
                       resolved, errno, strerror(errno));
         if (launchd_fd >= 0)
             close(launchd_fd);
+        if (systemd_fd >= 0)
+            close(systemd_fd);
         cbm_mcp_core_free(core);
         return SKIP_ONE;
     }

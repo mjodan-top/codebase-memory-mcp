@@ -1,0 +1,31 @@
+# Issue #29 — Linux user systemd socket activation (template).
+#
+# Install as a USER unit (no root):
+#   ~/.config/systemd/user/codebase-memory-mcp.socket
+# then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now codebase-memory-mcp.socket
+#
+# systemd binds + listens the UDS below and passes it to the service per the
+# sd_listen_fds contract (LISTEN_PID/LISTEN_FDS, first fd == 3).
+# PV ref: https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html
+#         https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html
+#
+# %t expands to $XDG_RUNTIME_DIR for user units. The daemon resolves the
+# same path via cbm_uds_socket_path_resolve(); keep them in sync (or pass an
+# explicit --socket in the .service and here).
+
+[Unit]
+Description=codebase-memory-mcp daemon socket (on-demand activation)
+
+[Socket]
+ListenStream=%t/codebase-memory-mcp/daemon.sock
+# Private by contract: only the owning user may connect (peer-uid is also
+# enforced in-process on every accept).
+SocketMode=0600
+DirectoryMode=0700
+# Single-listener contract: exactly one fd. Do not add more ListenStream
+# lines — the daemon refuses multi-fd activation (EINVAL, fail-closed).
+
+[Install]
+WantedBy=sockets.target

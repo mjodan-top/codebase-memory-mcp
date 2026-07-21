@@ -1,0 +1,24 @@
+# Issue #29 — Linux user systemd socket activation (template).
+#
+# Install as a USER unit next to codebase-memory-mcp.socket:
+#   ~/.config/systemd/user/codebase-memory-mcp.service
+#
+# Started ON DEMAND by codebase-memory-mcp.socket on the first client
+# connection; never enable/start this service directly (the daemon exits
+# fail-closed if the sd_listen_fds environment is missing, by design).
+#
+# PV ref: https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html
+
+[Unit]
+Description=codebase-memory-mcp daemon (systemd socket activation)
+Requires=codebase-memory-mcp.socket
+
+[Service]
+Type=simple
+# Adjust ExecStart to the installed binary location. --systemd makes the
+# daemon adopt the inherited fd (validated via LISTEN_PID/LISTEN_FDS +
+# SO_ACCEPTCONN) instead of binding its own socket; --socket must match the
+# .socket unit's ListenStream path.
+ExecStart=%h/.local/bin/codebase-memory-mcp daemon --systemd --socket %t/codebase-memory-mcp/daemon.sock
+# systemd owns the socket inode; the daemon never unlinks it, so a plain
+# stop keeps the path in place for the next activation.
