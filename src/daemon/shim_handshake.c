@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,6 +22,34 @@ static const char CBM_SHIM_HELLO_TAG[] = "CBM-SHIM-HELLO";
 static const char CBM_DAEMON_HELLO_TAG[] = "CBM-DAEMON-HELLO";
 static const char CBM_SHIM_HS_OK_TAG[] = "OK";
 static const char CBM_SHIM_HS_MISMATCH_TAG[] = "VERSION_MISMATCH";
+
+int cbm_shim_effective_protocol_version(int *out_version) {
+    if (out_version == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    const char *raw = getenv(CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV);
+    if (raw == NULL) {
+        *out_version = CBM_SHIM_PROTOCOL_VERSION;
+        return 0;
+    }
+    /* Strict full-string decimal parse, fail-closed on any leftover bytes,
+     * leading whitespace/sign tricks (strtol would silently accept them),
+     * overflow, or out-of-range value (see header contract). */
+    if (raw[0] < '0' || raw[0] > '9') {
+        errno = EINVAL;
+        return -1;
+    }
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(raw, &end, 10);
+    if (end == NULL || *end != '\0' || errno != 0 || value < 1 || value > 1000000) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out_version = (int)value;
+    return 0;
+}
 
 const char *cbm_shim_hs_result_name(cbm_shim_hs_result_t result) {
     switch (result) {
@@ -137,9 +166,13 @@ cbm_shim_hs_result_t cbm_shim_handshake_client(int fd, int deadline_ms) {
     }
     long long deadline_at = now_ms() + deadline_ms;
 
+    int self_version = 0;
+    if (cbm_shim_effective_protocol_version(&self_version) != 0) {
+        return CBM_SHIM_HS_MALFORMED;
+    }
+
     char hello[CBM_SHIM_HS_LINE_MAX];
-    int hlen =
-        snprintf(hello, sizeof(hello), "%s %d\n", CBM_SHIM_HELLO_TAG, CBM_SHIM_PROTOCOL_VERSION);
+    int hlen = snprintf(hello, sizeof(hello), "%s %d\n", CBM_SHIM_HELLO_TAG, self_version);
     if (hlen < 0 || (size_t)hlen >= sizeof(hello)) {
         return CBM_SHIM_HS_IO_ERROR;
     }
@@ -162,10 +195,10 @@ cbm_shim_hs_result_t cbm_shim_handshake_client(int fd, int deadline_ms) {
     /* Defense-in-depth: never trust the daemon's self-reported "OK" verdict
      * alone. A fake/misbehaving daemon (or a genuinely mismatched build) could
      * echo verdict=OK while advertising a different protocol version; the
-     * client independently re-checks peer_version against its own compiled-in
-     * CBM_SHIM_PROTOCOL_VERSION before ever accepting the connection as
-     * attached. Any mismatch is fail-closed regardless of what verdict says. */
-    if (peer_version != CBM_SHIM_PROTOCOL_VERSION) {
+     * client independently re-checks peer_version against its own effective
+     * protocol version before ever accepting the connection as attached. Any
+     * mismatch is fail-closed regardless of what verdict says. */
+    if (peer_version != self_version) {
         return CBM_SHIM_HS_VERSION_MISMATCH;
     }
     if (strcmp(verdict, CBM_SHIM_HS_OK_TAG) == 0) {
@@ -183,6 +216,11 @@ cbm_shim_hs_result_t cbm_shim_handshake_server(int fd, int deadline_ms) {
     }
     long long deadline_at = now_ms() + deadline_ms;
 
+    int self_version = 0;
+    if (cbm_shim_effective_protocol_version(&self_version) != 0) {
+        return CBM_SHIM_HS_MALFORMED;
+    }
+
     char line[CBM_SHIM_HS_LINE_MAX];
     if (read_line_deadline(fd, line, sizeof(line), deadline_at) != 0) {
         return errno == ETIMEDOUT ? CBM_SHIM_HS_TIMEOUT : CBM_SHIM_HS_IO_ERROR;
@@ -195,11 +233,11 @@ cbm_shim_hs_result_t cbm_shim_handshake_server(int fd, int deadline_ms) {
         return CBM_SHIM_HS_MALFORMED;
     }
 
-    bool match = (client_version == CBM_SHIM_PROTOCOL_VERSION);
+    bool match = (client_version == self_version);
     char reply[CBM_SHIM_HS_LINE_MAX];
     int rlen =
-        snprintf(reply, sizeof(reply), "%s %d %s\n", CBM_DAEMON_HELLO_TAG,
-                 CBM_SHIM_PROTOCOL_VERSION, match ? CBM_SHIM_HS_OK_TAG : CBM_SHIM_HS_MISMATCH_TAG);
+        snprintf(reply, sizeof(reply), "%s %d %s\n", CBM_DAEMON_HELLO_TAG, self_version,
+                 match ? CBM_SHIM_HS_OK_TAG : CBM_SHIM_HS_MISMATCH_TAG);
     if (rlen < 0 || (size_t)rlen >= sizeof(reply)) {
         return CBM_SHIM_HS_IO_ERROR;
     }

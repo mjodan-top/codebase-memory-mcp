@@ -623,6 +623,84 @@ TEST(mcp_uds_three_process_clients_isolate_roots_ids_and_cancel) {
 #endif
 }
 
+/* Issue #29 I_UPGRADED seam: CBM_SHIM_PROTOCOL_VERSION_OVERRIDE lets a test
+ * run a genuinely incompatible "old" shim against a current daemon. The seam
+ * itself must be fail-closed: malformed overrides are errors, never silent
+ * fallbacks to the compiled-in version. */
+TEST(shim_handshake_version_override_parses_strictly) {
+#ifdef _WIN32
+    SKIP_PLATFORM("handshake override seam is exercised on Unix");
+#else
+    int version = 0;
+    unsetenv(CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV);
+    ASSERT_EQ(cbm_shim_effective_protocol_version(&version), 0);
+    ASSERT_EQ(version, CBM_SHIM_PROTOCOL_VERSION);
+
+    ASSERT_EQ(setenv(CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV, "2", 1), 0);
+    ASSERT_EQ(cbm_shim_effective_protocol_version(&version), 0);
+    ASSERT_EQ(version, 2);
+
+    static const char *bad[] = {"", "0", "-1", "+3", "2x", " 2", "2 ", "9999999999", "abc"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        ASSERT_EQ(setenv(CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV, bad[i], 1), 0);
+        errno = 0;
+        ASSERT_EQ(cbm_shim_effective_protocol_version(&version), -1);
+        ASSERT_EQ(errno, EINVAL);
+    }
+    unsetenv(CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV);
+    PASS();
+#endif
+}
+
+/* Real two-fd handshake: an overridden (old) client against a current-version
+ * server must land on VERSION_MISMATCH on BOTH sides, and a clean client must
+ * still succeed afterwards (upgrade recovery). */
+TEST(shim_handshake_version_override_rejects_and_recovers) {
+#ifdef _WIN32
+    SKIP_PLATFORM("socketpair handshake is Unix-only");
+#else
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    /* Old client (version 2 via override) writes its hello first, then the
+     * server judges it with the override unset (current version 1). The
+     * handshake is a strict half-duplex line exchange, so running the client
+     * in a forked child keeps both roles genuinely concurrent. */
+    ASSERT_EQ(setenv(CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV, "2", 1), 0);
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(fds[1]);
+        cbm_shim_hs_result_t r = cbm_shim_handshake_client(fds[0], 3000);
+        _exit(r == CBM_SHIM_HS_VERSION_MISMATCH ? 0 : 1);
+    }
+    close(fds[0]);
+    unsetenv(CBM_SHIM_PROTOCOL_VERSION_OVERRIDE_ENV);
+    ASSERT_EQ(cbm_shim_handshake_server(fds[1], 3000), CBM_SHIM_HS_VERSION_MISMATCH);
+    close(fds[1]);
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* Recovery: a current-version client on a fresh connection succeeds. */
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(fds[1]);
+        cbm_shim_hs_result_t r = cbm_shim_handshake_client(fds[0], 3000);
+        _exit(r == CBM_SHIM_HS_OK ? 0 : 1);
+    }
+    close(fds[0]);
+    ASSERT_EQ(cbm_shim_handshake_server(fds[1], 3000), CBM_SHIM_HS_OK);
+    close(fds[1]);
+    status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    PASS();
+#endif
+}
+
 TEST(mcp_uds_serve_detaches_and_reclaims_completed_sessions) {
 #ifdef _WIN32
     SKIP_PLATFORM("pathname UDS runner is Unix-only");
@@ -666,6 +744,8 @@ SUITE(mcp_uds_runner) {
     RUN_TEST(mcp_uds_two_process_clients_share_core_but_isolate_sessions);
     RUN_TEST(mcp_uds_three_process_clients_isolate_roots_ids_and_cancel);
     RUN_TEST(mcp_uds_serve_detaches_and_reclaims_completed_sessions);
+    RUN_TEST(shim_handshake_version_override_parses_strictly);
+    RUN_TEST(shim_handshake_version_override_rejects_and_recovers);
 }
 
 #ifdef CBM_MCP_UDS_RUNNER_MAIN
