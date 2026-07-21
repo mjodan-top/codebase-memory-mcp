@@ -975,6 +975,29 @@ void cbm_mcp_core_free(cbm_mcp_core_t *core) {
     free(core);
 }
 
+void cbm_mcp_core_set_watcher(cbm_mcp_core_t *core, struct cbm_watcher *w) {
+    if (!core) {
+        return;
+    }
+    cbm_mutex_lock(&core->mutex);
+    core->watcher = w;
+    cbm_mutex_unlock(&core->mutex);
+}
+
+void cbm_mcp_core_invalidate_store(cbm_mcp_core_t *core) {
+    if (!core) {
+        return;
+    }
+    cbm_mutex_lock(&core->mutex);
+    if (core->owns_store && core->store) {
+        cbm_store_close(core->store);
+    }
+    core->store = NULL;
+    free(core->current_project);
+    core->current_project = NULL;
+    cbm_mutex_unlock(&core->mutex);
+}
+
 cbm_mcp_server_t *cbm_mcp_server_new_with_core(cbm_mcp_core_t *core) {
     if (!core) {
         return NULL;
@@ -1018,9 +1041,14 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
     if (!srv || !srv->core) {
         return;
     }
-    cbm_mutex_lock(&srv->core->mutex);
-    srv->core->watcher = w;
-    cbm_mutex_unlock(&srv->core->mutex);
+    cbm_mcp_core_set_watcher(srv->core, w);
+}
+
+void cbm_mcp_server_invalidate_store(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    cbm_mcp_core_invalidate_store(srv->core);
 }
 
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
@@ -4474,7 +4502,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
  * run it through index_run_supervised. Shared by the session auto-index (srv
  * present → its cached store is invalidated) and the watcher re-index (srv NULL).
  * Returns the worker's response string (caller frees) or NULL to degrade. */
-static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path) {
+static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path,
+                                       const char *project_name) {
     if (!root_path || !root_path[0]) {
         return NULL;
     }
@@ -4482,6 +4511,9 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path);
+    if (project_name && project_name[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "name", project_name);
+    }
     char *args = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     if (!args) {
@@ -4492,10 +4524,113 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     return resp;
 }
 
+static void register_watcher_path_if_enabled(cbm_mcp_server_t *srv, const char *project_name,
+                                             const char *root_path);
+
+static char *index_response_project_name(const char *response) {
+    if (!response) {
+        return NULL;
+    }
+    yyjson_doc *outer_doc = yyjson_read(response, strlen(response), 0);
+    if (!outer_doc) {
+        return NULL;
+    }
+    yyjson_val *outer = yyjson_doc_get_root(outer_doc);
+    yyjson_val *content = yyjson_obj_get(outer, "content");
+    yyjson_val *first = yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    yyjson_val *text_val = first ? yyjson_obj_get(first, "text") : NULL;
+    const char *text = text_val ? yyjson_get_str(text_val) : NULL;
+    yyjson_doc *inner_doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *inner = inner_doc ? yyjson_doc_get_root(inner_doc) : NULL;
+    yyjson_val *project_val = inner ? yyjson_obj_get(inner, "project") : NULL;
+    const char *project = project_val ? yyjson_get_str(project_val) : NULL;
+    char *result = project && project[0] ? heap_strdup(project) : NULL;
+    if (inner_doc) {
+        yyjson_doc_free(inner_doc);
+    }
+    yyjson_doc_free(outer_doc);
+    return result;
+}
+
 /* Public entry (see mcp.h): the watcher re-index in main.c has no MCP server, so
  * it reaches the supervised runner through this srv-less wrapper. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path) {
-    return index_run_supervised_path(NULL, root_path);
+    return index_run_supervised_path(NULL, root_path, NULL);
+}
+
+/* Public entry (see mcp.h): the UI /api/index job carries an optional explicit
+ * project name; it rides the same supervised runner as every other index. */
+char *cbm_mcp_index_run_supervised_path_named(const char *root_path, const char *project_name) {
+    return index_run_supervised_path(NULL, root_path, project_name);
+}
+
+/* Daemon-owned index dispatch (#28): every full-index trigger that is not an
+ * MCP tool call (watcher re-index, UI /api/index) funnels through here, so
+ * xlock keying, canonical-root resolution, and crash-supervision behave
+ * identically no matter who asked. Caller must hold the pipeline lock. */
+bool cbm_mcp_index_path_dispatch_locked(const char *root_path, const char *project_name) {
+    if (!root_path || !root_path[0]) {
+        return false;
+    }
+    if (cbm_index_supervisor_should_wrap()) {
+        char *response = index_run_supervised_path(NULL, root_path, project_name);
+        if (response) {
+            bool ok = cbm_mcp_index_response_succeeded(response);
+            free(response);
+            return ok;
+        }
+        /* NULL response = spawn failed → degrade to in-process, same policy as
+         * handle_index_repository. */
+    }
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
+    if (!pipeline) {
+        return false;
+    }
+    bool named =
+        !project_name || !project_name[0] || cbm_pipeline_set_project_name(pipeline, project_name);
+    bool ok = named && cbm_pipeline_run(pipeline) == 0;
+    cbm_pipeline_free(pipeline);
+    return ok;
+}
+
+/* Blocking variant: waits for the pipeline lock (UI /api/index jobs queue
+ * behind whatever the daemon is already indexing instead of racing it). */
+bool cbm_mcp_index_path_dispatch(const char *root_path, const char *project_name) {
+    cbm_pipeline_lock();
+    bool ok = cbm_mcp_index_path_dispatch_locked(root_path, project_name);
+    cbm_pipeline_unlock();
+    return ok;
+}
+
+bool cbm_mcp_index_response_succeeded(const char *response) {
+    if (!response) {
+        return false;
+    }
+    yyjson_doc *outer_doc = yyjson_read(response, strlen(response), 0);
+    if (!outer_doc) {
+        return false;
+    }
+    yyjson_val *outer = yyjson_doc_get_root(outer_doc);
+    yyjson_val *is_error = yyjson_obj_get(outer, "isError");
+    if (is_error && yyjson_get_bool(is_error)) {
+        yyjson_doc_free(outer_doc);
+        return false;
+    }
+    yyjson_val *content = yyjson_obj_get(outer, "content");
+    yyjson_val *first = yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    yyjson_val *text_val = first ? yyjson_obj_get(first, "text") : NULL;
+    const char *text = text_val ? yyjson_get_str(text_val) : NULL;
+    yyjson_doc *inner_doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *inner = inner_doc ? yyjson_doc_get_root(inner_doc) : NULL;
+    yyjson_val *status_val = inner ? yyjson_obj_get(inner, "status") : NULL;
+    const char *status = status_val ? yyjson_get_str(status_val) : NULL;
+    bool ok = status && (strcmp(status, "indexed") == 0 || strcmp(status, "degraded") == 0 ||
+                         strcmp(status, "reused") == 0);
+    if (inner_doc) {
+        yyjson_doc_free(inner_doc);
+    }
+    yyjson_doc_free(outer_doc);
+    return ok;
 }
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
@@ -4536,6 +4671,26 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     if (cbm_index_supervisor_should_wrap()) {
         char *supervised = index_run_supervised(srv, args);
         if (supervised) {
+            if (cbm_mcp_index_response_succeeded(supervised)) {
+                char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+                char *project_name = index_response_project_name(supervised);
+                if (repo_path) {
+                    cbm_normalize_path_sep(repo_path);
+                    repo_path = canonicalize_repo_path_if_exists(repo_path);
+                }
+                if (!project_name) {
+                    project_name = cbm_mcp_get_string_arg(args, "name");
+                }
+                if (!project_name) {
+                    project_name = cbm_mcp_get_string_arg(args, "project_alias");
+                }
+                if (!project_name && repo_path) {
+                    project_name = cbm_pipeline_project_name_for_path(repo_path);
+                }
+                register_watcher_path_if_enabled(srv, project_name, repo_path);
+                free(project_name);
+                free(repo_path);
+            }
             return supervised;
         }
     }
@@ -4734,6 +4889,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_str(doc, root, "project_alias_warning",
                                    "indexed, but failed to persist project_alias into git-common-dir");
         }
+        register_watcher_path_if_enabled(srv, project_name, repo_path);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
@@ -6685,18 +6841,28 @@ static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
     return cbm_config_get_bool(srv->core->config, CBM_CONFIG_AUTO_WATCH, true);
 }
 
-/* Register the session project with the background watcher for ongoing
- * change detection — unless auto_watch is disabled. */
-static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
-    if (!srv->core->watcher || srv->session.project[0] == '\0' || srv->session.root[0] == '\0') {
+bool cbm_mcp_server_auto_watch_enabled(cbm_mcp_server_t *srv) {
+    return srv && auto_watch_enabled(srv);
+}
+
+static void register_watcher_path_if_enabled(cbm_mcp_server_t *srv, const char *project_name,
+                                             const char *root_path) {
+    if (!srv || !srv->core->watcher || !project_name || !project_name[0] || !root_path ||
+        !root_path[0]) {
         return;
     }
     if (!auto_watch_enabled(srv)) {
         cbm_log_info("watcher.register.skipped", "reason", "auto_watch_off", "project",
-                     srv->session.project);
+                     project_name);
         return;
     }
-    cbm_watcher_watch(srv->core->watcher, srv->session.project, srv->session.root);
+    cbm_watcher_watch(srv->core->watcher, project_name, root_path);
+}
+
+/* Register the session project with the background watcher for ongoing
+ * change detection — unless auto_watch is disabled. */
+static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
+    register_watcher_path_if_enabled(srv, srv->session.project, srv->session.root);
 }
 
 /* Background auto-index thread function */
@@ -6711,13 +6877,10 @@ static void *autoindex_thread(void *arg) {
      * the worker itself provides cross-process singleflight. */
     if (cbm_index_supervisor_should_wrap()) {
         cbm_mutex_lock(&srv->core->mutex);
-        char *resp = index_run_supervised_path(srv, srv->session.root);
+        char *resp = index_run_supervised_path(srv, srv->session.root, NULL);
         cbm_mutex_unlock(&srv->core->mutex);
         if (resp) {
-            bool ok = strstr(resp, "\"isError\":true") == NULL &&
-                      (strstr(resp, "\"status\":\"indexed\"") != NULL ||
-                       strstr(resp, "\"status\":\"degraded\"") != NULL ||
-                       strstr(resp, "\"status\":\"reused\"") != NULL);
+            bool ok = cbm_mcp_index_response_succeeded(resp);
             free(resp);
             if (ok) {
                 cbm_log_info("autoindex.done", "project", srv->session.project, "mode",

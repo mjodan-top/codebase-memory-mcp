@@ -5019,6 +5019,64 @@ TEST(index_recovery_parallel_quarantines_crasher) {
  *  `auto_watch` config key (default TRUE = existing behavior).
  * ══════════════════════════════════════════════════════════════════ */
 
+TEST(tool_index_repository_success_registers_explicit_path_with_watcher) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-explicit-watch-repo-XXXXXX");
+    if (!cbm_mkdtemp(repo)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-explicit-watch-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        th_rmtree(repo);
+        PASS();
+    }
+
+    char src[512];
+    snprintf(src, sizeof(src), "%s/main.py", repo);
+    ASSERT_EQ(th_write_file(src, "def explicit_watch_target():\n    return 28\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_sv = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sv_copy = saved_sv ? strdup(saved_sv) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_store_t *watch_store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(watch_store);
+    cbm_watcher_t *watcher = cbm_watcher_new(watch_store, NULL, NULL);
+    ASSERT_NOT_NULL(watcher);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_watcher(srv, watcher);
+
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"name\":\"explicit-watch\"}", repo);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    ASSERT_EQ(cbm_watcher_watch_count(watcher), 1);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_watcher_free(watcher);
+    cbm_store_close(watch_store);
+    cleanup_project_db(cache, "explicit-watch");
+    if (saved_sv_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sv_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_sv_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    PASS();
+}
+
 /* Drive the already-indexed connect path (initialize → maybe_auto_index →
  * watcher registration) and return the resulting watch count.
  * auto_watch_value: NULL leaves the key unset (exercises the default),
@@ -5586,6 +5644,7 @@ SUITE(mcp) {
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
 
     /* auto_watch gate (distilled from PR #625) */
+    RUN_TEST(tool_index_repository_success_registers_explicit_path_with_watcher);
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);

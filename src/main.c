@@ -590,6 +590,32 @@ static void *daemon_http_thread(void *arg) {
     return NULL;
 }
 
+static void *daemon_watcher_thread(void *arg) {
+    cbm_watcher_run((cbm_watcher_t *)arg, 5000);
+    return NULL;
+}
+
+static int daemon_watcher_index_fn(const char *project_name, const char *root_path,
+                                   void *user_data) {
+    if (atomic_load(&g_shutdown)) {
+        return 0;
+    }
+    if (!cbm_pipeline_try_lock()) {
+        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
+        return 0;
+    }
+
+    cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
+    bool succeeded = cbm_mcp_index_path_dispatch_locked(root_path, project_name);
+    cbm_pipeline_unlock();
+    if (succeeded) {
+        /* The worker rewrote the project DB out-of-band; drop the daemon
+         * core's cached store so every attached session reopens fresh (#28). */
+        cbm_mcp_core_invalidate_store((cbm_mcp_core_t *)user_data);
+    }
+    return succeeded ? 0 : CBM_NOT_FOUND;
+}
+
 static int run_daemon(int argc, char **argv) {
     const char *socket_override = parse_socket_flag(argc, argv);
     char resolved[108];
@@ -624,6 +650,18 @@ static int run_daemon(int argc, char **argv) {
     }
     g_daemon_owner = &owner;
 
+    cbm_thread_t watcher_tid;
+    bool watcher_started = false;
+    g_watcher = cbm_watcher_new(NULL, daemon_watcher_index_fn, core);
+    if (g_watcher && cbm_thread_create(&watcher_tid, 0, daemon_watcher_thread, g_watcher) == 0) {
+        watcher_started = true;
+        cbm_mcp_core_set_watcher(core, g_watcher);
+    } else {
+        cbm_log_warn("daemon.watcher.unavailable", "reason", "thread_create_failed");
+        cbm_watcher_free(g_watcher);
+        g_watcher = NULL;
+    }
+
     /* Issue #28: the daemon is the sole owner of the HTTP UI. The UI's /rpc
      * MCP server shares the daemon core (store registry / router) instead of
      * opening a second SQLite connection of its own. */
@@ -636,6 +674,7 @@ static int run_daemon(int argc, char **argv) {
         (void)snprintf(ui_port_str, sizeof(ui_port_str), "%d", ui_cfg.ui_port);
         g_http_server = cbm_http_server_new_with_core(ui_cfg.ui_port, core);
         if (g_http_server) {
+            cbm_http_server_set_watcher(g_http_server, g_watcher);
             if (cbm_thread_create(&http_tid, 0, daemon_http_thread, g_http_server) == 0) {
                 http_started = true;
                 (void)snprintf(ui_port_str, sizeof(ui_port_str), "%d",
@@ -664,6 +703,16 @@ static int run_daemon(int argc, char **argv) {
     if (g_http_server) {
         cbm_http_server_free(g_http_server);
         g_http_server = NULL;
+    }
+
+    if (watcher_started) {
+        cbm_watcher_stop(g_watcher);
+        cbm_thread_join(&watcher_tid);
+    }
+    if (g_watcher) {
+        cbm_mcp_core_set_watcher(core, NULL);
+        cbm_watcher_free(g_watcher);
+        g_watcher = NULL;
     }
 
     g_daemon_owner = NULL;
