@@ -160,74 +160,6 @@ static void *parent_watchdog_thread(void *arg) {
 }
 #endif
 
-/* ── Watcher background thread ──────────────────────────────────── */
-
-static void *watcher_thread(void *arg) {
-    cbm_watcher_t *w = arg;
-#define WATCHER_BASE_INTERVAL_MS 5000
-
-    cbm_watcher_run(w, WATCHER_BASE_INTERVAL_MS);
-    return NULL;
-}
-
-/* ── HTTP UI background thread ──────────────────────────────────── */
-
-static void *http_thread(void *arg) {
-    cbm_http_server_t *srv = arg;
-    cbm_http_server_run(srv);
-    return NULL;
-}
-
-/* ── Index callback for watcher ─────────────────────────────────── */
-
-static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
-    (void)user_data;
-
-    /* Skip indexing if shutdown is in progress */
-    if (atomic_load(&g_shutdown)) {
-        return 0;
-    }
-
-    /* Non-blocking: skip if another pipeline is already running.
-     * Watcher will retry on next poll cycle (5-60s). */
-    if (!cbm_pipeline_try_lock()) {
-        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
-    }
-
-    cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
-
-    /* #832: route the re-index through the supervised worker subprocess so this
-     * long-lived server process hands its RSS back to the OS on every cycle
-     * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
-     * threads abandon at exit). The child writes the DB; the parent only needs the
-     * return code. The pipeline lock (already held) still serialises re-indexes.
-     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
-     * or the spawn fails. */
-    if (cbm_index_supervisor_should_wrap()) {
-        char *resp = cbm_mcp_index_run_supervised_path(root_path);
-        if (resp) {
-            free(resp);
-            cbm_pipeline_unlock();
-            return 0;
-        }
-        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
-    }
-
-    cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
-    if (p && project_name && project_name[0]) {
-        (void)cbm_pipeline_apply_project_alias(p, project_name);
-    }
-    if (!p) {
-        cbm_pipeline_unlock();
-        return CBM_NOT_FOUND;
-    }
-
-    int rc = cbm_pipeline_run(p);
-    cbm_pipeline_free(p);
-    cbm_pipeline_unlock();
-    return rc;
-}
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
 #define CLI_USAGE "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [json_args]\n"
@@ -651,6 +583,39 @@ static int daemon_should_stop(void *userdata) {
  * cbm_mcp_core_t (store/router). This is the only code path that opens the
  * UDS listener and constructs MCP server sessions; the default (shim) path
  * above never reaches any of this. */
+/* Daemon-owned HTTP UI thread (#28): runs the UI listener until
+ * cbm_http_server_stop() is called during daemon shutdown. */
+static void *daemon_http_thread(void *arg) {
+    cbm_http_server_run((cbm_http_server_t *)arg);
+    return NULL;
+}
+
+static void *daemon_watcher_thread(void *arg) {
+    cbm_watcher_run((cbm_watcher_t *)arg, 5000);
+    return NULL;
+}
+
+static int daemon_watcher_index_fn(const char *project_name, const char *root_path,
+                                   void *user_data) {
+    if (atomic_load(&g_shutdown)) {
+        return 0;
+    }
+    if (!cbm_pipeline_try_lock()) {
+        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
+        return 0;
+    }
+
+    cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
+    bool succeeded = cbm_mcp_index_path_dispatch_locked(root_path, project_name);
+    cbm_pipeline_unlock();
+    if (succeeded) {
+        /* The worker rewrote the project DB out-of-band; drop the daemon
+         * core's cached store so every attached session reopens fresh (#28). */
+        cbm_mcp_core_invalidate_store((cbm_mcp_core_t *)user_data);
+    }
+    return succeeded ? 0 : CBM_NOT_FOUND;
+}
+
 static int run_daemon(int argc, char **argv) {
     const char *socket_override = parse_socket_flag(argc, argv);
     char resolved[108];
@@ -685,9 +650,70 @@ static int run_daemon(int argc, char **argv) {
     }
     g_daemon_owner = &owner;
 
+    cbm_thread_t watcher_tid;
+    bool watcher_started = false;
+    g_watcher = cbm_watcher_new(NULL, daemon_watcher_index_fn, core);
+    if (g_watcher && cbm_thread_create(&watcher_tid, 0, daemon_watcher_thread, g_watcher) == 0) {
+        watcher_started = true;
+        cbm_mcp_core_set_watcher(core, g_watcher);
+    } else {
+        cbm_log_warn("daemon.watcher.unavailable", "reason", "thread_create_failed");
+        cbm_watcher_free(g_watcher);
+        g_watcher = NULL;
+    }
+
+    /* Issue #28: the daemon is the sole owner of the HTTP UI. The UI's /rpc
+     * MCP server shares the daemon core (store registry / router) instead of
+     * opening a second SQLite connection of its own. */
+    cbm_thread_t http_tid;
+    bool http_started = false;
+    cbm_ui_config_t ui_cfg;
+    cbm_ui_config_load(&ui_cfg);
+    if (ui_cfg.ui_enabled) {
+        char ui_port_str[16];
+        (void)snprintf(ui_port_str, sizeof(ui_port_str), "%d", ui_cfg.ui_port);
+        g_http_server = cbm_http_server_new_with_core(ui_cfg.ui_port, core);
+        if (g_http_server) {
+            cbm_http_server_set_watcher(g_http_server, g_watcher);
+            if (cbm_thread_create(&http_tid, 0, daemon_http_thread, g_http_server) == 0) {
+                http_started = true;
+                (void)snprintf(ui_port_str, sizeof(ui_port_str), "%d",
+                               cbm_http_server_port(g_http_server));
+                cbm_log_info("daemon.ui.started", "port", ui_port_str);
+            } else {
+                char errno_str[16];
+                (void)snprintf(errno_str, sizeof(errno_str), "%d", errno);
+                cbm_log_error("daemon.ui.thread_failed", "errno", errno_str);
+                cbm_http_server_free(g_http_server);
+                g_http_server = NULL;
+            }
+        } else {
+            cbm_log_error("daemon.ui.start_failed", "port", ui_port_str);
+        }
+    }
+
     cbm_log_info("daemon.listening", "socket", resolved);
     int rc = cbm_mcp_uds_serve(&owner, core, daemon_should_stop, NULL);
     cbm_log_info("daemon.shutdown");
+
+    if (http_started) {
+        cbm_http_server_stop(g_http_server);
+        cbm_thread_join(&http_tid);
+    }
+    if (g_http_server) {
+        cbm_http_server_free(g_http_server);
+        g_http_server = NULL;
+    }
+
+    if (watcher_started) {
+        cbm_watcher_stop(g_watcher);
+        cbm_thread_join(&watcher_tid);
+    }
+    if (g_watcher) {
+        cbm_mcp_core_set_watcher(core, NULL);
+        cbm_watcher_free(g_watcher);
+        g_watcher = NULL;
+    }
 
     g_daemon_owner = NULL;
     cbm_uds_owner_close(&owner);

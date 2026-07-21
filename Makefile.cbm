@@ -857,3 +857,8 @@ security: cbm
 	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="
+
+# Issue #28: production daemon + two UDS shims + HTTP per-state live E2E.
+.PHONY: test-per-state-live-e2e
+test-per-state-live-e2e: $(BUILD_DIR)/codebase-memory-mcp
+	CBM_E2E_BIN="$(CURDIR)/$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test-per-state-live-e2e.sh

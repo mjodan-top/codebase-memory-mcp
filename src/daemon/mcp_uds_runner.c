@@ -8,6 +8,9 @@
 #include "daemon/shim_handshake.h"
 
 #include <errno.h>
+#ifndef _WIN32
+#include <fcntl.h> /* fcntl FD_CLOEXEC — see the dup() note in run_client_stream */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +67,21 @@ static void *run_client_stream(void *arg) {
         if (task->self_cleanup)
             finish_task(task);
         return NULL;
+    }
+    /* dup() drops FD_CLOEXEC (#28): a daemon-side fork (supervised index
+     * worker) would otherwise inherit this shim connection's write fd and
+     * keep the socket open long after the session ended — the shim then
+     * never observes UDS EOF on close and hangs until killed. */
+    {
+        int fdflags = fcntl(write_fd, F_GETFD);
+        if (fdflags < 0 || fcntl(write_fd, F_SETFD, fdflags | FD_CLOEXEC) < 0) {
+            close(write_fd);
+            close(read_fd);
+            task->result = -1;
+            if (task->self_cleanup)
+                finish_task(task);
+            return NULL;
+        }
     }
 
     in = fdopen(read_fd, "rb");

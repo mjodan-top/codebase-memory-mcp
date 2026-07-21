@@ -107,6 +107,15 @@ cbm_mcp_core_t *cbm_mcp_core_new(const char *store_path);
  * the final attached server (and owner) releases its reference. */
 void cbm_mcp_core_free(cbm_mcp_core_t *core);
 
+/* Set the daemon-owned watcher shared by every server attached to this core.
+ * The core does not own the watcher. */
+void cbm_mcp_core_set_watcher(cbm_mcp_core_t *core, struct cbm_watcher *w);
+
+/* Drop the core's cached project store (closed if owned). Call after an
+ * out-of-band index run (watcher re-index, UI /api/index) rewrote the DB so
+ * attached sessions reopen it instead of reading a stale connection (#28). */
+void cbm_mcp_core_invalidate_store(cbm_mcp_core_t *core);
+
 /* Create a connection server attached to an existing shared core. Session
  * lifecycle, request/cancellation state, and auto-index state stay isolated. */
 cbm_mcp_server_t *cbm_mcp_server_new_with_core(cbm_mcp_core_t *core);
@@ -122,6 +131,14 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
+
+/* Snapshot whether automatic watcher registration is enabled for this server.
+ * Defaults to true when no config is attached. */
+bool cbm_mcp_server_auto_watch_enabled(cbm_mcp_server_t *srv);
+
+/* Convenience wrapper: invalidate the cached store on this server's core.
+ * See cbm_mcp_core_invalidate_store. */
+void cbm_mcp_server_invalidate_store(cbm_mcp_server_t *srv);
 
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
@@ -151,6 +168,21 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * is not a supervisor host). This is the shared entry the watcher re-index
  * (main.c) and the session auto-index (mcp.c) route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
+
+/* Same supervised runner, with an optional explicit project name (UI /api/index
+ * passes the user-chosen name through to the worker). NULL/empty name = derive. */
+char *cbm_mcp_index_run_supervised_path_named(const char *root_path, const char *project_name);
+
+/* Daemon-owned full-index dispatch (#28): supervised subprocess when available,
+ * in-process pipeline fallback otherwise. Returns true on a successful index.
+ * The _locked variant requires the caller to hold the global pipeline lock
+ * (cbm_pipeline_try_lock/cbm_pipeline_lock); the plain variant blocks on it. */
+bool cbm_mcp_index_path_dispatch_locked(const char *root_path, const char *project_name);
+bool cbm_mcp_index_path_dispatch(const char *root_path, const char *project_name);
+
+/* Return true only for a successful index tool-result envelope. A non-NULL
+ * supervised response may still be a contained MCP error. */
+bool cbm_mcp_index_response_succeeded(const char *response);
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 

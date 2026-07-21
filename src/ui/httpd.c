@@ -24,6 +24,7 @@ typedef SOCKET cbm_sock_t;
 #else
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h> /* fcntl FD_CLOEXEC — daemon-owned listener must not leak into workers (#28) */
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -125,6 +126,20 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     if (fd == CBM_SOCK_BAD)
         return NULL;
 
+#ifndef _WIN32
+    /* FD_CLOEXEC (#28): the daemon is the sole owner of the UI listener. A
+     * fork+exec'd supervised index worker must not inherit this socket —
+     * an inherited listener keeps the port bound after the daemon exits, so
+     * a restarted daemon fails to bind and comes up with the UI dark. */
+    {
+        int fdflags = fcntl(fd, F_GETFD);
+        if (fdflags < 0 || fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC) < 0) {
+            cbm_sock_close(fd);
+            return NULL;
+        }
+    }
+#endif
+
     /* POSIX: SO_REUSEADDR only permits rebinding a TIME_WAIT port.
      * Windows: SO_REUSEADDR would let ANY local user hijack the port, so
      * use SO_EXCLUSIVEADDRUSE instead (Microsoft's own guidance). */
@@ -198,6 +213,16 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 #ifdef SO_NOSIGPIPE
     setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+#ifndef _WIN32
+    /* FD_CLOEXEC (#28): same rationale as the listener — a fork+exec'd index
+     * worker must not hold a client connection open past the daemon's reply. */
+    {
+        int fdflags = fcntl(cfd, F_GETFD);
+        if (fdflags >= 0) {
+            (void)fcntl(cfd, F_SETFD, fdflags | FD_CLOEXEC);
+        }
+    }
 #endif
 
     cbm_http_conn_t *c = calloc(1, sizeof(*c));

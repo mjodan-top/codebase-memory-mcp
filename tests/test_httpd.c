@@ -785,6 +785,48 @@ TEST(ui_server_delete_project_unlink_failure_keeps_watch) {
     PASS();
 }
 
+TEST(ui_server_index_success_registers_watcher) {
+#ifdef _WIN32
+    PASS();
+#else
+    char *root = th_mktempdir("cbm_httpd_index_watch");
+    ASSERT_NOT_NULL(root);
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    ASSERT_NOT_NULL(watcher);
+
+    cbm_http_server_set_binary_path("/bin/true");
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, watcher), 0);
+
+    char body[1024];
+    snprintf(body, sizeof(body), "{\"root_path\":\"%s\",\"project_name\":\"http-index-watch\"}",
+             root);
+    char req[2048];
+    snprintf(req, sizeof(req),
+             "POST /api/index HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 202);
+
+    for (int i = 0; i < 40 && cbm_watcher_watch_count(watcher) == 0; i++) {
+        struct timespec delay = {0, 50000000};
+        cbm_nanosleep(&delay, NULL);
+    }
+    ASSERT_EQ(cbm_watcher_watch_count(watcher), 1);
+
+    th_server_stop(&ts);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+#endif
+}
+
 TEST(ui_server_ui_config_detects_zh_accept_language) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -1213,6 +1255,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_delete_project_missing_name_keeps_watch);
     RUN_TEST(ui_server_delete_project_invalid_name_keeps_watch);
     RUN_TEST(ui_server_delete_project_unlink_failure_keeps_watch);
+    RUN_TEST(ui_server_index_success_registers_watcher);
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
     RUN_TEST(ui_server_slow_request_hits_deadline);
