@@ -313,8 +313,12 @@ TEST(systemd_activation_receives_adopts_and_preserves_inode) {
     ASSERT_EQ(bind(manager_fd, (const struct sockaddr *)&addr, addr_len), 0);
     ASSERT_EQ(chmod(socket_path, 0600), 0);
     ASSERT_EQ(listen(manager_fd, 4), 0);
-    ASSERT_EQ(dup2(manager_fd, CBM_SD_LISTEN_FDS_START), CBM_SD_LISTEN_FDS_START);
-    close(manager_fd);
+    /* Park the listener at SD_LISTEN_FDS_START. If socket() already handed
+     * us fd 3, dup2(3,3) is a no-op and closing it would destroy the fd. */
+    if (manager_fd != CBM_SD_LISTEN_FDS_START) {
+        ASSERT_EQ(dup2(manager_fd, CBM_SD_LISTEN_FDS_START), CBM_SD_LISTEN_FDS_START);
+        close(manager_fd);
+    }
 
     char pid_str[32];
     ASSERT_LT(snprintf(pid_str, sizeof(pid_str), "%ld", (long)getpid()), (int)sizeof(pid_str));
@@ -378,8 +382,10 @@ TEST(systemd_activation_rejects_non_listening_inherited_fd) {
     socklen_t addr_len =
         (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(socket_path) + 1);
     ASSERT_EQ(bind(bound_fd, (const struct sockaddr *)&addr, addr_len), 0);
-    ASSERT_EQ(dup2(bound_fd, CBM_SD_LISTEN_FDS_START), CBM_SD_LISTEN_FDS_START);
-    close(bound_fd);
+    if (bound_fd != CBM_SD_LISTEN_FDS_START) {
+        ASSERT_EQ(dup2(bound_fd, CBM_SD_LISTEN_FDS_START), CBM_SD_LISTEN_FDS_START);
+        close(bound_fd);
+    }
 
     char pid_str[32];
     ASSERT_LT(snprintf(pid_str, sizeof(pid_str), "%ld", (long)getpid()), (int)sizeof(pid_str));
