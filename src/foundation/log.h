@@ -78,8 +78,10 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
 
 /* Operational event helpers. They deliberately avoid request bodies, headers,
  * arguments, and query strings. */
+/* project (issue #38): resolved project name for tools/call, or NULL/"" to
+ * omit the key (initialize, tools/list, project-less tool calls). */
 void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,
-                         int64_t duration_us);
+                         int64_t duration_us, const char *project);
 void cbm_log_http_request(const char *component, const char *method, const char *path, int status,
                           int64_t duration_ms, size_t request_bytes, size_t response_bytes);
 
