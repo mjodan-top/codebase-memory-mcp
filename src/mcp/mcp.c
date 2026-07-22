@@ -7184,7 +7184,13 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_diag_record_query(dur_us, is_err);
         long long request_dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                                    ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
+        /* issue #38: log the project the way the tools themselves resolve it
+         * (get_project_arg accepts the alias keys and normalizes paths to the
+         * project name). Parsing here is logging-only and never alters the
+         * tool's own argument validation or fallback behavior. */
+        char *log_project = tool_args ? get_project_arg(tool_args) : NULL;
+        cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us, log_project);
+        free(log_project);
         request_logged = true;
 
         result_json = inject_update_notice(srv, result_json);
@@ -7205,7 +7211,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        cbm_log_mcp_request(req.method, NULL, true, dur_us, NULL);
         cbm_jsonrpc_request_free(&req);
         return err;
     }
@@ -7215,7 +7221,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, false, dur_us);
+        cbm_log_mcp_request(req.method, NULL, false, dur_us, NULL);
     }
 
     cbm_jsonrpc_response_t resp = {

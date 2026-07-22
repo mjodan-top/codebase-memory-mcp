@@ -2,6 +2,7 @@
  * log.c — Structured key-value logging to stderr.
  */
 #include "log.h"
+#include "foundation/compat.h"
 #include "foundation/constants.h"
 #include <ctype.h>
 #include <inttypes.h>
@@ -205,6 +206,31 @@ static void emit_line(const char *line) {
     (void)fprintf(stderr, "%s\n", line);
 }
 
+/* issue #38: ISO8601 UTC millisecond timestamp for the head of every log
+ * line. Wall clock via CLOCK_REALTIME (durations elsewhere stay on
+ * CLOCK_MONOTONIC — never mix the two); gmtime_r keeps it thread-safe;
+ * strftime has no sub-second conversion, so milliseconds are hand-appended. */
+static void format_log_timestamp(char *out, size_t outsz) {
+    if (!out || outsz == 0) {
+        return;
+    }
+    struct timespec now;
+    if (cbm_clock_gettime(CLOCK_REALTIME, &now) != 0) {
+        now.tv_sec = 0;
+        now.tv_nsec = 0;
+    }
+    struct tm tm_utc;
+    memset(&tm_utc, 0, sizeof(tm_utc));
+    time_t secs = (time_t)now.tv_sec;
+    cbm_gmtime_r(&secs, &tm_utc);
+    size_t n = strftime(out, outsz, "%Y-%m-%dT%H:%M:%S", &tm_utc);
+    if (n == 0) {
+        out[0] = '\0';
+        return;
+    }
+    snprintf(out + n, outsz - n, ".%03ldZ", (long)(now.tv_nsec / 1000000L));
+}
+
 void cbm_log(CBMLogLevel level, const char *msg, ...) {
     if (level < g_log_level) {
         return;
@@ -215,8 +241,13 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     va_list args;
     va_start(args, msg);
 
+    char ts_buf[CBM_SZ_32];
+    format_log_timestamp(ts_buf, sizeof(ts_buf));
+
     if (g_log_format == CBM_LOG_FORMAT_JSON) {
-        append_raw(line_buf, sizeof(line_buf), &pos, "{\"level\":");
+        append_raw(line_buf, sizeof(line_buf), &pos, "{\"ts\":");
+        append_json_string(line_buf, sizeof(line_buf), &pos, ts_buf);
+        append_raw(line_buf, sizeof(line_buf), &pos, ",\"level\":");
         append_json_string(line_buf, sizeof(line_buf), &pos, level_str(level));
         append_raw(line_buf, sizeof(line_buf), &pos, ",\"event\":");
         append_json_string(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
@@ -233,7 +264,9 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
         }
         append_char(line_buf, sizeof(line_buf), &pos, '}');
     } else {
-        append_raw(line_buf, sizeof(line_buf), &pos, "level=");
+        append_raw(line_buf, sizeof(line_buf), &pos, "ts=");
+        append_text_atom(line_buf, sizeof(line_buf), &pos, ts_buf);
+        append_raw(line_buf, sizeof(line_buf), &pos, " level=");
         append_text_atom(line_buf, sizeof(line_buf), &pos, level_str(level));
         append_raw(line_buf, sizeof(line_buf), &pos, " msg=");
         append_text_atom(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
@@ -278,17 +311,23 @@ static void copy_path_without_query(const char *path, char *out, size_t outsz) {
 }
 
 void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,
-                         int64_t duration_us) {
+                         int64_t duration_us, const char *project) {
     char duration_ms[CBM_SZ_32];
     snprintf(duration_ms, sizeof(duration_ms), "%" PRId64, duration_us / 1000);
-    if (tool_name && tool_name[0] != '\0') {
-        cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "tool", tool_name, "status",
-                is_error ? "error" : "ok", "duration_ms", duration_ms, NULL);
-    } else {
-        cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "status", is_error ? "error" : "ok", "duration_ms",
+    CBMLogLevel level = is_error ? CBM_LOG_WARN : CBM_LOG_INFO;
+    const char *status = is_error ? "error" : "ok";
+    /* issue #38: project rides only on tool calls that actually carry one;
+     * initialize/tools/list and project-less tool calls omit the key. */
+    if (tool_name && tool_name[0] != '\0' && project && project[0] != '\0') {
+        cbm_log(level, "mcp.request", "protocol", "jsonrpc", "method", method ? method : "",
+                "tool", tool_name, "project", project, "status", status, "duration_ms",
                 duration_ms, NULL);
+    } else if (tool_name && tool_name[0] != '\0') {
+        cbm_log(level, "mcp.request", "protocol", "jsonrpc", "method", method ? method : "",
+                "tool", tool_name, "status", status, "duration_ms", duration_ms, NULL);
+    } else {
+        cbm_log(level, "mcp.request", "protocol", "jsonrpc", "method", method ? method : "",
+                "status", status, "duration_ms", duration_ms, NULL);
     }
 }
 

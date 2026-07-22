@@ -168,7 +168,7 @@ TEST(log_operational_helpers) {
     cbm_log_set_level(CBM_LOG_DEBUG);
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
     capture_start();
-    cbm_log_mcp_request("tools/call", "search_graph", false, 1250);
+    cbm_log_mcp_request("tools/call", "search_graph", false, 1250, "demo-project");
     cbm_log_http_request("graph_ui", "GET", "/api/layout", 200, 7, 0, 42);
     const char *output = capture_end();
     cbm_log_set_level(CBM_LOG_INFO);
@@ -177,10 +177,81 @@ TEST(log_operational_helpers) {
     ASSERT(cbm_str_contains_raw(output, "protocol=jsonrpc"));
     ASSERT(cbm_str_contains_raw(output, "method=tools/call"));
     ASSERT(cbm_str_contains_raw(output, "tool=search_graph"));
+    ASSERT(cbm_str_contains_raw(output, "project=demo-project"));
     ASSERT(cbm_str_contains_raw(output, "msg=http.request"));
     ASSERT(cbm_str_contains_raw(output, "method=GET"));
     ASSERT(cbm_str_contains_raw(output, "path=/api/layout"));
     ASSERT(cbm_str_contains_raw(output, "status=200"));
+    PASS();
+}
+
+/* issue #38: no project → key omitted entirely (initialize/tools/list and
+ * project-less tool calls must not carry an empty project=). */
+TEST(log_mcp_request_project_omitted) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    capture_start();
+    cbm_log_mcp_request("tools/call", "list_projects", false, 900, NULL);
+    cbm_log_mcp_request("initialize", NULL, false, 300, NULL);
+    const char *output = capture_end();
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(cbm_str_contains_raw(output, "tool=list_projects"));
+    ASSERT(cbm_str_contains_raw(output, "method=initialize"));
+    ASSERT(!cbm_str_contains_raw(output, "project="));
+    PASS();
+}
+
+/* issue #38: every line leads with ts=<ISO8601 UTC millisecond>. */
+static bool is_iso8601_ms_utc(const char *s) {
+    /* YYYY-MM-DDTHH:MM:SS.mmmZ — 24 chars */
+    static const char pat[] = "dddd-dd-ddTdd:dd:dd.dddZ";
+    for (size_t i = 0; pat[i]; i++) {
+        char p = pat[i];
+        char c = s[i];
+        if (c == '\0') {
+            return false;
+        }
+        if (p == 'd') {
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        } else if (c != p) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(log_text_line_leads_with_iso_timestamp) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    capture_start();
+    cbm_log_info("ts.check", "key", "val");
+    const char *output = capture_end();
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(strncmp(output, "ts=", 3) == 0);
+    ASSERT(is_iso8601_ms_utc(output + 3));
+    ASSERT(output[3 + 24] == ' ');
+    ASSERT(cbm_str_contains_raw(output, " level=info msg=ts.check key=val"));
+    PASS();
+}
+
+TEST(log_json_line_leads_with_iso_timestamp) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_JSON);
+    capture_start();
+    cbm_log_info("ts.check", "key", "val");
+    const char *output = capture_end();
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(strncmp(output, "{\"ts\":\"", 7) == 0);
+    ASSERT(is_iso8601_ms_utc(output + 7));
+    ASSERT(output[7 + 24] == '"');
+    ASSERT(cbm_str_contains_raw(output, "\"level\":\"info\""));
+    ASSERT(cbm_str_contains_raw(output, "\"event\":\"ts.check\""));
     PASS();
 }
 
@@ -294,6 +365,9 @@ SUITE(log) {
     RUN_TEST(log_text_sanitizes_control_chars);
     RUN_TEST(log_sink_tee_keeps_stderr);
     RUN_TEST(log_operational_helpers);
+    RUN_TEST(log_mcp_request_project_omitted);
+    RUN_TEST(log_text_line_leads_with_iso_timestamp);
+    RUN_TEST(log_json_line_leads_with_iso_timestamp);
     RUN_TEST(log_format_from_env);
     RUN_TEST(log_format_unset_keeps_current);
     RUN_TEST(log_level_from_env_textual);
