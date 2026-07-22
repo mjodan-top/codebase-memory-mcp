@@ -836,6 +836,10 @@ static char *normalize_project_arg(char *project) {
     return project;
 }
 
+/* Forward decl — definition lives below alongside resolve_store_fallback_scan,
+ * whose cache-dir helpers it reuses. */
+static char *resolve_bare_project_name(char *project);
+
 /* Resolve the project argument, accepting the canonical "project" key plus the
  * aliases a caller naturally reaches for (#640): list_projects surfaces the
  * field as "name" and the not-found hint says "pass the project name", so
@@ -853,7 +857,10 @@ static char *get_project_arg(const char *args_json) {
     if (!p) {
         p = cbm_mcp_get_string_arg(args_json, "projectName");
     }
-    return normalize_project_arg(p);
+    /* Bare directory-name / alias resolution (spike S2): map e.g. "coder" to
+     * the indexed project whose root_path basename or alias is "coder", when
+     * that mapping is unique. See resolve_bare_project_name below. */
+    return resolve_bare_project_name(normalize_project_arg(p));
 }
 
 int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val) {
@@ -1537,6 +1544,109 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
     }
     cbm_closedir(d);
     return found;
+}
+
+/* Last path component of a root_path ("/a/b/coder" → "coder"), ignoring
+ * trailing separators. Separators are already normalized to '/'. Returns a
+ * pointer into `tmp` (caller-owned scratch that receives a copy of path). */
+static const char *root_path_basename(const char *path, char *tmp, size_t tmp_sz) {
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    snprintf(tmp, tmp_sz, "%s", path);
+    cbm_normalize_path_sep(tmp);
+    size_t len = strlen(tmp);
+    while (len > 1 && tmp[len - 1] == '/') {
+        tmp[--len] = '\0';
+    }
+    char *slash = strrchr(tmp, '/');
+    const char *base = slash ? slash + 1 : tmp;
+    return base[0] ? base : NULL;
+}
+
+/* Bare project-name resolution (spike S2, follow-up to #704): agents naturally
+ * pass the repo directory's name ("coder") while the indexed project is keyed
+ * on an internal name that only CONTAINS it ("coder-fam", root_path
+ * ".../projects/coder"). The exact-name lookup then fails and every query
+ * tool returns "project not found or not indexed" even though the project is
+ * right there — observed twice on 2026-07-22 (search_code project=coder), and
+ * each miss flipped the whole session back to grep.
+ *
+ * Resolve the mismatch instead of erroring: when the passed name matches no
+ * db directly, scan the cache dir once and adopt the internal name of the
+ * UNIQUE project whose root_path basename or project_alias equals the passed
+ * name. Ambiguous (>1 candidates) and no-match names are returned unchanged
+ * so the existing not-found error (with available_projects) still applies —
+ * a genuine typo never silently picks a project.
+ *
+ * Takes ownership of `project`; returns either `project` itself or a fresh
+ * heap string (old one freed). NULL stays NULL. */
+static char *resolve_bare_project_name(char *project) {
+    if (!project || !project[0]) {
+        return project;
+    }
+
+    /* Fast path: the passed name addresses a db file directly — no scan. */
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    if (db_path[0] && cbm_file_exists(db_path)) {
+        return project;
+    }
+
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        return project;
+    }
+
+    char match[CBM_SZ_1K] = "";
+    int candidates = 0;
+    bool exact = false;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *n = entry->name;
+        size_t len = strlen(n);
+        if (!is_project_db_file(n, len)) {
+            continue;
+        }
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
+        char iname[CBM_SZ_1K];
+        cbm_store_t *st = NULL;
+        if (!db_internal_project_name(full_path, iname, sizeof(iname), &st)) {
+            continue;
+        }
+        if (strcmp(iname, project) == 0) {
+            /* Exact internal-name match (#704 drifted filename): the name is
+             * already right — resolve_store's own fallback scan handles it. */
+            exact = true;
+            cbm_store_close(st);
+            break;
+        }
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(st, iname, &proj) == CBM_STORE_OK) {
+            char tmp[CBM_SZ_2K];
+            const char *base = root_path_basename(proj.root_path, tmp, sizeof(tmp));
+            bool hit = (base && strcmp(base, project) == 0) ||
+                       (proj.project_alias && proj.project_alias[0] &&
+                        strcmp(proj.project_alias, project) == 0);
+            cbm_project_free_fields(&proj);
+            if (hit && strcmp(match, iname) != 0) {
+                candidates++;
+                snprintf(match, sizeof(match), "%s", iname);
+            }
+        }
+        cbm_store_close(st);
+    }
+    cbm_closedir(d);
+
+    if (!exact && candidates == 1 && match[0]) {
+        cbm_log_info("mcp.project_bare_name_resolved", "passed", project, "resolved", match);
+        free(project);
+        return heap_strdup(match);
+    }
+    return project;
 }
 
 static bool family_root_path(char *buf, size_t bufsz, const char *project_name) {

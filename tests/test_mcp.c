@@ -3738,6 +3738,155 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
 }
 #undef ISSUE235_DBNAME
 
+/* ── spike S2 (follow-up to #704): bare directory-name / alias resolution ──
+ *
+ * Agents naturally pass the repo DIRECTORY name ("coder") while the indexed
+ * project key is an internal name that only contains it ("coder-fam",
+ * root_path ".../projects/coder"). Exact-name lookup misses, every query tool
+ * errors "project not found or not indexed", and the session falls back to
+ * grep — observed twice on 2026-07-22 (search_code project=coder).
+ *
+ * Fixture in an isolated CBM_CACHE_DIR:
+ *   - fam-s2.db    : internal "fam-s2", root_path <dir>/projects/webapp-s2
+ *   - alias-s2.db  : internal "alias-s2", project_alias "friendly-s2",
+ *                    root_path <dir>/repos/alias-repo-s2
+ *   - amb1-s2.db / amb2-s2.db : two projects whose root_path basename is the
+ *                    SAME ("dupdir-s2") — ambiguous, must stay not-found
+ *
+ * RED on buggy code / GREEN on the fix:
+ *   A. search_graph(project="webapp-s2")   → resolves to "fam-s2" (basename)
+ *   B. search_graph(project="friendly-s2") → resolves to "alias-s2" (alias)
+ *   C. search_graph(project="fam-s2")      → exact name still works untouched
+ *   D. search_graph(project="dupdir-s2")   → ambiguous → stays not-found
+ *   E. search_graph(project="nope-s2")     → no match → stays not-found
+ */
+
+/* Like issue704_make_db but with a distinct root_path and optional alias. */
+static bool spike_s2_make_db(const char *dir, const char *filename, const char *internal,
+                             const char *root_path, const char *alias, const char *fn) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", dir, filename);
+    cbm_store_t *st = cbm_store_open_path(path);
+    if (!st) {
+        return false;
+    }
+    cbm_project_t proj = {0};
+    proj.name = internal;
+    proj.root_path = root_path;
+    proj.project_alias = alias;
+    bool ok = (cbm_store_upsert_project_ex(st, &proj) == CBM_STORE_OK);
+    if (ok) {
+        char qn[256];
+        snprintf(qn, sizeof(qn), "%s.%s", internal, fn);
+        cbm_node_t n = {0};
+        n.project = internal;
+        n.label = "Function";
+        n.name = fn;
+        n.qualified_name = qn;
+        n.file_path = "main.go";
+        n.start_line = 1;
+        n.end_line = 2;
+        ok = (cbm_store_upsert_node(st, &n) > 0);
+    }
+    cbm_store_close(st);
+    return ok;
+}
+
+static char *spike_s2_search_graph(cbm_mcp_server_t *srv, const char *project,
+                                   const char *name_pattern, int id) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"%s\",\"name_pattern\":\"%s\",\"limit\":5}}}",
+             id, project, name_pattern);
+    return cbm_mcp_server_handle(srv, req);
+}
+
+TEST(tool_resolve_bare_project_name_spike_s2) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-spike-s2-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails — not a signal for this fix */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char root[700];
+    snprintf(root, sizeof(root), "%s/projects/webapp-s2", cache);
+    ASSERT_TRUE(spike_s2_make_db(cache, "fam-s2.db", "fam-s2", root, "", "famFuncS2"));
+
+    snprintf(root, sizeof(root), "%s/repos/alias-repo-s2", cache);
+    ASSERT_TRUE(spike_s2_make_db(cache, "alias-s2.db", "alias-s2", root, "friendly-s2",
+                                 "aliasFuncS2"));
+
+    snprintf(root, sizeof(root), "%s/one/dupdir-s2", cache);
+    ASSERT_TRUE(spike_s2_make_db(cache, "amb1-s2.db", "amb1-s2", root, "", "amb1FuncS2"));
+    snprintf(root, sizeof(root), "%s/two/dupdir-s2", cache);
+    ASSERT_TRUE(spike_s2_make_db(cache, "amb2-s2.db", "amb2-s2", root, "", "amb2FuncS2"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* ── A: bare root_path basename resolves to the internal name ── */
+    char *q = spike_s2_search_graph(srv, "webapp-s2", "famFuncS2", 1);
+    ASSERT_NOT_NULL(q);
+    ASSERT_NOT_NULL(strstr(q, "famFuncS2")); /* RED before: "not found" */
+    ASSERT_NULL(strstr(q, "not found"));
+    free(q);
+
+    /* ── B: project_alias resolves too ── */
+    q = spike_s2_search_graph(srv, "friendly-s2", "aliasFuncS2", 2);
+    ASSERT_NOT_NULL(q);
+    ASSERT_NOT_NULL(strstr(q, "aliasFuncS2")); /* RED before: "not found" */
+    ASSERT_NULL(strstr(q, "not found"));
+    free(q);
+
+    /* ── C: exact internal name is untouched (fast path) ── */
+    q = spike_s2_search_graph(srv, "fam-s2", "famFuncS2", 3);
+    ASSERT_NOT_NULL(q);
+    ASSERT_NOT_NULL(strstr(q, "famFuncS2"));
+    ASSERT_NULL(strstr(q, "not found"));
+    free(q);
+
+    /* ── D: ambiguous basename must NOT silently pick one ── */
+    q = spike_s2_search_graph(srv, "dupdir-s2", ".*", 4);
+    ASSERT_NOT_NULL(q);
+    ASSERT_NOT_NULL(strstr(q, "not found"));
+    free(q);
+
+    /* ── E: a genuine typo stays not-found ── */
+    q = spike_s2_search_graph(srv, "nope-s2", ".*", 5);
+    ASSERT_NOT_NULL(q);
+    ASSERT_NOT_NULL(strstr(q, "not found"));
+    free(q);
+
+    cbm_mcp_server_free(srv);
+
+    /* ── cleanup ── */
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    const char *dbs[] = {"fam-s2.db", "alias-s2.db", "amb1-s2.db", "amb2-s2.db"};
+    for (size_t i = 0; i < sizeof(dbs) / sizeof(dbs[0]); i++) {
+        char p[700];
+        snprintf(p, sizeof(p), "%s/%s", cache, dbs[i]);
+        cbm_unlink(p);
+        char side[740];
+        snprintf(side, sizeof(side), "%s-wal", p);
+        cbm_unlink(side);
+        snprintf(side, sizeof(side), "%s-shm", p);
+        cbm_unlink(side);
+    }
+    cbm_rmdir(cache);
+    PASS();
+}
+
 /* Issue #235 (follow-up): with many long-named projects indexed,
  * collect_db_project_names overflowed projects[CBM_SZ_4K] and truncated the
  * LAST name MID-TOKEN, then clamped offset to out_sz-1 — emitting malformed,
@@ -5642,6 +5791,7 @@ SUITE(mcp) {
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+    RUN_TEST(tool_resolve_bare_project_name_spike_s2);
 
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(tool_index_repository_success_registers_explicit_path_with_watcher);
