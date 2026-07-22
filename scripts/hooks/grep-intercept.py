@@ -85,6 +85,34 @@ def split_pipeline(command):
 
 GREP_RE = re.compile(r"^(grep|rg|egrep|fgrep)$")
 
+# 带值标志：`-A 6` 的 `6` 是标志的值，不是文件/pattern（与 metrics 的
+# GREP_NOFILE_OK 同一套口径）。`--include=*.mjs` 的 `=` 形式自带值，不吃下一个 token。
+VALUED_FLAGS = {
+    "-e", "--regexp", "-f", "--file", "-m", "--max-count", "-A", "-B", "-C",
+    "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not",
+    "--include", "--exclude", "--exclude-dir", "--color", "-d",
+    "--after-context", "--before-context", "--context",
+}
+
+# 重定向 token：`2>/dev/null`、`>out`、`2>&1`、`<in`；裸 `>` / `2>` / `<` 的
+# 目标是下一个 token，需一并跳过。
+REDIR_RE = re.compile(r"^\d*(?:>>|>|<)\S*$")
+
+
+def strip_redirects(toks):
+    out = []
+    skip = False
+    for t in toks:
+        if skip:
+            skip = False
+            continue
+        if REDIR_RE.match(t):
+            if re.match(r"^\d*(?:>>|>|<)$", t):
+                skip = True  # 裸重定向符，目标在下一个 token
+            continue
+        out.append(t)
+    return out
+
 
 def analyze_segment(seg, is_first):
     """返回 'deny' / 'allow'。"""
@@ -92,6 +120,7 @@ def analyze_segment(seg, is_first):
         toks = shlex.split(seg)
     except ValueError:
         toks = seg.split()
+    toks = strip_redirects(toks)
     if not toks:
         return "allow"
     # 跳过 env 赋值与常见包装
@@ -115,8 +144,18 @@ def analyze_segment(seg, is_first):
     if not is_first:
         return "allow"
 
-    flags = [a for a in args if a.startswith("-")]
-    positional = [a for a in args if not a.startswith("-")]
+    flags, positional = [], []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a.startswith("-") and a != "-":
+            flags.append(a)
+            if a in VALUED_FLAGS:
+                skip_next = True  # 带值标志：下一个 token 是它的值
+            continue
+        positional.append(a)
 
     recursive = any(re.match(r"^-[a-zA-Z]*[rR]", f) or f == "--recursive" for f in flags) or any(
         f.startswith("--include") or f.startswith("--exclude") for f in flags

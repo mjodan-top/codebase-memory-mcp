@@ -35,6 +35,24 @@ CASES = [
     ("grep -rn foo src/ | head", True),
     # 链式组内的管道中游 grep 仍放行
     ("cd src && ls -la | grep foo", False),
+    # --- FP 修复回归（带值标志 / 重定向 / $VAR / glob-noncode） ---
+    # -A/-B/-C 的值不是第二个文件：单文件页内精定位照旧放行
+    ('grep -n "NONCODE_PATH_HINTS" -A 6 scripts/metrics/mcp-adoption.py', False),
+    # 链式里组内 grep 段同样不受 -A 值误判影响
+    ("sed -n '135,240p' scripts/metrics/mcp-adoption.py; echo ===; "
+     'grep -n "HINTS" -A 6 scripts/metrics/mcp-adoption.py', False),
+    # 重定向 token 不是文件参数：单文件 + 2>/dev/null 放行
+    ("grep -n close services/matter-service/store.mjs 2>/dev/null", False),
+    # $VAR 前缀路径按 basename 扩展名判 noncode（.md）放行；-h/-i 无参标志不吃 pattern
+    ("grep -i -h postreview $MEM/MEMORY.md 2>/dev/null", False),
+    # glob 展开目标全是 .md noncode：按扩展名豁免；-l 无参标志不吃 pattern
+    ("grep -l -i postreview $MEM/*.md 2>/dev/null", False),
+    # 裸重定向符 `>` 的目标 token 也要跳过
+    ("grep -n foo file.md > /tmp/out.txt", False),
+    # 带值标志修复不放松拦截：-A 值后还有代码 glob 多文件照拦
+    ('grep -n "x" -A 3 src/a.c src/b.c', True),
+    # 重定向剥离后仍是递归扫代码 → 照拦
+    ("grep -rn setStatus src/ 2>/dev/null", True),
 ]
 
 
