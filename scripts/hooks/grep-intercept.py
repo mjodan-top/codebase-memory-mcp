@@ -69,10 +69,18 @@ def is_noncode_target(tok):
 
 
 def split_pipeline(command):
-    """按 shell 管道/连接符粗切成子命令 token 列表的列表。"""
-    # 保守：按 | ; && || 切
-    parts = re.split(r"\|\||&&|;|\|", command)
-    return [p.strip() for p in parts if p.strip()]
+    """两级切分：返回 (segment, is_pipeline_head) 列表。
+
+    `&&` / `;` / `||` 切出的是相互独立的命令组（`cd x && grep …` 的 grep
+    仍是新命令的首段），每组首段都要重新走拦截判定；仅组内 `|` 切出的
+    非首段才算「管道中游过滤」可放行。
+    """
+    out = []
+    for group in re.split(r"\|\||&&|;", command):
+        stages = [s.strip() for s in group.split("|") if s.strip()]
+        for j, seg in enumerate(stages):
+            out.append((seg, j == 0))
+    return out
 
 
 GREP_RE = re.compile(r"^(grep|rg|egrep|fgrep)$")
@@ -147,6 +155,9 @@ def main():
         payload = json.load(sys.stdin)
     except Exception:
         allow()
+    if not isinstance(payload, dict):
+        # 合法 JSON 但非对象（如 [1,2,3]）→ fail-open 放行
+        allow()
     tool = payload.get("tool_name", "")
     if tool != "Bash":
         allow()
@@ -155,10 +166,8 @@ def main():
     if not command:
         allow()
 
-    segments = split_pipeline(command)
-    for idx, seg in enumerate(segments):
-        verdict = analyze_segment(seg, is_first=(idx == 0))
-        if verdict == "deny":
+    for seg, is_head in split_pipeline(command):
+        if analyze_segment(seg, is_first=is_head) == "deny":
             deny(command)
     log({"decision": "allow", "command": command})
     allow()

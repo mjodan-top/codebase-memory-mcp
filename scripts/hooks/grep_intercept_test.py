@@ -27,6 +27,14 @@ CASES = [
     ("cat file.mjs | grep close", False),
     # 非 grep 命令 → 放行
     ('sed -n "500,560p" services/matter-service/store.mjs', False),
+    # 链式命令：&& / ; / || 切出的是新命令组，组首段 grep 照拦
+    ('cd src && grep -rn setStatus .', True),
+    ("make build; rg foo", True),
+    ('true || grep -rn "close" services/', True),
+    # 链式组内首段拦截不受管道影响：首段仍 deny
+    ("grep -rn foo src/ | head", True),
+    # 链式组内的管道中游 grep 仍放行
+    ("cd src && ls -la | grep foo", False),
 ]
 
 
@@ -48,6 +56,18 @@ def run_case(command):
     return decision == "deny"
 
 
+def run_raw(stdin_text):
+    """原始 stdin 直调 hook，返回 (exit_code, stdout)。"""
+    out = subprocess.run(
+        [sys.executable, HOOK],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return out.returncode, out.stdout.strip()
+
+
 def main():
     failed = 0
     for command, expect_deny in CASES:
@@ -56,7 +76,16 @@ def main():
         if got != expect_deny:
             failed += 1
         print(f"[{status}] deny={got} expect={expect_deny} :: {command}")
-    print(f"\n{len(CASES) - failed}/{len(CASES)} passed")
+
+    # 健壮性：合法 JSON 但非 dict → fail-open（exit 0 + "{}"）
+    rc, stdout = run_raw("[1,2,3]")
+    ok = rc == 0 and stdout == "{}"
+    if not ok:
+        failed += 1
+    print(f"[{'ok' if ok else 'FAIL'}] fail-open rc={rc} stdout={stdout!r} :: non-dict JSON [1,2,3]")
+
+    total = len(CASES) + 1
+    print(f"\n{total - failed}/{total} passed")
     sys.exit(1 if failed else 0)
 
 
