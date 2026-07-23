@@ -10,6 +10,15 @@ import sys
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grep-intercept.py")
 
+
+def _ensure_issue49_fixture():
+    """#49 回放样本依赖的 /tmp 目录结构（易失）：缺则重建最小骨架。"""
+    for d in ("/tmp/pr4868/run/services/project-service",):
+        os.makedirs(d, exist_ok=True)
+
+
+_ensure_issue49_fixture()
+
 # (command, expect_deny)
 CASES = [
     # 跨文件扫射 → 拦
@@ -138,6 +147,21 @@ CASES = [
     ("cd /nonexistent-x 2>/dev/null || cd " +
      os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) +
      " 2>/dev/null; grep -rn setStatus src/", True),
+    # --- #49 回归固化：历史误拦（新版 hook 已放行）characterization 回放 ---
+    # 命令逐字节取自 blocked 审计全文（/tmp/cbm-denied-audit.json，16 条去重后
+    # 10 条），expect=allow 以 merged main 回放结果为 approved 值。样本含本机
+    # 绝对路径（~/.coder/memory、~/.local/state 等），属本机锚定 fixture；
+    # /tmp/pr4868 依赖的目录结构由上方 _ensure_issue49_fixture() 兜底重建。
+    ('ls /Users/zkf/.coder/memory/run-solo-company-db83f0d1/ 2>/dev/null | head -50; grep -ril "GH_CONFIG_DIR" /Users/zkf/.coder/memory/run-solo-company-db83f0d1/ 2>/dev/null | head', False),
+    ('sed -n \'135,240p\' ~/work/codebase-memory-mcp/scripts/metrics/mcp-adoption.py; echo ===HINTS===; grep -n "NONCODE_PATH_HINTS\\s*=" -A 6 ~/work/codebase-memory-mcp/scripts/metrics/mcp-adoption.py', False),
+    ('H=~/work/codebase-memory-mcp/scripts/hooks/grep-intercept.py\necho \'--- probe1: 单文件页内 grep + 前置 sed 链\'\necho \'{"tool_name":"Bash","tool_input":{"command":"sed -n \\"135,240p\\" scripts/metrics/mcp-adoption.py; echo ===; grep -n \\"NONCODE_PATH_HINTS\\" -A 6 scripts/metrics/mcp-adoption.py"}}\' | python3 $H\necho \'--- probe2: 单文件 grep 带 -A\'\necho \'{"tool_name":"Bash","tool_input":{"command":"grep -n \\"NONCODE_PATH_HINTS\\" -A 6 scripts/metrics/mcp-adoption.py"}}\' | python3 $H\necho \'--- probe3: 单文件 grep 带重定向\'\necho \'{"tool_name":"Bash","tool_input":{"command":"grep -i -h postreview $MEM/MEMORY.md 2>/dev/null"}}\' | python3 $H\necho \'--- metrics 侧同款\'\ncd ~/work/codebase-memory-mcp && python3 -c "\nimport sys; sys.path.insert(0,\'scripts/metrics\')\nimport importlib.util\nspec=importlib.util.spec_from_file_location(\'m\',\'scripts/metrics/mcp-adoption.py\'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\nfor cmd in [\'grep -i -h postreview \\$MEM/MEMORY.md 2>/dev/null\',\'grep -l -i postreview \\$MEM/*.md 2>/dev/null\',\'grep -n NONCODE_PATH_HINTS -A 6 scripts/metrics/mcp-adoption.py\']:\n    print(repr(cmd), \'->\', m.classify_exec(cmd))\n"', False),
+    ('cd /tmp/pr4868 && awk \'/^  zh: {/,/^  },/\' head-misc.ts | grep -o \'"misc\\.tg\\.[^"]*"\' | sort > zh.keys; awk \'/^  en: {/,/^  },/\' head-misc.ts | grep -o \'"misc\\.tg\\.[^"]*"\' | sort > en.keys; diff zh.keys en.keys && echo KEY_NAME_PARITY_OK; grep -n "^export" head-server.mjs; grep -n "telegram" head-server.mjs | grep -in "publish\\b" ; sed -n \'/async function publish(/,/^}/p\' head-server.mjs | grep -n "telegram\\|inject" ; echo ---; grep -c "misc.tg" zh.keys en.keys', False),
+    ('cd /tmp/pr4868/run/services/project-service && grep -n "telegram" README.md selftest.mjs 2>/dev/null | head; echo ---; cd /Users/zkf/work/solo/run-solo-company && git diff --stat 1667b573f..11ce511db | tail -5', False),
+    ('ls ~/work/solo-wt/fix-4863-stall-guard/projects 2>&1; echo ---; grep -n -e "zero outcome" -e "auto-paused" -e noop_streak ~/work/solo/run-solo-company/projects/coder/codex-rs/core/src/goals.rs | head -20', False),
+    ('cd /tmp/cbm-review-42 && grep -n "is_noncode_target" -A 18 scripts/hooks/grep-intercept.py | head -30', False),
+    ("ls ~/.codex-zkf/scripts/ai-dev/ 2>/dev/null | head; echo ---; ls -d ~/work/RunAI/docs/specs/postreview.md 2>/dev/null; grep -rn 'formal-gh' ~/.codex-zkf/scripts/ai-dev/postreview-artifact-helper.py 2>/dev/null | head -3; python3 ~/.codex-zkf/scripts/ai-dev/postreview-artifact-helper.py 2>&1 | head -8", False),
+    ("grep -o '^[A-Z_]*=' ~/.local/state/runai/public-ai-dev-review/public-ai-dev-review.env ~/.local/state/runai/public-ai-dev-review/public-ai-dev-review-bot-codex_gpt54_xhigh.env; echo ---; python3 ~/.codex-zkf/scripts/ai-dev/postreview-artifact-helper.py --help 2>&1 | head -30", False),
+    ("ls -la ~/.local/state/runai/public-ai-dev-review/; echo ---SEP---; stat -f '%N %SB' ~/.local/state/runai/public-ai-dev-review/* ~/.local/github.env; echo ---SEP---; head -c 400 ~/.local/github.env 2>/dev/null | grep -v -i token; echo ---SEP---; grep -l -i 'esweb168' ~/.local/state/runai/public-ai-dev-review/*.env ~/.local/github.env 2>/dev/null", False),
 ]
 
 # (command, cwd, expect_deny) — 需要 cwd 的用例
