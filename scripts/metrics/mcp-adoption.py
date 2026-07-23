@@ -15,6 +15,10 @@
   - 豁免（两边都不计）：页内精定位（单文件 grep / sed -n 'X,Yp'）；
     非代码文本目标（.log/.toml/.json/.md/...）；握手管理面
     （list_projects/index_status/tools/list/initialize）；管道过滤 `| grep`。
+  - hook 拦截（2026-07-23 新增）：function_call_output 含
+    "blocked by PreToolUse hook" 的 legacy 尝试帧＝被拦、未真执行，
+    单列 legacy_denied 桶，不计 s/S 的 legacy 分母（denied 是纪律在起效，
+    不是 agent 真跑了 grep）。
 
 事件级 S：同会话内相邻检索调用间隔 ≤120s 归并为一个事件，
 按事件内首个跨文件定位动作判 MCP 主导 / legacy 主导。
@@ -316,8 +320,11 @@ def parse_session(path, since, until, seen_call_ids):
     sid = os.path.basename(path)
     meta_ts = None
     forked = False
+    pending_legacy = {}   # call_id -> [calls 下标]，等 output 判 hook 拦截
+    denied_idx = set()    # 被 hook 拦截的 calls 下标（终局剔除）
     for line in open(path, errors="replace"):
-        if '"function_call"' not in line and '"turn_context"' not in line \
+        if '"function_call"' not in line and '"function_call_output"' not in line \
+           and '"turn_context"' not in line \
            and '"session_meta"' not in line and '"forked_history_ref"' not in line:
             continue
         try:
@@ -338,6 +345,14 @@ def parse_session(path, since, until, seen_call_ids):
         if t != "response_item":
             continue
         p = d.get("payload", {})
+        if p.get("type") == "function_call_output":
+            cid = p.get("call_id")
+            idxs = pending_legacy.pop(cid, None)
+            if idxs and "blocked by PreToolUse hook" in str(p.get("output", ""))[:400]:
+                counters["legacy_denied"] += len(idxs)
+                counters["legacy"] -= len(idxs)
+                denied_idx.update(idxs)
+            continue
         if p.get("type") != "function_call":
             continue
         ts = parse_ts(d.get("timestamp", ""))
@@ -383,8 +398,12 @@ def parse_session(path, since, until, seen_call_ids):
             elif kind == "legacy":
                 counters["legacy"] += 1
                 calls.append((ts, "legacy", detail))
+                if cid:
+                    pending_legacy.setdefault(cid, []).append(len(calls) - 1)
             else:
                 counters[kind] += 1
+    if denied_idx:
+        calls = [c for i, c in enumerate(calls) if i not in denied_idx]
     return {"sid": sid, "cwd": cwd, "calls": sorted(calls), "counters": counters}
 
 
@@ -446,6 +465,7 @@ def main():
     N_mcp_jsonl = sum(s["counters"]["mcp_frame"] + s["counters"]["mcp_cli"]
                       for s in sessions)
     N_legacy = sum(s["counters"]["legacy"] for s in sessions)
+    N_denied = sum(s["counters"]["legacy_denied"] for s in sessions)
     # 命令级 s：分子 = daemon 检索 tools/call + cli 直调（cli 不落 daemon 日志）
     n_cli = sum(s["counters"]["mcp_cli"] for s in sessions)
     N_mcp = len(d_search) + n_cli
@@ -495,7 +515,7 @@ def main():
                    "hours": args.hours},
         "s_cmd_level": {"value": s_val, "N_mcp": N_mcp,
                         "N_mcp_daemon_search": len(d_search), "N_mcp_cli": n_cli,
-                        "N_legacy": N_legacy},
+                        "N_legacy": N_legacy, "N_legacy_denied": N_denied},
         "S_episode_level": {"value": S_val, "E_mcp": E_mcp, "E_legacy": E_leg,
                             "episodes": len(all_eps)},
         "daemon": {"rows": len(drows), "search_calls": len(d_search),
@@ -518,6 +538,7 @@ def main():
         "top_legacy_sessions": [
             {"sid": s["sid"], "cwd": s["cwd"],
              "legacy": s["counters"]["legacy"],
+             "legacy_denied": s["counters"]["legacy_denied"],
              "exempt_noncode": s["counters"]["exempt_noncode"],
              "exempt_page": s["counters"]["exempt_page"],
              "mcp": s["counters"]["mcp_frame"] + s["counters"]["mcp_cli"],
@@ -540,7 +561,7 @@ def main():
         sc = w["s_cmd_level"]
         print(f"\n## 命令级 s = {fmt(sc['value'])}  "
               f"(N_mcp={sc['N_mcp']} [daemon {sc['N_mcp_daemon_search']} + cli {sc['N_mcp_cli']}], "
-              f"N_legacy={sc['N_legacy']})")
+              f"N_legacy={sc['N_legacy']}, hook拦截剔除 {sc['N_legacy_denied']})")
         Se = w["S_episode_level"]
         print(f"## 事件级 S = {fmt(Se['value'])}  "
               f"(E_mcp={Se['E_mcp']}, E_legacy={Se['E_legacy']}, 共 {Se['episodes']} 事件)")
@@ -561,7 +582,8 @@ def main():
             print(f"  {k:40s} mcp={v['mcp']:<4d} legacy={v['legacy']:<4d} s={fmt(v['s'])}")
         print("\n## legacy 扫射 Top 会话")
         for t in w["top_legacy_sessions"]:
-            print(f"  legacy={t['legacy']:<3d} mcp={t['mcp']:<3d} 桶={t['bucket']:8s} "
+            print(f"  legacy={t['legacy']:<3d} denied={t['legacy_denied']:<3d} "
+                  f"mcp={t['mcp']:<3d} 桶={t['bucket']:8s} "
                   f"豁免(非代码/页内)={t['exempt_noncode']}/{t['exempt_page']} "
                   f"cwd={os.path.basename(t['cwd']) or '?'} {t['sid'][:60]}")
         # 事件样例
