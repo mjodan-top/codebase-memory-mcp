@@ -63,6 +63,10 @@ CODE_EXT = {".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".go", ".py", ".mjs", ".js
             ".ts", ".tsx", ".jsx", ".java", ".rb", ".sh", ".swift", ".m", ".kt",
             ".cs", ".php", ".lua", ".zig", ".sql"}
 EPISODE_GAP_S = 120  # 事件归并窗口（设计稿 §1.1）
+
+# 远端执行包装（与 hook REMOTE_WRAPPERS 同口径，#47）：段首是这些程序时
+# 参数串在远端 shell 执行，本地索引零覆盖 → exempt_remote，不压 S 分母。
+REMOTE_WRAPPERS = {"ssh", "mosh", "et", "autossh", "tmux"}
 LATENCY_MAX_S = 600  # 指标 2：单 action call→output 超过此值视为异常帧丢弃
 
 # grep/rg 里"pattern 像标识符"：≥3 个 word 字符起步（可含 | 交替、\b 等）
@@ -215,6 +219,9 @@ def classify_search_cmd(seg, piped_before):
         return ("none", "")
     prog = os.path.basename(toks[i])
     args = toks[i + 1:]
+    if prog in REMOTE_WRAPPERS:
+        # 远端执行（ssh/tmux 等）：目标不在本地索引覆盖内，不压 S 分母（#47）
+        return ("exempt_remote", seg.strip()[:120])
     if prog not in ("grep", "egrep", "fgrep", "rg", "sed"):
         return ("none", "")
 
@@ -290,6 +297,15 @@ def classify_exec(cmd):
     'legacy'
     >>> classify_exec("rg -n GoalBudget")[0][0]
     'legacy'
+
+    远端执行豁免（#47，quote-aware 切段 + REMOTE_WRAPPERS）：
+
+    >>> classify_exec("ssh public 'D=/data/x; grep -rl victor $D/src | head'")[0][0]
+    'exempt_remote'
+    >>> classify_exec('tmux send-keys -t w:0 "grep -ril SECRET ~/x/ | head" Enter')[0][0]
+    'exempt_remote'
+    >>> [k for k, _ in classify_exec("ssh h 'grep -r x /r/' && grep -rn setStatus src/")]
+    ['exempt_remote', 'legacy']
     """
     out = []
     m = CLI_SEARCH_RE.search(cmd)
@@ -297,21 +313,40 @@ def classify_exec(cmd):
         out.append(("mcp_cli", m.group(0)))
     elif CLI_ANY_RE.search(cmd):
         out.append(("mcp_cli_mgmt", CLI_ANY_RE.search(cmd).group(0)))
-    # 按分隔符切段，记录每段前是否是管道
+    # 按分隔符切段（quote-aware，与 hook split_pipeline 同口径，#47）：
+    # 引号/转义内的 ; && || | 不切，`ssh public 'a; grep -r x'` 整体一段。
     segs = []
     buf, prev_sep = "", ""
+    q, esc = None, False
     i, n = 0, len(cmd)
     while i < n:
-        two = cmd[i:i + 2]
         ch = cmd[i]
-        if two in ("&&", "||"):
-            segs.append((buf, prev_sep)); buf, prev_sep = "", two; i += 2; continue
+        if esc:
+            buf += ch; esc = False; i += 1; continue
+        if q == "'":
+            if ch == "'":
+                q = None
+            buf += ch; i += 1; continue
+        if q == '"':
+            if ch == "\\":
+                esc = True
+            elif ch == '"':
+                q = None
+            buf += ch; i += 1; continue
+        if ch == "\\":
+            esc = True; buf += ch; i += 1; continue
+        if ch in ("'", '"'):
+            q = ch; buf += ch; i += 1; continue
+        if cmd[i:i + 2] in ("&&", "||"):
+            segs.append((buf, prev_sep)); buf, prev_sep = "", cmd[i:i + 2]; i += 2; continue
         if ch in ";\n":
             segs.append((buf, prev_sep)); buf, prev_sep = "", ch; i += 1; continue
         if ch == "|":
             segs.append((buf, prev_sep)); buf, prev_sep = "", "|"; i += 1; continue
         buf += ch; i += 1
     segs.append((buf, prev_sep))
+    if q is not None:  # 未闭合引号：fail-open，整条按单段
+        segs = [(cmd, "")]
     for seg, sep in segs:
         if not seg.strip():
             continue
@@ -617,7 +652,8 @@ def main():
         "exempt_totals": {
             "page": sum(s["counters"]["exempt_page"] + s["counters"]["sed_page"] for s in sessions),
             "noncode": sum(s["counters"]["exempt_noncode"] for s in sessions),
-            "filter": sum(s["counters"]["exempt_filter"] for s in sessions)},
+            "filter": sum(s["counters"]["exempt_filter"] for s in sessions),
+            "remote": sum(s["counters"]["exempt_remote"] for s in sessions)},
         "dedup": {"skipped_replay": sum(s["counters"]["skipped_replay"] for s in sessions),
                   "skipped_dup_call_id": sum(s["counters"]["skipped_dup"] for s in sessions)},
     }
@@ -654,7 +690,8 @@ def main():
         r = w["reconcile"]
         print(f"## 对账：jsonl MCP 帧 {r['jsonl_mcp_frames']} vs daemon 检索 {r['daemon_search_calls']}（{r['note']}）")
         print(f"## 豁免剔除：页内精定位 {w['exempt_totals']['page']}，"
-              f"非代码文本 {w['exempt_totals']['noncode']}，管道过滤 {w['exempt_totals']['filter']}")
+              f"非代码文本 {w['exempt_totals']['noncode']}，管道过滤 {w['exempt_totals']['filter']}，"
+              f"远端执行 {w['exempt_totals']['remote']}")
         print(f"## 去重：fork 重放跳过 {w['dedup']['skipped_replay']} 帧，"
               f"call_id 重复跳过 {w['dedup']['skipped_dup_call_id']} 帧")
         print("\n## 按 project（cwd）")
