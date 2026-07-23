@@ -4,6 +4,7 @@
 判定规则与 metrics 设计（mcp-adoption-metrics-design）一致：
 - 拦：grep/rg 递归/多文件/glob 扫代码目录（找定义/调用方式的跨文件扫射）
 - 豁免：单文件页内精定位；目标为非代码文本(.log/.toml/.json/.md 等)；纯管道过滤（grep 无文件参数）；
+  项目外目标（解析后不在任何 git 仓库内，如 ~/.local/state/**——索引不覆盖，MCP 替代不了）；
   ls/find/cat 等非 grep 命令一律放行。
 输出协议：stdout JSON（pre-tool-use.command.output schema），deny 走
 hookSpecificOutput.permissionDecision="deny" + permissionDecisionReason。
@@ -44,7 +45,7 @@ def allow():
     sys.exit(0)
 
 
-def deny(cmd):
+def deny(cmd, cwd=""):
     out = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -52,9 +53,40 @@ def deny(cmd):
             "permissionDecisionReason": REDIRECT,
         }
     }
-    log({"decision": "deny", "command": cmd})
+    log({"decision": "deny", "command": cmd, "cwd": cwd})
     print(json.dumps(out, ensure_ascii=False))
     sys.exit(0)
+
+
+def resolve_target(tok, cwd):
+    """展开 ~ / $VAR，相对路径按 cwd 拼接；无法确定则返回 None。"""
+    t = os.path.expandvars(os.path.expanduser(tok))
+    if "$" in t:
+        return None  # 未定义变量展不开，无法判定
+    if not os.path.isabs(t):
+        if not cwd:
+            return None
+        t = os.path.join(cwd, t)
+    return os.path.normpath(t)
+
+
+def is_outside_git_repo(path):
+    """路径存在且向上走到根都无 .git → 在任何 git 仓库之外（索引不覆盖）。
+
+    不存在的路径返回 False（无法确认，走常规判定）。
+    """
+    p = path
+    if not os.path.exists(p):
+        return False
+    if not os.path.isdir(p):
+        p = os.path.dirname(p) or "/"
+    while True:
+        if os.path.exists(os.path.join(p, ".git")):
+            return False
+        parent = os.path.dirname(p)
+        if parent == p:
+            return True
+        p = parent
 
 
 def is_noncode_target(tok):
@@ -114,7 +146,28 @@ def strip_redirects(toks):
     return out
 
 
-def analyze_segment(seg, is_first):
+def _glob_prefix_dir(tok):
+    """glob token 取无通配前缀目录（`~/x/*.py` → `~/x`）。"""
+    m = re.search(r"[*?\[]", tok)
+    head = tok[: m.start()] if m else tok
+    return head.rsplit("/", 1)[0] if "/" in head else ""
+
+
+def targets_all_outside_repo(file_args, cwd):
+    """全部目标都能解析且都在 git 仓库之外 → True（索引不覆盖，放行）。"""
+    if not file_args:
+        return False
+    for f in file_args:
+        tok = _glob_prefix_dir(f) if any(ch in f for ch in "*?[") else f
+        if not tok:
+            return False
+        p = resolve_target(tok, cwd)
+        if p is None or not is_outside_git_repo(p):
+            return False
+    return True
+
+
+def analyze_segment(seg, is_first, cwd=""):
     """返回 'deny' / 'allow'。"""
     try:
         toks = shlex.split(seg)
@@ -169,11 +222,18 @@ def analyze_segment(seg, is_first):
     if not file_args:
         # 无文件参数：grep 是读 stdin（管道过滤，放行）；rg 是递归扫 cwd（拦，除非上面已判非首段）
         if is_rg or recursive:
+            # cwd 本身在任何 git 仓库之外（索引不覆盖）→ 放行
+            if cwd and is_outside_git_repo(cwd) and os.path.isdir(cwd):
+                return "allow"
             return "deny"
         return "allow"
 
     # 全部目标是非代码文本 → 放行
     if all(is_noncode_target(f) for f in file_args):
+        return "allow"
+
+    # 全部目标解析后都在 git 仓库之外（如 ~/.local/state/**）→ 索引不覆盖，放行
+    if targets_all_outside_repo(file_args, cwd):
         return "allow"
 
     # 单个具体文件（无通配、非目录样式）→ 页内精定位，放行
@@ -204,10 +264,18 @@ def main():
     command = cmd.get("command", "") if isinstance(cmd, dict) else ""
     if not command:
         allow()
+    cwd = payload.get("cwd", "") or (cmd.get("cwd", "") if isinstance(cmd, dict) else "")
 
     for seg, is_head in split_pipeline(command):
-        if analyze_segment(seg, is_first=is_head) == "deny":
-            deny(command)
+        # 追踪链内 `cd <path>`：后续段的相对路径/rg-无参按新 cwd 判定
+        m = re.match(r"^cd\s+(\S+)\s*$", seg)
+        if m:
+            nxt = resolve_target(m.group(1), cwd)
+            if nxt:
+                cwd = nxt
+            continue
+        if analyze_segment(seg, is_first=is_head, cwd=cwd) == "deny":
+            deny(command, cwd)
     log({"decision": "allow", "command": command})
     allow()
 

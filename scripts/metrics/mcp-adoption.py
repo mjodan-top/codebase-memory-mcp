@@ -138,11 +138,39 @@ def _strip_redirects(toks):
     return out
 
 
+def _outside_git_repo(tok):
+    """~/$HOME 绝对路径存在且向上无 .git → 项目外（索引不覆盖），与 hook 同口径。
+
+    相对路径/不存在的路径返回 False（历史命令无 cwd 可靠展开，保守不豁免）。
+    """
+    t = os.path.expandvars(os.path.expanduser(tok))
+    if "$" in t or not os.path.isabs(t):
+        return False
+    m = re.search(r"[*?\[]", t)
+    if m:
+        head = t[: m.start()]
+        t = head.rsplit("/", 1)[0] if "/" in head else ""
+        if not t:
+            return False
+    if not os.path.exists(t):
+        return False
+    p = t if os.path.isdir(t) else (os.path.dirname(t) or "/")
+    while True:
+        if os.path.exists(os.path.join(p, ".git")):
+            return False
+        parent = os.path.dirname(p)
+        if parent == p:
+            return True
+        p = parent
+
+
 def _path_kind(tok, cwd=""):
     """返回 'code' / 'noncode' / 'dir' / 'unknown'。"""
     t = tok.rstrip("/")
     low = tok.lower()
     if any(h.lower() in low for h in NONCODE_PATH_HINTS):
+        return "noncode"
+    if _outside_git_repo(tok):
         return "noncode"
     base = os.path.basename(t)
     _, ext = os.path.splitext(base)
