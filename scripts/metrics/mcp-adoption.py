@@ -359,6 +359,9 @@ def parse_session(path, since, until, seen_call_ids):
     pending_legacy = {}   # call_id -> [calls 下标]，等 output 判 hook 拦截
     denied_idx = set()    # 被 hook 拦截的 calls 下标（终局剔除）
     pending_lat = {}      # call_id -> (call_ts, kind)，等 output 算单 action 耗时
+                          # 归属规则：一条多段 cmd 只按第一个搜索段的 kind 记整帧墙钟，
+                          # 含帧内非搜索段（如 `cargo test && grep …` 的 build 时间）——
+                          # legacy 桶解读时带此 caveat
     latencies = []        # (kind, seconds)  指标 2：call→output 墙钟差
     for line in open(path, errors="replace"):
         if '"function_call"' not in line and '"function_call_output"' not in line \
