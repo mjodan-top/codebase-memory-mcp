@@ -22,6 +22,13 @@ NONCODE_EXT = {
     ".lock", ".cfg", ".ini", ".err", ".out", ".csv",
 }
 
+# 记忆/会话档根（#48）：这些目录可能自带 .git（版本化只为审计），
+# 「是 git 仓」不等于「是代码仓」——按第一性（索引不覆盖 + 非代码）显式豁免。
+NONCODE_ROOTS = (
+    "~/.agents/memory", "~/.coder/memory", "~/.coder/subagent-archive",
+    "~/.claude/projects",
+)
+
 REDIRECT = (
     "grep/rg 跨文件扫代码被仓库纪律拦截：请改用 codebase-memory MCP 索引 — "
     "先调用 tool_search 拉取 codebase-memory 工具（如果工具面还没有），"
@@ -99,10 +106,61 @@ def is_noncode_target(tok):
     for ext in NONCODE_EXT:
         if t.endswith(ext):
             return True
-    # 日志/配置目录关键词
-    if any(k in t for k in ("/logs/", "daemon.err", "/log/", ".codex", ".coder")):
+    # 日志/配置/记忆/会话档目录关键词（#48 补记忆仓与会话档形态）
+    if any(k in t for k in ("/logs/", "daemon.err", "/log/", ".codex", ".coder",
+                            "/memory/", ".agents/memory", "/sessions/",
+                            "subagent-archive", ".claude/projects",
+                            "history.jsonl")):
+        return True
+    # 文档目录（docs 树 = markdown 文档，非代码，#48）
+    d = t.rstrip("/")
+    if d == "docs" or d.endswith("/docs") or t.startswith("docs/") or "/docs/" in t:
         return True
     return False
+
+
+def in_noncode_root(path):
+    """解析后的绝对路径落在记忆/会话档根内（#48）。先 realpath 防 symlink 绕过。"""
+    p = os.path.realpath(path)
+    for root in NONCODE_ROOTS:
+        r = os.path.realpath(os.path.expanduser(root))
+        if p == r or p.startswith(r + os.sep):
+            return True
+    return False
+
+
+# 命令内静态赋值（#48）：`hf="$h/history.jsonl"; grep -n x "$hf"` 的 $hf
+# 目标在同一条命令里有字面值，做纯文本代换后再判 noncode/ext——不执行任何
+# 命令替换（ShellCheck 同款静态边界），解不开仍从严。
+ASSIGN_RE = re.compile(
+    r"(?:^|[;&|(]\s*|\b(?:do|then|else)\s+|\s)"
+    r"([A-Za-z_][A-Za-z0-9_]*)="
+    r"(\"[^\"]*\"|'[^']*'|\$\([^)]*\)|[^\s;|&]+)")
+
+VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def collect_assignments(command):
+    env = {}
+    for m in ASSIGN_RE.finditer(command):
+        val = m.group(2)
+        if val[:1] in "\"'" and val[-1:] == val[:1]:
+            val = val[1:-1]
+        env[m.group(1)] = val
+    return env
+
+
+def expand_assigned(tok, env):
+    """用命令内赋值做文本代换（最多 3 层，防自引用循环）。"""
+    if not env or "$" not in tok:
+        return tok
+    for _ in range(3):
+        new = VAR_RE.sub(
+            lambda m: env.get(m.group(1) or m.group(2), m.group(0)), tok)
+        if new == tok:
+            break
+        tok = new
+    return tok
 
 
 def split_pipeline(command):
@@ -222,8 +280,12 @@ def _glob_prefix_dir(tok):
     return head.rsplit("/", 1)[0] if "/" in head else ""
 
 
-def targets_all_outside_repo(file_args, cwd):
-    """全部目标都能解析且都在 git 仓库之外 → True（索引不覆盖，放行）。"""
+def targets_all_unindexed(file_args, cwd):
+    """全部目标都能解析且都在索引覆盖之外 → True（放行）。
+
+    「之外」= 不在任何 git 仓库内（PR #44），或落在记忆/会话档根
+    NONCODE_ROOTS 内（#48：记忆仓可能自带 .git，「是 git 仓」≠「是代码仓」）。
+    """
     if not file_args:
         return False
     for f in file_args:
@@ -231,12 +293,14 @@ def targets_all_outside_repo(file_args, cwd):
         if not tok:
             return False
         p = resolve_target(tok, cwd)
-        if p is None or not is_outside_git_repo(p):
+        if p is None:
+            return False
+        if not is_outside_git_repo(p) and not in_noncode_root(p):
             return False
     return True
 
 
-def analyze_segment(seg, is_first, cwd=""):
+def analyze_segment(seg, is_first, cwd="", env=None):
     """返回 'deny' / 'allow'。"""
     try:
         toks = shlex.split(seg)
@@ -288,14 +352,26 @@ def analyze_segment(seg, is_first, cwd=""):
     # rg 默认递归：rg pattern [path...]，无文件或给目录都算递归
     is_rg = prog == "rg"
 
-    # 文件参数（pattern 之后）
+    # 文件参数（pattern 之后）；命令内静态赋值先做文本代换（#48：
+    # `hf="$h/history.jsonl"; grep -n x "$hf"` 的 $hf 有同命令字面值）
     file_args = positional[1:] if positional else []
+    if env:
+        file_args = [expand_assigned(f, env) for f in file_args]
+
+    # --include=GLOB 把匹配面完全限定（GNU grep 语义）：全部 include glob
+    # 都是非代码扩展名 → 内容面为非代码文本，放行（#48）
+    include_globs = [f.split("=", 1)[1] for f in flags
+                     if f.startswith("--include=") and "=" in f]
+    if include_globs and all(
+            os.path.splitext(g)[1].lower() in NONCODE_EXT for g in include_globs):
+        return "allow"
 
     if not file_args:
         # 无文件参数：grep 是读 stdin（管道过滤，放行）；rg 是递归扫 cwd（拦，除非上面已判非首段）
         if is_rg or recursive:
-            # cwd 本身在任何 git 仓库之外（索引不覆盖）→ 放行
-            if cwd and is_outside_git_repo(cwd) and os.path.isdir(cwd):
+            # cwd 本身在索引覆盖之外（仓外 / 记忆根）→ 放行
+            if cwd and os.path.isdir(cwd) and (
+                    is_outside_git_repo(cwd) or in_noncode_root(cwd)):
                 return "allow"
             return "deny"
         return "allow"
@@ -304,8 +380,8 @@ def analyze_segment(seg, is_first, cwd=""):
     if all(is_noncode_target(f) for f in file_args):
         return "allow"
 
-    # 全部目标解析后都在 git 仓库之外（如 ~/.local/state/**）→ 索引不覆盖，放行
-    if targets_all_outside_repo(file_args, cwd):
+    # 全部目标解析后都在索引覆盖之外（仓外 ~/.local/state/**、记忆/会话档根）→ 放行
+    if targets_all_unindexed(file_args, cwd):
         return "allow"
 
     # 单个具体文件（无通配、非目录样式）→ 页内精定位，放行
@@ -338,18 +414,24 @@ def main():
         allow()
     cwd = payload.get("cwd", "") or (cmd.get("cwd", "") if isinstance(cmd, dict) else "")
 
+    env = collect_assignments(command)
     for seg, is_head in split_pipeline(command):
-        # 追踪链内 `cd <path>`：后续段的相对路径/rg-无参按新 cwd 判定
-        m = re.match(r"^cd\s+(\S+)\s*$", seg)
-        if m:
-            # 解析不了（$UNDEF 等）→ cwd 置空从严：陈旧仓外 cwd 不得给后续段背书
-            cwd = resolve_target(m.group(1), cwd) or ""
-            continue
+        # 追踪链内 `cd <path>`：后续段的相对路径/rg-无参按新 cwd 判定。
+        # #48：先剥重定向再解析（`cd X 2>/dev/null || cd …` fallback 链），
+        # 支持 `cd -- <path>` 与带引号路径；参数含 $UNDEF / $(…) 命令替换
+        # 等解析不了 → cwd 置空从严：陈旧仓外 cwd 不得给后续段背书。
         if re.match(r"^cd(\s|$)", seg):
-            # cd 形态跟踪不了（带引号路径 / `cd --` / 多参数）→ cwd 不可知，置空从严
-            cwd = ""
+            try:
+                ctoks = strip_redirects(shlex.split(seg))
+            except ValueError:
+                ctoks = []
+            cargs = [t for t in ctoks[1:] if t != "--"]
+            if len(cargs) == 1:
+                cwd = resolve_target(expand_assigned(cargs[0], env), cwd) or ""
+            else:
+                cwd = ""
             continue
-        if analyze_segment(seg, is_first=is_head, cwd=cwd) == "deny":
+        if analyze_segment(seg, is_first=is_head, cwd=cwd, env=env) == "deny":
             deny(command, cwd)
     log({"decision": "allow", "command": command})
     allow()
