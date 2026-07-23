@@ -28,6 +28,18 @@ function_call → function_call_output 墙钟差，mcp / legacy 各一桶；
 hook-denied 帧不计（拦截返回不是真实检索耗时），负值/超 600s 的
 异常差值丢弃（时钟回拨、跨压缩残帧）。这是 agent 视角的单动作等待，
 与 daemon 侧 duration_ms（纯服务端）互为对照。
+
+指标 3 —— hook 误判率（2026-07-23 新增，次要指标）：窗口内被 hook
+拦截（denied）的命令逐条按**当前版本** hook 回放，allow ⇒ 该 deny 在
+现行规则下属误拦（FP）。rate = FP / 回放成功数，目标线 < 5%
+（FP_TARGET，#47/#48/#49 修完后持续达标）。语义：修复合入后，历史
+误拦回放转 allow → rate 先升后随窗口滚动清零；稳态下新增 deny 都是
+现行规则的产物，rate ≈ 0 即无已知误拦形态。
+辅助诊断 classifier_disagree（不进 rate）：回放仍 deny 但 metrics 自身
+classify_exec 不判 legacy 的条数——独立第二意见，用来在 hook 修复
+**之前**暴露候选新 FP 形态（如 ssh 远端/非代码残漏）；含 tmpclone
+（/tmp 克隆代码，hook 按设计拦、metrics 记 noncode）这类口径灰区，
+所以只作分诊线索，不做达标判据。
 """
 import argparse
 import glob
@@ -35,6 +47,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -68,6 +81,9 @@ EPISODE_GAP_S = 120  # 事件归并窗口（设计稿 §1.1）
 # 参数串在远端 shell 执行，本地索引零覆盖 → exempt_remote，不压 S 分母。
 REMOTE_WRAPPERS = {"ssh", "mosh", "et", "autossh", "tmux"}
 LATENCY_MAX_S = 600  # 指标 2：单 action call→output 超过此值视为异常帧丢弃
+FP_TARGET = 0.05     # 指标 3：hook 误判率目标线（#47/#48/#49 修完后 <5%）
+REPLAY_TIMEOUT_S = 10   # 指标 3：单条回放超时（与 hook 自身 timeout 对齐）
+REPLAY_MAX = 400        # 指标 3：单次统计回放上限（防日志爆量拖死报表）
 
 # grep/rg 里"pattern 像标识符"：≥3 个 word 字符起步（可含 | 交替、\b 等）
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
@@ -398,6 +414,8 @@ def parse_session(path, since, until, seen_call_ids):
                           # 含帧内非搜索段（如 `cargo test && grep …` 的 build 时间）——
                           # legacy 桶解读时带此 caveat
     latencies = []        # (kind, seconds)  指标 2：call→output 墙钟差
+    pending_cmd = {}      # call_id -> 完整原始 cmd（等 output 判 denied 后供指标 3 回放）
+    denied_cmds = []      # (ts_iso, cmd, cwd)  指标 3：被拦命令 + 当时 cwd
     for line in open(path, errors="replace"):
         if '"function_call"' not in line and '"function_call_output"' not in line \
            and '"turn_context"' not in line \
@@ -425,11 +443,17 @@ def parse_session(path, since, until, seen_call_ids):
             cid = p.get("call_id")
             denied = False
             idxs = pending_legacy.pop(cid, None)
-            if idxs and "blocked by PreToolUse hook" in str(p.get("output", ""))[:400]:
+            blocked = "blocked by PreToolUse hook" in str(p.get("output", ""))[:400]
+            if idxs and blocked:
                 counters["legacy_denied"] += len(idxs)
                 counters["legacy"] -= len(idxs)
                 denied_idx.update(idxs)
                 denied = True
+            # 指标 3：凡被 hook 拦的 exec 帧都入回放桶（不限 metrics 是否判 legacy——
+            # hook 的拦截面比 legacy 分类宽，ssh/噪声形态也要算误判率分母）
+            dcmd = pending_cmd.pop(cid, None)
+            if blocked and dcmd is not None:
+                denied_cmds.append((d.get("timestamp", ""), dcmd, cwd))
             lat = pending_lat.pop(cid, None)
             if lat is not None and not denied:
                 t0, lkind = lat
@@ -477,6 +501,10 @@ def parse_session(path, since, until, seen_call_ids):
         cmd = a.get("cmd") or a.get("command") or ""
         if not cmd:
             continue
+        if cid:
+            # 指标 3：所有 exec 帧都留底——hook 拦截面比 legacy 分类宽
+            # （ssh/噪声形态 metrics 不判 legacy 但也会被拦），output 时弹出
+            pending_cmd.setdefault(cid, cmd)
         for kind, detail in classify_exec(cmd):
             if kind == "mcp_cli":
                 counters["mcp_cli"] += 1
@@ -496,7 +524,56 @@ def parse_session(path, since, until, seen_call_ids):
     if denied_idx:
         calls = [c for i, c in enumerate(calls) if i not in denied_idx]
     return {"sid": sid, "cwd": cwd, "calls": sorted(calls), "counters": counters,
-            "latencies": latencies}
+            "latencies": latencies, "denied_cmds": denied_cmds}
+
+
+# ---------------- 指标 3：hook 误判率（denied 回放） ----------------
+HOOK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "hooks", "grep-intercept.py")
+
+
+def replay_denied(denied, hook_path=None, timeout=REPLAY_TIMEOUT_S, limit=REPLAY_MAX):
+    """把窗口内被拦命令逐条喂当前版本 hook + classify_exec 双判据，统计误拦率。
+
+    FP（进 rate）= 回放 allow。classifier_disagree（不进 rate，诊断用）=
+    回放仍 deny 但 metrics classify_exec 不判 legacy 的条数（候选新 FP 形态）。
+    返回 dict：n_denied / replayed / fp / tp / classifier_disagree /
+    errors（回放失败不计分母）/ rate（fp/replayed）/ samples。
+    """
+    res = {"n_denied": len(denied), "replayed": 0, "fp": 0, "tp": 0,
+           "classifier_disagree": 0,
+           "errors": 0, "rate": None, "target": FP_TARGET, "samples": []}
+    hook = hook_path or HOOK_PATH
+    if not denied:
+        return res
+    hook_ok = os.path.exists(hook)
+    for ts, cmd, cwd in denied[:limit]:
+        if hook_ok:
+            payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+            if cwd:
+                payload["cwd"] = cwd
+            try:
+                r = subprocess.run([sys.executable, hook], input=json.dumps(payload),
+                                   capture_output=True, text=True, timeout=timeout)
+                deny = '"deny"' in (r.stdout or "") or "'deny'" in (r.stdout or "")
+            except Exception:
+                res["errors"] += 1
+                continue
+        else:
+            res["errors"] += 1
+            continue
+        res["replayed"] += 1
+        if not deny:
+            res["fp"] += 1
+            if len(res["samples"]) < 8:
+                res["samples"].append({"ts": ts, "cwd": cwd, "cmd": cmd[:160]})
+        else:
+            res["tp"] += 1
+            if not any(k == "legacy" for k, _ in classify_exec(cmd)):
+                res["classifier_disagree"] += 1
+    if res["replayed"]:
+        res["rate"] = res["fp"] / res["replayed"]
+    return res
 
 
 # ---------------- 事件归并 ----------------
@@ -530,6 +607,8 @@ def main():
                     help="可多次；默认 ~/.codex/sessions 与 ~/.coder/sessions")
     ap.add_argument("--samples", type=int, default=5, help="事件级归并样例数")
     ap.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    ap.add_argument("--no-replay", action="store_true",
+                    help="跳过指标 3 denied 回放（回放要逐条起 hook 子进程，量大时可关）")
     args = ap.parse_args()
 
     until = datetime.now(timezone.utc)
@@ -613,6 +692,16 @@ def main():
                 "p50_s": round(pctl(xs, .5), 3), "p90_s": round(pctl(xs, .9), 3),
                 "max_s": round(max(xs), 3)}
 
+    # 指标 3：hook 误判率（denied 回放，--no-replay 可跳过）
+    all_denied = [dc for s in sessions for dc in s.get("denied_cmds", [])]
+    if args.no_replay:
+        fp_replay = {"n_denied": len(all_denied), "replayed": 0, "fp": 0, "tp": 0,
+                     "classifier_disagree": 0,
+                     "errors": 0, "rate": None, "target": FP_TARGET,
+                     "samples": [], "skipped": True}
+    else:
+        fp_replay = replay_denied(all_denied)
+
     report = {
         "window": {"since": since.isoformat(), "until": until.isoformat(),
                    "hours": args.hours},
@@ -624,6 +713,10 @@ def main():
         "action_latency": {"mcp": lat_stats(lat_mcp), "legacy": lat_stats(lat_leg),
                            "note": f"call→output 墙钟（agent 视角）；denied 剔除；"
                                    f">{LATENCY_MAX_S}s 异常帧丢弃"},
+        "hook_fp_rate": dict(
+            fp_replay,
+            note=f"窗口内 denied 按当前 hook 回放，allow=误拦(FP)；"
+                 f"目标 <{FP_TARGET*100:.0f}%（#47/#48/#49 修复后）"),
         "daemon": {"rows": len(drows), "search_calls": len(d_search),
                    "mgmt": len(d_mgmt), "other": len(d_other),
                    "errors": len(d_err),
@@ -681,6 +774,19 @@ def main():
                     f"p50={b['p50_s']:.2f}s p90={b['p90_s']:.2f}s max={b['max_s']:.1f}s")
         print(f"## 指标2 每 action 耗时（call→output）  "
               f"mcp: {lfmt(al['mcp'])}  |  legacy: {lfmt(al['legacy'])}")
+        fpq = w["hook_fp_rate"]
+        if fpq.get("skipped"):
+            print(f"## 指标3 hook 误判率 = 跳过（--no-replay），denied {fpq['n_denied']} 条")
+        else:
+            mark = ""
+            if fpq["rate"] is not None:
+                mark = "  ✅达标" if fpq["rate"] < fpq["target"] else "  ⚠️超标"
+            print(f"## 指标3 hook 误判率 = {fmt(fpq['rate'])}（目标 <{fpq['target']*100:.0f}%）"
+                  f"{mark}  denied={fpq['n_denied']} 回放={fpq['replayed']} "
+                  f"FP={fpq['fp']} 仍拦={fpq['tp']} 回放失败={fpq['errors']}；"
+                  f"分类器异议 {fpq['classifier_disagree']}（诊断线索，不进 rate）")
+            for smp in fpq["samples"]:
+                print(f"      FP样本 {smp['ts'][:19]} :: {smp['cmd'][:110]}")
         sl = w["slot"]
         print(f"## slot 加载率 = {fmt(sl['rate'])}  ({sl['loaded']}/{sl['active_sessions']} 个有检索活动的会话)")
         d = w["daemon"]
