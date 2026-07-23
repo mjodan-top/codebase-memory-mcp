@@ -64,6 +64,48 @@ CASES = [
     ("grep -rn foo ~/.local/state/ src/", True),
     # 不存在的仓库外路径：无法确认 → 照常规判定（递归扫 → 拦）
     ("grep -rn foo /nonexistent-dir-xyz/", True),
+    # --- #47 远端执行豁免（quote-aware 切段 + REMOTE_WRAPPERS）：6 条审计样本回放 ---
+    ('tmux send-keys -t esweb168:0 "cat ~/.config/systemd/user/container-solo-github.service; '
+     "echo ---; ls ~/.runai/ 2>/dev/null; grep -ril 'CLIENT_SECRET\\\\|client_secret' ~/.runai/ "
+     '~/data/ /data/solo 2>/dev/null | grep -v node_modules | head -20; echo ===D3===" Enter; '
+     'timeout 60 bash -c "until tmux capture-pane -p -t esweb168:0 | grep -q \'===D3===\'; '
+     'do sleep 2; done"; tmux capture-pane -p -t esweb168:0 | tail -45', False),
+    ("tmux send-keys -t esweb168:0 'sed -E \"s/(SECRET=).{6}.*/\\\\1<redacted-old>/\" "
+     "/data/solo-releases/shared/secrets/forge-oauth.env; echo ---WHOUSES---; for u in solo-broker "
+     "solo-agent-bridge solo-matter solo-project solo-share-broker; do systemctl --user cat $u "
+     "2>/dev/null | grep -l forge-oauth >/dev/null; done; grep -c forge-oauth "
+     "~/.config/systemd/user/*.service 2>/dev/null | grep -v \":0\"; echo ===D9===' Enter; "
+     "timeout 60 bash -c \"until tmux capture-pane -p -t esweb168:0 | grep -q '===D9==='; "
+     "do sleep 2; done\"; tmux capture-pane -p -t esweb168:0 | sed -n "
+     "'/---WHOUSES---/,$p; /forge-oauth.env; echo/,$p' | tail -25", False),
+    ("ssh public 'D=/data/solo-releases/coder-gateway/current/coder-proxy; "
+     'grep -rl "victor.annie" $D/config $D/secrets $D/src 2>/dev/null | head; '
+     "ls $D/config 2>/dev/null | head -30; ls $D/secrets 2>/dev/null | head -20'", False),
+    ("ssh public 'systemctl show -p User,Group,Environment runai-coder-gateway@18796 | head -5; "
+     "D=/data/solo-releases/coder-gateway/current/coder-proxy; "
+     'grep -n "\\.runai\\|dbPath\\|DB_PATH\\|coder-pool" $D/src/coder-pool/store-sqlite.ts | head -10; '
+     'grep -rn "victor.annie\\|6164" /data/solo-state/gate-telemetry/events.jsonl 2>/dev/null '
+     "| head -3 | cut -c1-300'", False),
+    ("ssh public 'D=/data/solo-releases/coder-gateway/current/coder-proxy; "
+     'grep -n "entryUsedPercent" $D/src/coder-pool/*.ts | head; echo ===; '
+     "sed -n \"590,700p\" $D/src/coder-pool/lease.ts'", False),
+    ("ssh public 'for d in 21 22; do echo \"== 07-$d distinct serving creds:\"; "
+     "journalctl -u runai-coder-gateway@18796 -u runai-coder-gateway@18793 "
+     '--since "2026-07-$d 00:00" --until "2026-07-$d 23:59" --no-pager 2>/dev/null | '
+     'grep -o "serving_credential_fp\\":\\"[a-f0-9]*" | sort -u | wc -l; done; '
+     "D=/data/solo-releases/coder-gateway/current/coder-proxy; "
+     'grep -n "SOFT_QUOTA_PERCENT =\\|EXHAUSTED_QUOTA_PERCENT =" $D/src/coder-pool/lease.ts\'', False),
+    # --- #47 反向用例：远端豁免绝不放松本地纪律 ---
+    # 顶层 && 在引号外照切：第二段本地跨文件 grep 仍拦
+    ("ssh host 'grep -r x /remote/dir' && grep -rn y src/", True),
+    # 顶层 ; 在引号外照切：本地递归 grep 照拦
+    ('tmux send-keys -t s "grep -r foo /r/" Enter; grep -rn bar services/', True),
+    # 引号内 pattern 含 | / ; 的本地跨文件 grep：quote-aware 后仍整段判定 → 照拦
+    ("grep -rn 'setStatus|close;done' src/", True),
+    # 引号内含 ; 的单文件页内 grep：不再被误切，照常放行
+    ("grep -n 'a;b|c' services/matter-service/store.mjs", False),
+    # 未闭合引号 fail-open：整条按单段（段首 ssh → 放行），hook 不崩
+    ("ssh public 'grep -rl x $D/src", False),
 ]
 
 # (command, cwd, expect_deny) — 需要 cwd 的用例

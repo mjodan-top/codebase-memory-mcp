@@ -106,21 +106,85 @@ def is_noncode_target(tok):
 
 
 def split_pipeline(command):
-    """两级切分：返回 (segment, is_pipeline_head) 列表。
+    """quote-aware 两级切分：返回 (segment, is_pipeline_head) 列表。
 
     `&&` / `;` / `||` 切出的是相互独立的命令组（`cd x && grep …` 的 grep
     仍是新命令的首段），每组首段都要重新走拦截判定；仅组内 `|` 切出的
     非首段才算「管道中游过滤」可放行。
+
+    引号/转义内的分隔符不切（#47 根因修复）：`ssh public 'a; grep -r x'`
+    的 `;` 是 ssh 参数字符串的一部分，切开会把远端 grep 误判成本地段。
+    口径同 stdlib shlex punctuation_chars 的引号保护语义（"different quote
+    types protect each other as in the shell"），此处手写扫描以保留段原文。
+    未闭合引号 → fail-open：整条按单段返回（hook 决不能崩成阻断）。
     """
-    out = []
-    for group in re.split(r"\|\||&&|;", command):
-        stages = [s.strip() for s in group.split("|") if s.strip()]
-        for j, seg in enumerate(stages):
-            out.append((seg, j == 0))
-    return out
+    parts = []  # (text, sep_before)
+    buf = []
+    sep = ""
+    q = None      # 当前引号态: None / "'" / '"'
+    esc = False   # 上一字符是反斜杠（裸态或双引号内）
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if esc:
+            buf.append(ch)
+            esc = False
+            i += 1
+            continue
+        if q == "'":
+            if ch == "'":
+                q = None
+            buf.append(ch)
+            i += 1
+            continue
+        if q == '"':
+            if ch == "\\":
+                esc = True
+            elif ch == '"':
+                q = None
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            esc = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            q = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if command[i:i + 2] in ("&&", "||"):
+            parts.append(("".join(buf), sep))
+            buf, sep = [], command[i:i + 2]
+            i += 2
+            continue
+        if ch in ";\n":
+            parts.append(("".join(buf), sep))
+            buf, sep = [], ";"
+            i += 1
+            continue
+        if ch == "|":
+            parts.append(("".join(buf), sep))
+            buf, sep = [], "|"
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append(("".join(buf), sep))
+    if q is not None:
+        return [(command.strip(), True)]
+    return [(t.strip(), s != "|") for t, s in parts if t.strip()]
 
 
 GREP_RE = re.compile(r"^(grep|rg|egrep|fgrep)$")
+
+# 远端执行包装：段首是这些程序时，其参数串是远端 shell 的输入（ShellCheck
+# SC2029 同法理），远端文件本地索引零覆盖 → 整段放行（issue #47）。
+# quote-aware 切分后段首本就是 ssh/tmux（自然走非 grep 放行），此集合作为
+# 防守层显式声明语义，防未来切分逻辑变化回退。
+REMOTE_WRAPPERS = {"ssh", "mosh", "et", "autossh", "tmux"}
 
 # 带值标志：`-A 6` 的 `6` 是标志的值，不是文件/pattern（与 metrics 的
 # GREP_NOFILE_OK 同一套口径）。`--include=*.mjs` 的 `=` 形式自带值，不吃下一个 token。
@@ -194,6 +258,9 @@ def analyze_segment(seg, is_first, cwd=""):
         return "allow"
     prog = toks[i].rsplit("/", 1)[-1]
     args = toks[i + 1:]
+
+    if prog in REMOTE_WRAPPERS:
+        return "allow"  # 远端执行：目标不在本地索引覆盖内（#47）
 
     if not GREP_RE.match(prog):
         return "allow"
