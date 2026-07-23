@@ -106,6 +106,38 @@ CASES = [
     ("grep -n 'a;b|c' services/matter-service/store.mjs", False),
     # 未闭合引号 fail-open：整条按单段（段首 ssh → 放行），hook 不崩
     ("ssh public 'grep -rl x $D/src", False),
+    # --- #48 非代码文本残漏（记忆/会话档/变量目标/fallback-cd/include-glob） ---
+    # 记忆仓目录（可能自带 .git）：递归 grep 放行
+    ('grep -ril "completion report" ~/.agents/memory/ 2>/dev/null | head', False),
+    # 会话档 jsonl（变量目标，同命令内有字面赋值）：放行
+    ('for h in ~/.codex ~/.coder; do hf="$h/history.jsonl"; '
+     "[ -f \"$hf\" ] && { echo \"== $hf\"; grep -n 'gh auth' \"$hf\" | head -5; }; done", False),
+    # 变量单文件 .jsonl（f=…; grep -c x "$f"）：放行
+    ("f14=~/.coder.before/sessions/2026/04/14/rollout-a.jsonl; "
+     "grep -o '\"cmd\":\"[^\"]*' \"$f14\" | tail -8", False),
+    # fallback cd 链（cd X 2>/dev/null || cd Y 2>/dev/null）后 grep 记忆目录：放行
+    ("cd ~/.agents/memory/sub-x 2>/dev/null || cd ~/.agents/memory 2>/dev/null; "
+     "pwd; ls; grep -rn '14:42' . | head -20", False),
+    # 变量赋值 + 变量目标 .md：放行
+    ("M=/Users/zkf/.coder/memory/proj-x/MEMORY.md; "
+     'grep -n "dispatcher-state-lock-done" "$M" && ls /tmp/', False),
+    # --include=*.md 限定匹配面为文档：放行
+    ('grep -rn "mcp-adoption" --include=*.md docs 2>/dev/null | head', False),
+    # docs/ 文档目录：放行
+    ('grep -rn "19/19" docs/design/issue4626/ 2>/dev/null', False),
+    # --- #48 反向用例：豁免不放松代码纪律 ---
+    # 变量展开后是代码文件多目标：照拦
+    ('S=src; grep -rn setStatus "$S/" services/', True),
+    # 变量展开后是代码目录递归：照拦
+    ('D=services; grep -rn close "$D"', True),
+    # --include=*.mjs 代码 glob：照拦
+    ('grep -rn "budget" --include=*.mjs .', True),
+    # 记忆根混排仓内代码目录：从严照拦
+    ("grep -rn foo ~/.agents/memory/ src/", True),
+    # fallback cd 链落点是代码仓时不背书：照拦（cd 进本仓后递归 grep）
+    ("cd /nonexistent-x 2>/dev/null || cd " +
+     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) +
+     " 2>/dev/null; grep -rn setStatus src/", True),
 ]
 
 # (command, cwd, expect_deny) — 需要 cwd 的用例
