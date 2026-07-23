@@ -53,11 +53,45 @@ CASES = [
     ('grep -n "x" -A 3 src/a.c src/b.c', True),
     # 重定向剥离后仍是递归扫代码 → 照拦
     ("grep -rn setStatus src/ 2>/dev/null", True),
+    # --- 项目外目标豁免（不在任何 git 仓库内 = 索引不覆盖，MCP 替代不了） ---
+    # 绝对路径目录在仓库外：递归 grep 放行
+    ("grep -rn socket ~/.local/state/ 2>/dev/null", False),
+    # ~ 展开 + glob 前缀目录在仓库外：放行
+    ("grep -l addr ~/.local/state/*.json", False),
+    # /etc 在仓库外：多文件也放行
+    ("grep -rn PermitRoot /etc/ssh/", False),
+    # 仓库外目标 + 仓库内代码目录混合 → 从严照拦
+    ("grep -rn foo ~/.local/state/ src/", True),
+    # 不存在的仓库外路径：无法确认 → 照常规判定（递归扫 → 拦）
+    ("grep -rn foo /nonexistent-dir-xyz/", True),
+]
+
+# (command, cwd, expect_deny) — 需要 cwd 的用例
+CWD_CASES = [
+    # cwd 在仓库外：rg 无文件参数（默认递归扫 cwd）放行
+    ("rg -n pattern9x", os.path.expanduser("~/.local/state"), False),
+    # cwd 在仓库内：rg 无文件参数照拦
+    ("rg -n pattern9x", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), True),
+    # 链式 cd 到仓库外目录再递归 grep：跟踪 cd 后放行
+    ("cd ~/.local/state && grep -rn socket .", "", False),
+    # --- F1 回归：cd 形态跟踪不了时必须丢弃陈旧仓外 cwd（置空从严） ---
+    # 带引号路径的 cd（regex 匹配不上）→ cwd 置空，后续递归 grep 照拦
+    ('cd "/tmp/some dir" && grep -rn foo .', os.path.expanduser("~/.local/state"), True),
+    # `cd --` 形态 → cwd 置空，照拦
+    ("cd -- /tmp/anywhere && grep -rn foo .", os.path.expanduser("~/.local/state"), True),
+    # `cd $UNDEF`（解析不了）→ cwd 置空，照拦
+    ("cd $CBM_UNDEF_VAR_9X && grep -rn foo .", os.path.expanduser("~/.local/state"), True),
+    # `..` normpath 回到仓库内 → 照拦（回归固化）
+    ("grep -rn foo ~/.local/../work/codebase-memory-mcp/src", "", True),
+    # 相对路径 + 仓库内 cwd：照拦
+    ("grep -rn setStatus src/", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), True),
 ]
 
 
-def run_case(command):
+def run_case(command, cwd=None):
     payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    if cwd is not None:
+        payload["cwd"] = cwd
     out = subprocess.run(
         [sys.executable, HOOK],
         input=json.dumps(payload),
@@ -95,6 +129,13 @@ def main():
             failed += 1
         print(f"[{status}] deny={got} expect={expect_deny} :: {command}")
 
+    for command, cwd, expect_deny in CWD_CASES:
+        got = run_case(command, cwd=cwd)
+        status = "ok" if got == expect_deny else "FAIL"
+        if got != expect_deny:
+            failed += 1
+        print(f"[{status}] deny={got} expect={expect_deny} cwd={cwd or '-'} :: {command}")
+
     # 健壮性：合法 JSON 但非 dict → fail-open（exit 0 + "{}"）
     rc, stdout = run_raw("[1,2,3]")
     ok = rc == 0 and stdout == "{}"
@@ -102,7 +143,7 @@ def main():
         failed += 1
     print(f"[{'ok' if ok else 'FAIL'}] fail-open rc={rc} stdout={stdout!r} :: non-dict JSON [1,2,3]")
 
-    total = len(CASES) + 1
+    total = len(CASES) + len(CWD_CASES) + 1
     print(f"\n{total - failed}/{total} passed")
     sys.exit(1 if failed else 0)
 
