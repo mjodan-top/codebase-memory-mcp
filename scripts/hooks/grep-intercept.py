@@ -74,8 +74,13 @@ def is_outside_git_repo(path):
     """路径存在且向上走到根都无 .git → 在任何 git 仓库之外（索引不覆盖）。
 
     不存在的路径返回 False（无法确认，走常规判定）。
+    先 realpath 解 symlink：经仓外符号链接指进仓内的路径不得豁免。
+
+    已知折衷：只向上爬 `.git`，不向下扫子目录——目标目录本身若是某仓的
+    祖先目录（如 `grep -rn /tmp/` 而仓在 `/tmp/x/`），仍会豁免；索引按项目
+    根注册，此形态极罕见且 metrics 端同口径，接受。
     """
-    p = path
+    p = os.path.realpath(path)
     if not os.path.exists(p):
         return False
     if not os.path.isdir(p):
@@ -270,9 +275,12 @@ def main():
         # 追踪链内 `cd <path>`：后续段的相对路径/rg-无参按新 cwd 判定
         m = re.match(r"^cd\s+(\S+)\s*$", seg)
         if m:
-            nxt = resolve_target(m.group(1), cwd)
-            if nxt:
-                cwd = nxt
+            # 解析不了（$UNDEF 等）→ cwd 置空从严：陈旧仓外 cwd 不得给后续段背书
+            cwd = resolve_target(m.group(1), cwd) or ""
+            continue
+        if re.match(r"^cd(\s|$)", seg):
+            # cd 形态跟踪不了（带引号路径 / `cd --` / 多参数）→ cwd 不可知，置空从严
+            cwd = ""
             continue
         if analyze_segment(seg, is_first=is_head, cwd=cwd) == "deny":
             deny(command, cwd)

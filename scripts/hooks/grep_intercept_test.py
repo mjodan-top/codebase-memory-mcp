@@ -74,6 +74,15 @@ CWD_CASES = [
     ("rg -n pattern9x", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), True),
     # 链式 cd 到仓库外目录再递归 grep：跟踪 cd 后放行
     ("cd ~/.local/state && grep -rn socket .", "", False),
+    # --- F1 回归：cd 形态跟踪不了时必须丢弃陈旧仓外 cwd（置空从严） ---
+    # 带引号路径的 cd（regex 匹配不上）→ cwd 置空，后续递归 grep 照拦
+    ('cd "/tmp/some dir" && grep -rn foo .', os.path.expanduser("~/.local/state"), True),
+    # `cd --` 形态 → cwd 置空，照拦
+    ("cd -- /tmp/anywhere && grep -rn foo .", os.path.expanduser("~/.local/state"), True),
+    # `cd $UNDEF`（解析不了）→ cwd 置空，照拦
+    ("cd $CBM_UNDEF_VAR_9X && grep -rn foo .", os.path.expanduser("~/.local/state"), True),
+    # `..` normpath 回到仓库内 → 照拦（回归固化）
+    ("grep -rn foo ~/.local/../work/codebase-memory-mcp/src", "", True),
     # 相对路径 + 仓库内 cwd：照拦
     ("grep -rn setStatus src/", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), True),
 ]

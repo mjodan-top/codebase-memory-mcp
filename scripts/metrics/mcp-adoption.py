@@ -152,6 +152,7 @@ def _outside_git_repo(tok):
         t = head.rsplit("/", 1)[0] if "/" in head else ""
         if not t:
             return False
+    t = os.path.realpath(t)  # 解 symlink，与 hook 同口径：链接指进仓内不豁免
     if not os.path.exists(t):
         return False
     p = t if os.path.isdir(t) else (os.path.dirname(t) or "/")
