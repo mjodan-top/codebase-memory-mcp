@@ -22,6 +22,12 @@
 
 事件级 S：同会话内相邻检索调用间隔 ≤120s 归并为一个事件，
 按事件内首个跨文件定位动作判 MCP 主导 / legacy 主导。
+
+指标 2 —— 每 action 耗时（2026-07-23 新增）：同一 call_id 的
+function_call → function_call_output 墙钟差，mcp / legacy 各一桶；
+hook-denied 帧不计（拦截返回不是真实检索耗时），负值/超 600s 的
+异常差值丢弃（时钟回拨、跨压缩残帧）。这是 agent 视角的单动作等待，
+与 daemon 侧 duration_ms（纯服务端）互为对照。
 """
 import argparse
 import glob
@@ -57,6 +63,7 @@ CODE_EXT = {".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".go", ".py", ".mjs", ".js
             ".ts", ".tsx", ".jsx", ".java", ".rb", ".sh", ".swift", ".m", ".kt",
             ".cs", ".php", ".lua", ".zig", ".sql"}
 EPISODE_GAP_S = 120  # 事件归并窗口（设计稿 §1.1）
+LATENCY_MAX_S = 600  # 指标 2：单 action call→output 超过此值视为异常帧丢弃
 
 # grep/rg 里"pattern 像标识符"：≥3 个 word 字符起步（可含 | 交替、\b 等）
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
@@ -351,6 +358,11 @@ def parse_session(path, since, until, seen_call_ids):
     forked = False
     pending_legacy = {}   # call_id -> [calls 下标]，等 output 判 hook 拦截
     denied_idx = set()    # 被 hook 拦截的 calls 下标（终局剔除）
+    pending_lat = {}      # call_id -> (call_ts, kind)，等 output 算单 action 耗时
+                          # 归属规则：一条多段 cmd 只按第一个搜索段的 kind 记整帧墙钟，
+                          # 含帧内非搜索段（如 `cargo test && grep …` 的 build 时间）——
+                          # legacy 桶解读时带此 caveat
+    latencies = []        # (kind, seconds)  指标 2：call→output 墙钟差
     for line in open(path, errors="replace"):
         if '"function_call"' not in line and '"function_call_output"' not in line \
            and '"turn_context"' not in line \
@@ -376,11 +388,21 @@ def parse_session(path, since, until, seen_call_ids):
         p = d.get("payload", {})
         if p.get("type") == "function_call_output":
             cid = p.get("call_id")
+            denied = False
             idxs = pending_legacy.pop(cid, None)
             if idxs and "blocked by PreToolUse hook" in str(p.get("output", ""))[:400]:
                 counters["legacy_denied"] += len(idxs)
                 counters["legacy"] -= len(idxs)
                 denied_idx.update(idxs)
+                denied = True
+            lat = pending_lat.pop(cid, None)
+            if lat is not None and not denied:
+                t0, lkind = lat
+                ots = parse_ts(d.get("timestamp", ""))
+                if ots is not None:
+                    dt = (ots - t0).total_seconds()
+                    if 0 <= dt <= LATENCY_MAX_S:
+                        latencies.append((lkind, dt))
             continue
         if p.get("type") != "function_call":
             continue
@@ -403,6 +425,8 @@ def parse_session(path, since, until, seen_call_ids):
             if bare in SEARCH_TOOLS:
                 counters["mcp_frame"] += 1
                 calls.append((ts, "mcp", f"[MCP工具帧] {bare}"))
+                if cid:
+                    pending_lat[cid] = (ts, "mcp")
             else:
                 counters["mcp_mgmt_frame"] += 1
             continue
@@ -422,6 +446,8 @@ def parse_session(path, since, until, seen_call_ids):
             if kind == "mcp_cli":
                 counters["mcp_cli"] += 1
                 calls.append((ts, "mcp", f"[cli直调] {detail}"))
+                if cid:
+                    pending_lat.setdefault(cid, (ts, "mcp"))
             elif kind == "mcp_cli_mgmt":
                 counters["mcp_cli_mgmt"] += 1
             elif kind == "legacy":
@@ -429,11 +455,13 @@ def parse_session(path, since, until, seen_call_ids):
                 calls.append((ts, "legacy", detail))
                 if cid:
                     pending_legacy.setdefault(cid, []).append(len(calls) - 1)
+                    pending_lat.setdefault(cid, (ts, "legacy"))
             else:
                 counters[kind] += 1
     if denied_idx:
         calls = [c for i, c in enumerate(calls) if i not in denied_idx]
-    return {"sid": sid, "cwd": cwd, "calls": sorted(calls), "counters": counters}
+    return {"sid": sid, "cwd": cwd, "calls": sorted(calls), "counters": counters,
+            "latencies": latencies}
 
 
 # ---------------- 事件归并 ----------------
@@ -539,6 +567,17 @@ def main():
     top_legacy = sorted(sessions, key=lambda s: -s["counters"]["legacy"])[:8]
     top_legacy = [s for s in top_legacy if s["counters"]["legacy"]]
 
+    # 指标 2：每 action 耗时（call→output，denied 已在 parse_session 内剔除）
+    lat_mcp = [dt for s in sessions for k, dt in s.get("latencies", []) if k == "mcp"]
+    lat_leg = [dt for s in sessions for k, dt in s.get("latencies", []) if k == "legacy"]
+
+    def lat_stats(xs):
+        if not xs:
+            return {"n": 0, "mean_s": None, "p50_s": None, "p90_s": None, "max_s": None}
+        return {"n": len(xs), "mean_s": round(sum(xs) / len(xs), 3),
+                "p50_s": round(pctl(xs, .5), 3), "p90_s": round(pctl(xs, .9), 3),
+                "max_s": round(max(xs), 3)}
+
     report = {
         "window": {"since": since.isoformat(), "until": until.isoformat(),
                    "hours": args.hours},
@@ -547,6 +586,9 @@ def main():
                         "N_legacy": N_legacy, "N_legacy_denied": N_denied},
         "S_episode_level": {"value": S_val, "E_mcp": E_mcp, "E_legacy": E_leg,
                             "episodes": len(all_eps)},
+        "action_latency": {"mcp": lat_stats(lat_mcp), "legacy": lat_stats(lat_leg),
+                           "note": f"call→output 墙钟（agent 视角）；denied 剔除；"
+                                   f">{LATENCY_MAX_S}s 异常帧丢弃"},
         "daemon": {"rows": len(drows), "search_calls": len(d_search),
                    "mgmt": len(d_mgmt), "other": len(d_other),
                    "errors": len(d_err),
@@ -594,6 +636,15 @@ def main():
         Se = w["S_episode_level"]
         print(f"## 事件级 S = {fmt(Se['value'])}  "
               f"(E_mcp={Se['E_mcp']}, E_legacy={Se['E_legacy']}, 共 {Se['episodes']} 事件)")
+        al = w["action_latency"]
+
+        def lfmt(b):
+            if not b["n"]:
+                return "n=0"
+            return (f"n={b['n']} mean={b['mean_s']:.2f}s "
+                    f"p50={b['p50_s']:.2f}s p90={b['p90_s']:.2f}s max={b['max_s']:.1f}s")
+        print(f"## 指标2 每 action 耗时（call→output）  "
+              f"mcp: {lfmt(al['mcp'])}  |  legacy: {lfmt(al['legacy'])}")
         sl = w["slot"]
         print(f"## slot 加载率 = {fmt(sl['rate'])}  ({sl['loaded']}/{sl['active_sessions']} 个有检索活动的会话)")
         d = w["daemon"]
