@@ -322,6 +322,10 @@ def _nr_prog(seg):
         "timeout": {"-k", "--kill-after", "-s", "--signal"},
         "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
     }
+    # 终止/查询模式标志：带上它们时包装自己打印信息后退出，**根本不执行**
+    # 后面的程序。`env --help sed -n …` 不是一次窄读（复审 B2 举证）。
+    _WRAP_TERMINAL = {"--help", "-h", "--version", "-V", "--usage"}
+    _WRAP_QUERY = {"command": {"-v", "-V"}}   # `command -v sed` 只查路径不执行
     guard = 0
     while i < n and guard < 64:      # 上限放宽：30 层 env 赋值链实测会撞 24
         guard += 1
@@ -339,6 +343,9 @@ def _nr_prog(seg):
                     i += 1
                     break
                 if a.startswith("-"):
+                    # 终止/查询模式：包装不会执行后续程序 → 整段不是窄读
+                    if a in _WRAP_TERMINAL or a in _WRAP_QUERY.get(base, ()):
+                        return ""
                     valued = a in _WRAP_VALUED.get(base, ())
                     i += 1
                     if valued and i < n and not toks[i].startswith("-"):

@@ -113,8 +113,28 @@ def t_extract_real_prog_only():
                 "git show HEAD:src/a.c",
                 # xargs sed 对 stdin 文件列表批量执行 ≈ 跨文件扫射，不是页内定位
                 "xargs sed -n '1,10p' < list.txt",
-                "echo $(sed -n '1,10p' src/a.c)"):
+                "echo $(sed -n '1,10p' src/a.c)",
+                # 终止/查询模式：包装打印信息后退出，根本不执行后面的 sed
+                "env --help sed -n '1,10p' src/a.c",
+                "env -h sed -n '1,10p' src/a.c",
+                "sudo --version sed -n '1,10p' src/a.c",
+                "sudo -V sed -n '1,10p' src/a.c",
+                "timeout --help sed -n '1,10p' src/a.c",
+                "nohup --help sed -n '1,10p' src/a.c",
+                "setsid --help sed -n '1,10p' src/a.c",
+                "ionice --help sed -n '1,10p' src/a.c",
+                # `command -v/-V sed` 只查路径不执行
+                "command -v sed -n '1,10p' src/a.c",
+                "command -V sed -n '1,10p' src/a.c",
+                # 剥到 env -i 之后真正执行的是 echo，sed 只是 echo 的字面量
+                "env -i echo sed -n '1,10p' src/a.c"):
         check(f"不误计 {cmd[:30]!r}", M.extract_narrow_windows(cmd), [])
+
+    # 无值 flag 不得吞掉真实程序（sudo -n/-i 无值，与 stdbuf -i 带值区分）
+    for cmd in ("sudo -n sed -n '1,10p' src/a.c",
+                "sudo -i sed -n '1,10p' src/a.c"):
+        check(f"无值flag不吞程序 {cmd[:22]!r}", M.extract_narrow_windows(cmd),
+              [("src/a.c", 1, 10, "sed")])
 
 
 def t_aggregation_key_is_path():
