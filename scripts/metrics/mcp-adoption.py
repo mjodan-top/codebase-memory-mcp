@@ -215,6 +215,140 @@ GREP_NOFILE_OK = {"-e", "--regexp", "-f", "--file", "-m", "--max-count", "-A", "
                   "-C", "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not",
                   "--include", "--exclude", "--exclude-dir", "--color", "-d"}
 
+# ---------------- 窄窗读影子观测（issue #54） ----------------
+# 影子模式硬承诺：narrow_read 只观测、不判罚，绝不进 s/S 的任何分母。
+# prior art：GCP Organization Policy dry-run（强制前至少观测两周）、Istio
+# AuthorizationPolicy dry-run（策略求值并记录、流量照常通过）、Flagright
+# Shadow Rules（并行跑看潜在影响，平均观测一周再转 live）。
+NARROW_READ_SHADOW = True
+
+# 窗口合并阈值：相邻窗口间隔 ≤ 此值视为「本该合并成一刀」。
+# 注意：**「间隔<200」本身不是可疑信号** —— spike 全量实测（530 会话档）
+# 显示总体 72% 的邻窗间隔天然 <200，用它标红会误伤七成正常行为。
+# 它只作为合并运算的参数，可疑信号看 redundancy。
+MERGE_GAP = 200
+
+# 窄窗读命令形态。sed 已在 classify_search_cmd 里判 sed_page；nl / awk NR /
+# head / tail 此前完全不在 prog 白名单内（spike 实测 nl 388 次属真空）。
+_NR_SED_RANGE = re.compile(r"sed\s+(?:-[a-zA-Z]+\s+)*-n\s+['\"]?(\d+)\s*,\s*(\d+)p")
+_NR_SED_ONE = re.compile(r"sed\s+(?:-[a-zA-Z]+\s+)*-n\s+['\"]?(\d+)p")
+_NR_AWK_RANGE = re.compile(r"awk\s+['\"]NR\s*>=?\s*(\d+)\s*&&\s*NR\s*<=?\s*(\d+)")
+_NR_NL = re.compile(r"(?:^|[\s;|&])nl\b")
+_NR_HEADTAIL = re.compile(r"\b(head|tail)\s+-n\s*\+?(\d+)\s+(\S+)")
+NARROW_READ_TOOLS = ("sed", "nl", "awk", "head", "tail")
+
+
+def _nr_code_files(seg):
+    """段内看起来像代码文件路径的 token（按 CODE_EXT 判定）。"""
+    out = []
+    for t in seg.split():
+        t = t.strip("'\"();|&<>")
+        if not t or t.startswith("-"):
+            continue
+        if os.path.splitext(t)[1].lower() in CODE_EXT:
+            out.append(t)
+    return out
+
+
+def _nr_split(cmd):
+    """引号感知地按 ; && || | 切段。
+
+    不能直接用 WORD_SPLIT_RE：`awk 'NR>=1 && NR<=9' f.c` 的 `&&` 在单引号
+    内，裸切会把 awk 表达式劈成两半（与 hook 侧 #47 同一类根因）。
+    未闭合引号 → 整条按单段返回（宁可少抽，不要崩）。
+    """
+    parts, buf, q, esc = [], [], None, False
+    i, n = 0, len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if esc:
+            buf.append(ch); esc = False; i += 1; continue
+        if q:
+            if q == '"' and ch == "\\":
+                esc = True
+            elif ch == q:
+                q = None
+            buf.append(ch); i += 1; continue
+        if ch in ("'", '"'):
+            q = ch; buf.append(ch); i += 1; continue
+        if ch == "\\":
+            esc = True; buf.append(ch); i += 1; continue
+        if cmd[i:i + 2] in ("&&", "||"):
+            parts.append("".join(buf)); buf = []; i += 2; continue
+        if ch in ";\n|":
+            parts.append("".join(buf)); buf = []; i += 1; continue
+        buf.append(ch); i += 1
+    parts.append("".join(buf))
+    if q is not None:
+        return [cmd]
+    return [p for p in parts if p.strip()]
+
+
+def extract_narrow_windows(cmd):
+    """抽取窄窗读事件：[(basename, lo, hi, tool)]。
+
+    lo/hi 为 None 表示整文件读（如 `nl -ba f.c`）。仅代码文件计入；
+    纯管道过滤（无文件参数，如 `cat x | sed -n '1,5p'`）不计。
+    """
+    res = []
+    for seg in _nr_split(cmd):
+        s = (seg or "").strip()
+        if not s:
+            continue
+        files = _nr_code_files(s)
+        if not files:
+            continue
+        f = os.path.basename(files[0])
+        m = _NR_SED_RANGE.search(s)
+        if m:
+            res.append((f, int(m.group(1)), int(m.group(2)), "sed"))
+            continue
+        m = _NR_AWK_RANGE.search(s)
+        if m:
+            res.append((f, int(m.group(1)), int(m.group(2)), "awk"))
+            continue
+        m = _NR_SED_ONE.search(s)
+        if m:
+            n = int(m.group(1))
+            res.append((f, n, n, "sed"))
+            continue
+        m = _NR_HEADTAIL.search(s)
+        if m and os.path.splitext(m.group(3))[1].lower() in CODE_EXT:
+            res.append((os.path.basename(m.group(3)), 1, int(m.group(2)), m.group(1)))
+            continue
+        if _NR_NL.search(s):
+            res.append((f, None, None, "nl"))
+            continue
+    return res
+
+
+def merge_adjacent(windows, gap=MERGE_GAP):
+    """把 [(lo,hi)] 按「间隔 ≤ gap」合并，返回 [[lo,hi], ...]。"""
+    ranged = sorted((lo, hi) for lo, hi in windows if lo is not None and hi is not None)
+    if not ranged:
+        return []
+    out = [list(ranged[0])]
+    for lo, hi in ranged[1:]:
+        if lo - out[-1][1] <= gap:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return out
+
+
+def redundancy(windows, gap=MERGE_GAP):
+    """读冗余倍率 = 窗口数 / 合并后段数，即「本可几刀读完却用了几刀」。
+
+    1.0 = 无冗余（每刀都读了独立区域，健康）。实测总体 81.4% 的
+    会话×文件 ≤2.0；P90=4.0、P99≈19.4。坏样本可达 95.0（95 刀读完一个
+    458 行文件、合并后是连续 1 段）。
+    """
+    ranged = [(lo, hi) for lo, hi in windows if lo is not None and hi is not None]
+    if not ranged:
+        return None
+    merged = merge_adjacent(ranged, gap)
+    return round(len(ranged) / len(merged), 2)
+
 
 def classify_search_cmd(seg, piped_before):
     """对一段（已按 ; && || | 切开的）命令分类。
@@ -238,8 +372,16 @@ def classify_search_cmd(seg, piped_before):
     if prog in REMOTE_WRAPPERS:
         # 远端执行（ssh/tmux 等）：目标不在本地索引覆盖内，不压 S 分母（#47）
         return ("exempt_remote", seg.strip()[:120])
-    if prog not in ("grep", "egrep", "fgrep", "rg", "sed"):
+    if prog not in ("grep", "egrep", "fgrep", "rg", "sed", "nl", "awk", "head", "tail"):
         return ("none", "")
+
+    # nl / awk NR / head / tail：此前完全不在白名单内（#54 真空）。
+    # 只作影子观测，永不判 legacy。
+    if prog in ("nl", "awk", "head", "tail"):
+        if piped_before:
+            return ("exempt_filter", seg.strip()[:120])
+        return ("narrow_read", seg.strip()[:120]) if extract_narrow_windows(seg) \
+            else ("none", "")
 
     if prog == "sed":
         files = [a for a in args if not a.startswith("-")
@@ -252,6 +394,11 @@ def classify_search_cmd(seg, piped_before):
         code_files = [f for f in files if _path_kind(f) == "code"]
         if len(code_files) >= 2 or any(_has_glob(f) for f in code_files):
             return ("legacy", "sed 跨文件: " + seg.strip()[:120])
+        # 单文件 sed：既是既有 sed_page，也进 #54 的窄窗读影子桶。
+        # 桶名换成 narrow_read（sed_page 作为别名保留在报表 page 合计里），
+        # 语义不变：仍不进 s/S 分母。
+        if extract_narrow_windows(seg):
+            return ("narrow_read", seg.strip()[:120])
         return ("sed_page", seg.strip()[:120])
 
     # grep / rg
@@ -416,6 +563,8 @@ def parse_session(path, since, until, seen_call_ids):
     latencies = []        # (kind, seconds)  指标 2：call→output 墙钟差
     pending_cmd = {}      # call_id -> 完整原始 cmd（等 output 判 denied 后供指标 3 回放）
     denied_cmds = []      # (ts_iso, cmd, cwd)  指标 3：被拦命令 + 当时 cwd
+    narrow_windows = defaultdict(list)   # #54: basename -> [(lo,hi)]（影子观测）
+    narrow_tools = Counter()             # #54: tool -> 次数
     for line in open(path, errors="replace"):
         if '"function_call"' not in line and '"function_call_output"' not in line \
            and '"turn_context"' not in line \
@@ -505,6 +654,11 @@ def parse_session(path, since, until, seen_call_ids):
             # 指标 3：所有 exec 帧都留底——hook 拦截面比 legacy 分类宽
             # （ssh/噪声形态 metrics 不判 legacy 但也会被拦），output 时弹出
             pending_cmd.setdefault(cid, cmd)
+        # #54 影子观测：窗口形态与判定分离——无论 classify_exec 归到哪个桶，
+        # 只要抽出窄窗读事件就记形态，供 redundancy 聚合。不影响任何计分。
+        for f, lo, hi, tool in extract_narrow_windows(cmd):
+            narrow_windows[f].append((lo, hi))
+            narrow_tools[tool] += 1
         for kind, detail in classify_exec(cmd):
             if kind == "mcp_cli":
                 counters["mcp_cli"] += 1
@@ -524,7 +678,8 @@ def parse_session(path, since, until, seen_call_ids):
     if denied_idx:
         calls = [c for i, c in enumerate(calls) if i not in denied_idx]
     return {"sid": sid, "cwd": cwd, "calls": sorted(calls), "counters": counters,
-            "latencies": latencies, "denied_cmds": denied_cmds}
+            "latencies": latencies, "denied_cmds": denied_cmds,
+            "narrow_windows": dict(narrow_windows), "narrow_tools": narrow_tools}
 
 
 # ---------------- 指标 3：hook 误判率（denied 回放） ----------------
@@ -683,6 +838,50 @@ def main():
 
     # 指标 2：每 action 耗时（call→output，denied 已在 parse_session 内剔除）
     lat_mcp = [dt for s in sessions for k, dt in s.get("latencies", []) if k == "mcp"]
+    # ---- #54 窄窗读影子观测（只统计，绝不入 s/S 分母）----
+    nr_rows = []          # 每 (会话,文件) 一条
+    nr_tools = Counter()
+    for s in sessions:
+        nr_tools += s.get("narrow_tools", Counter())
+        for f, wins in s.get("narrow_windows", {}).items():
+            red = redundancy(wins)
+            merged = merge_adjacent(wins)
+            nr_rows.append({
+                "sid": s["sid"][:44], "file": f,
+                "windows": len([w for w in wins if w[0] is not None]),
+                "merged": len(merged),
+                "redundancy": red,
+                "coverage_lines": sum(hi - lo + 1 for lo, hi in merged),
+                "mcp": s["counters"]["mcp_frame"] + s["counters"]["mcp_cli"],
+            })
+    nr_scored = [r for r in nr_rows if r["redundancy"] is not None]
+    reds = [r["redundancy"] for r in nr_scored]
+    wcounts = [r["windows"] for r in nr_scored]
+    narrow_shadow = {
+        "MODE": "shadow (observe only, never scored)",
+        "events_total": sum(nr_tools.values()),
+        "events_by_tool": dict(nr_tools),
+        "session_file_pairs": len(nr_rows),
+        "sessions_with_narrow_read": sum(
+            1 for s in sessions if s.get("narrow_windows")),
+        "window_count": {
+            "P50": pctl(wcounts, .5), "P90": pctl(wcounts, .9),
+            "P99": pctl(wcounts, .99),
+            "dist": {("≥5" if min(w, 5) == 5 else str(w)): c
+                     for w, c in sorted(Counter(min(w, 5) for w in wcounts).items())},
+        },
+        "redundancy": {
+            "P50": pctl(reds, .5), "P90": pctl(reds, .9), "P99": pctl(reds, .99),
+            "share_healthy_le_2": (round(sum(1 for r in reds if r <= 2) / len(reds), 4)
+                                   if reds else None),
+            "dist": {"1.0": sum(1 for r in reds if r == 1.0),
+                     "1.0-2": sum(1 for r in reds if 1.0 < r <= 2),
+                     "2-5": sum(1 for r in reds if 2 < r <= 5),
+                     ">5": sum(1 for r in reds if r > 5)},
+        },
+        "top_thinned_reads": sorted(nr_scored, key=lambda r: -r["redundancy"])[:10],
+    }
+
     lat_leg = [dt for s in sessions for k, dt in s.get("latencies", []) if k == "legacy"]
 
     def lat_stats(xs):
@@ -742,8 +941,10 @@ def main():
              "exempt_page": s["counters"]["exempt_page"],
              "mcp": s["counters"]["mcp_frame"] + s["counters"]["mcp_cli"],
              "bucket": bucket(s)} for s in top_legacy],
+        "narrow_read_shadow": narrow_shadow,
         "exempt_totals": {
-            "page": sum(s["counters"]["exempt_page"] + s["counters"]["sed_page"] for s in sessions),
+            "page": sum(s["counters"]["exempt_page"] + s["counters"]["sed_page"]
+                        + s["counters"]["narrow_read"] for s in sessions),
             "noncode": sum(s["counters"]["exempt_noncode"] for s in sessions),
             "filter": sum(s["counters"]["exempt_filter"] for s in sessions),
             "remote": sum(s["counters"]["exempt_remote"] for s in sessions)},
@@ -765,6 +966,30 @@ def main():
         Se = w["S_episode_level"]
         print(f"## 事件级 S = {fmt(Se['value'])}  "
               f"(E_mcp={Se['E_mcp']}, E_legacy={Se['E_legacy']}, 共 {Se['episodes']} 事件)")
+        nr = w["narrow_read_shadow"]
+        if nr["events_total"]:
+            print(f"\n## 窄窗读观测（影子模式 · 不判罚 · 不入 s/S 分母）")
+            print(f"   事件 {nr['events_total']} 次"
+                  f"（{', '.join(f'{k} {v}' for k, v in sorted(nr['events_by_tool'].items(), key=lambda kv: -kv[1]))}）"
+                  f"，覆盖 {nr['sessions_with_narrow_read']} 会话 / "
+                  f"{nr['session_file_pairs']} 会话×文件")
+            rd = nr["redundancy"]
+            if rd["share_healthy_le_2"] is not None:
+                print(f"   读冗余倍率（窗口数/合并后段数，1.0=无冗余）："
+                      f"P50={rd['P50']} P90={rd['P90']} P99={rd['P99']}"
+                      f"，健康(≤2) 占 {rd['share_healthy_le_2']*100:.1f}%")
+                print(f"     分布 " + "  ".join(f"{k}:{v}" for k, v in rd["dist"].items()))
+            wc = nr["window_count"]
+            print(f"   同文件窗口数：P50={wc['P50']} P90={wc['P90']} P99={wc['P99']}"
+                  f"   分布 " + "  ".join(f"{k}窗:{v}" for k, v in wc["dist"].items()))
+            if nr["top_thinned_reads"]:
+                print("   Top 摊薄读（高冗余；mcp 列 >0 说明索引用得好、读侧照样摊薄）：")
+                for r in nr["top_thinned_reads"][:5]:
+                    print(f"     {r['redundancy']:>6}x  {r['windows']:>3}窗→{r['merged']}段 "
+                          f"覆盖{r['coverage_lines']:>5}行  mcp={r['mcp']:<3} "
+                          f"{r['file'][:28]:<28} {r['sid'][:34]}")
+            print("   ⚠ 影子模式：本段只观测，阈值未定。prior art（GCP dry-run）建议"
+                  "观测 ≥2 周再谈判定；告警须走独立渠道。")
         al = w["action_latency"]
 
         def lfmt(b):
