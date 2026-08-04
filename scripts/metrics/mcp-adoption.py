@@ -303,14 +303,50 @@ def _nr_prog(seg):
     except ValueError:
         toks = seg.split()
     toks = _strip_redirects(toks)
-    i = 0
-    while i < len(toks) and ("=" in toks[i] and not toks[i].startswith("-")):
-        i += 1
-    while i < len(toks) and toks[i] in ("timeout", "command", "nice", "xargs", "sudo"):
-        i += 1
-        if i < len(toks) and toks[i - 1] == "timeout" and re.match(r"^\d", toks[i]):
+    i, n = 0, len(toks)
+    # 包装层逐层剥：env/sudo/nice/timeout/command/xargs/stdbuf + 它们各自的
+    # 标志与标志值。复审实测原版只认裸前置赋值与简单 timeout，
+    # `env X=1 sed`/`sudo -u nobody sed`/`nice -n 5 sed`/`command -- sed`
+    # 全部漏计（prog 分别解析成 env/-u/-n/--）。
+    _WRAP = {"env", "sudo", "nice", "timeout", "command", "xargs", "stdbuf",
+             "nohup", "setsid", "ionice"}
+    _WRAP_VALUED = {"-u", "-g", "-n", "-i", "--user", "--group", "-k",
+                    "--kill-after", "-s", "--signal", "-I", "-o", "-e"}
+    guard = 0
+    while i < n and guard < 24:
+        guard += 1
+        t = toks[i]
+        if "=" in t and not t.startswith("-"):        # 前置 env 赋值
             i += 1
-    return os.path.basename(toks[i]) if i < len(toks) else ""
+            continue
+        base = os.path.basename(t)
+        if base in _WRAP:
+            i += 1
+            # 剥该包装自己的标志；timeout 的裸秒数也要跳
+            while i < n:
+                a = toks[i]
+                if a == "--":
+                    i += 1
+                    break
+                if a.startswith("-"):
+                    valued = a in _WRAP_VALUED
+                    i += 1
+                    if valued and i < n and not toks[i].startswith("-"):
+                        i += 1
+                    continue
+                if base == "timeout" and re.match(r"^[\d.]+[smhd]?$", a):
+                    i += 1
+                    continue
+                if "=" in a and not a.startswith("-"):   # env X=1
+                    i += 1
+                    continue
+                break
+            continue
+        if t == "--":
+            i += 1
+            continue
+        break
+    return os.path.basename(toks[i]) if i < n else ""
 
 
 def _nr_key(tok, cwd=""):

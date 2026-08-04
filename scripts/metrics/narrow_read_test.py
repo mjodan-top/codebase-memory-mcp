@@ -86,6 +86,16 @@ def t_extract_real_prog_only():
     # 远端执行整段跳过（远端文件不在本地索引覆盖内）
     check("ssh 远端不计",
           M.extract_narrow_windows("ssh host \"sed -n '1,10p' src/a.c\""), [])
+    # 包装层必须逐层剥到真实程序（复审实测原版这些全部漏计）
+    for cmd in ("env X=1 sed -n '1,10p' src/a.c",
+                "env -i X=1 sed -n '1,10p' src/a.c",
+                "sudo -u nobody sed -n '1,10p' src/a.c",
+                "nice -n 5 sed -n '1,10p' src/a.c",
+                "command -- sed -n '1,10p' src/a.c",
+                "timeout 30 sed -n '1,10p' src/a.c",
+                "timeout 1.5s sed -n '1,10p' src/a.c"):
+        check(f"包装剥离 {cmd[:26]!r}", M.extract_narrow_windows(cmd),
+              [("src/a.c", 1, 10, "sed")])
 
 
 def t_aggregation_key_is_path():
@@ -145,9 +155,18 @@ def _mk_session(root, entries, name="rollout-2026-08-04T00-00-00-test.jsonl"):
                             "timestamp": "2026-08-04T00:00:00.000Z",
                             "payload": {"timestamp": "2026-08-04T00:00:00.000Z",
                                         "cwd": "/repo"}}) + "\n")
+        # 时间戳设计有两条硬要求，缺一就会让 S 的断言退化：
+        # ① 严格递增——相同时间戳时 sorted(calls) 会按字符串序把 legacy 排到
+        #    mcp 前，基准直接变 E_mcp=0 / S=0.0，那 S 的相等断言就是
+        #    「0.0 == 0.0」（复审实测：sabotage 后 s 转红但 S 仍绿）。
+        # ② 每条调用间隔 > EPISODE_GAP_S（120s）——否则全部被归并成一个事件，
+        #    首动作是 MCP 就永远 E_mcp=1，往里塞多少 legacy 都抓不到。
+        step = M.EPISODE_GAP_S + 60
         for i, (name, cmd) in enumerate(entries):
+            sec = i * step
             f.write(json.dumps({
-                "timestamp": "2026-08-04T00:00:01.000Z",
+                "timestamp": (f"2026-08-04T{sec // 3600:02d}:"
+                              f"{sec % 3600 // 60:02d}:{sec % 60:02d}.000Z"),
                 "type": "response_item",
                 "payload": {"type": "function_call", "name": name,
                             "call_id": f"c{i}",
@@ -193,6 +212,17 @@ def t_shadow_promise_real_aggregation():
         except Exception as e:
             FAIL.append(f"shadow_promise: 无法跑真实聚合 → {type(e).__name__}: {e}")
             return
+
+        # 先证基准非退化：S 必须真由 MCP 主导且非 0，否则下面的相等断言
+        # 只是「0.0 == 0.0」，塞任何窄读进 S 分母都抓不到（复审发现）。
+        base_S = r_without["S_episode_level"]
+        check_true("基准 E_mcp>0（防退化断言）", base_S.get("E_mcp", 0) > 0,
+                   f"got {base_S}")
+        check_true("基准 S 非 0（防退化断言）", (base_S.get("value") or 0) > 0,
+                   f"got {base_S}")
+        base_s = r_without["s_cmd_level"]
+        check_true("基准 s 非 0 且非 1（防退化断言）",
+                   0 < (base_s.get("value") or 0) < 1, f"got {base_s}")
 
         for key in ("s_cmd_level", "S_episode_level"):
             check(f"影子承诺 {key} 不变", r_with[key], r_without[key])
