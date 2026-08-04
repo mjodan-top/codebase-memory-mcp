@@ -308,12 +308,22 @@ def _nr_prog(seg):
     # 标志与标志值。复审实测原版只认裸前置赋值与简单 timeout，
     # `env X=1 sed`/`sudo -u nobody sed`/`nice -n 5 sed`/`command -- sed`
     # 全部漏计（prog 分别解析成 env/-u/-n/--）。
-    _WRAP = {"env", "sudo", "nice", "timeout", "command", "xargs", "stdbuf",
+    # xargs 刻意不在此集合：`xargs sed -n …` 对 stdin 文件列表批量执行，
+    # 语义接近跨文件扫射而非页内定位，不该计为单文件窄读。
+    _WRAP = {"env", "sudo", "nice", "timeout", "command", "stdbuf",
              "nohup", "setsid", "ionice"}
-    _WRAP_VALUED = {"-u", "-g", "-n", "-i", "--user", "--group", "-k",
-                    "--kill-after", "-s", "--signal", "-I", "-o", "-e"}
+    # 带值标志按 (包装名, 标志) 精确匹配：`env -i` 是无值的 ignore-environment，
+    # 而 `sudo -i` 是 login shell；把 -i 一律当带值会误吞下一个 token。
+    _WRAP_VALUED = {
+        "env": {"-u", "--unset", "-S", "--split-string"},
+        "sudo": {"-u", "--user", "-g", "--group", "-p", "--prompt"},
+        "nice": {"-n", "--adjustment"},
+        "ionice": {"-c", "-n", "-p"},
+        "timeout": {"-k", "--kill-after", "-s", "--signal"},
+        "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    }
     guard = 0
-    while i < n and guard < 24:
+    while i < n and guard < 64:      # 上限放宽：30 层 env 赋值链实测会撞 24
         guard += 1
         t = toks[i]
         if "=" in t and not t.startswith("-"):        # 前置 env 赋值
@@ -329,7 +339,7 @@ def _nr_prog(seg):
                     i += 1
                     break
                 if a.startswith("-"):
-                    valued = a in _WRAP_VALUED
+                    valued = a in _WRAP_VALUED.get(base, ())
                     i += 1
                     if valued and i < n and not toks[i].startswith("-"):
                         i += 1

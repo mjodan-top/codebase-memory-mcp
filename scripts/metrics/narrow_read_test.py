@@ -89,13 +89,32 @@ def t_extract_real_prog_only():
     # 包装层必须逐层剥到真实程序（复审实测原版这些全部漏计）
     for cmd in ("env X=1 sed -n '1,10p' src/a.c",
                 "env -i X=1 sed -n '1,10p' src/a.c",
+                # `env -i` 无值：一律当带值会误吞 sed，故按 (包装,标志) 精确匹配
+                "env -i sed -n '1,10p' src/a.c",
+                "env -u FOO sed -n '1,10p' src/a.c",
                 "sudo -u nobody sed -n '1,10p' src/a.c",
+                "sudo -i sed -n '1,10p' src/a.c",
                 "nice -n 5 sed -n '1,10p' src/a.c",
                 "command -- sed -n '1,10p' src/a.c",
                 "timeout 30 sed -n '1,10p' src/a.c",
-                "timeout 1.5s sed -n '1,10p' src/a.c"):
+                "timeout -k 5 30 sed -n '1,10p' src/a.c",
+                "timeout 1.5s sed -n '1,10p' src/a.c",
+                "stdbuf -o0 sed -n '1,10p' src/a.c",
+                # 超长包装链：guard 上限须容得下（30 层实测撞过 24）
+                "env A=1 " * 30 + "sed -n '1,10p' src/a.c"):
         check(f"包装剥离 {cmd[:26]!r}", M.extract_narrow_windows(cmd),
               [("src/a.c", 1, 10, "sed")])
+
+    # 反向风险：这些都**不**该被计成单文件页内窄读
+    for cmd in ('bash -c "sed -n \'1,10p\' src/a.c"',
+                'sh -c "sed -n \'1,10p\' src/a.c"',
+                'eval "sed -n \'1,10p\' src/a.c"',
+                "docker run img sed -n '1,10p' src/a.c",
+                "git show HEAD:src/a.c",
+                # xargs sed 对 stdin 文件列表批量执行 ≈ 跨文件扫射，不是页内定位
+                "xargs sed -n '1,10p' < list.txt",
+                "echo $(sed -n '1,10p' src/a.c)"):
+        check(f"不误计 {cmd[:30]!r}", M.extract_narrow_windows(cmd), [])
 
 
 def t_aggregation_key_is_path():
