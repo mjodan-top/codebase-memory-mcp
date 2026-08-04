@@ -234,7 +234,10 @@ _NR_SED_RANGE = re.compile(r"sed\s+(?:-[a-zA-Z]+\s+)*-n\s+['\"]?(\d+)\s*,\s*(\d+
 _NR_SED_ONE = re.compile(r"sed\s+(?:-[a-zA-Z]+\s+)*-n\s+['\"]?(\d+)p")
 _NR_AWK_RANGE = re.compile(r"awk\s+['\"]NR\s*(>=|>)\s*(\d+)\s*&&\s*NR\s*(<=|<)\s*(\d+)")
 _NR_NL = re.compile(r"(?:^|[\s;|&])nl\b")
-_NR_HEADTAIL = re.compile(r"\b(head|tail)\s+-n\s*(\+?)(\d+)\s+(\S+)")
+_NR_HEADTAIL = re.compile(
+    # `head -n 20 f` / `head -n20 f` / `head -20 f`（裸 -N 是 POSIX 传统形态，
+    # 实测占 head/tail 绝大多数：只认 -n 会漏掉 90%+）
+    r"\b(head|tail)\s+(?:-n\s*(\+?)(\d+)|-(\+?)(\d+))\s+(\S+)")
 NARROW_READ_TOOLS = ("sed", "nl", "awk", "head", "tail")
 
 # 降级可观测（AGENTS.md 硬纪律）：窄读解析的每条降级分支都要计数 + 留样本，
@@ -432,9 +435,10 @@ def extract_narrow_windows(cmd, cwd=""):
             m = _NR_HEADTAIL.search(s)
             if not m:
                 continue
-            tgt = _nr_key(m.group(4), cwd)
-            n = int(m.group(3))
-            plus = m.group(2) == "+"
+            tgt = _nr_key(m.group(6), cwd)
+            # 两种写法二选一命中：`-n [+]N`(2,3) 或裸 `-[+]N`(4,5)
+            plus = (m.group(2) or m.group(4)) == "+"
+            n = int(m.group(3) or m.group(5))
             if prog == "head":
                 if n >= 1:
                     res.append((tgt, 1, n, "head"))

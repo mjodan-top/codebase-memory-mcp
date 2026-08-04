@@ -59,6 +59,11 @@ def t_extract():
          [("scripts/x.py", 10, 19, "awk")]),
         ("nl -ba src/daemon.c", [("src/daemon.c", None, None, "nl")]),
         ("head -n 40 lib/mod.ts", [("lib/mod.ts", 1, 40, "head")]),
+        # 裸 -N 是 POSIX 传统形态、实测占 head/tail 绝大多数（只认 -n 漏 90%+）
+        ("head -n40 lib/mod.ts", [("lib/mod.ts", 1, 40, "head")]),
+        ("head -40 lib/mod.ts", [("lib/mod.ts", 1, 40, "head")]),
+        ("tail -40 lib/mod.ts", [("lib/mod.ts", None, None, "tail")]),
+        ("tail -+40 lib/mod.ts", [("lib/mod.ts", None, None, "tail")]),
         # tail 两种语义都不是 1..N，区间未知
         ("tail -n +40 lib/mod.ts", [("lib/mod.ts", None, None, "tail")]),
         ("tail -n 40 lib/mod.ts", [("lib/mod.ts", None, None, "tail")]),
@@ -262,6 +267,16 @@ def t_shadow_promise_real_aggregation():
         base_s = r_without["s_cmd_level"]
         check_true("基准 s 非 0 且非 1（防退化断言）",
                    0 < (base_s.get("value") or 0) < 1, f"got {base_s}")
+        # fixture 的第二条硬要求（间隔 > EPISODE_GAP_S）也必须有守卫：
+        # 只写在注释里不配断言，后人把间隔改小就会让全部调用归并成 1 个事件，
+        # S 侧退化成 1.0==1.0 并放行「窄读进 calls 时间线」这类破坏
+        # （四审实测：间隔压到 1 秒时三条守卫全绿放行）。
+        check_true("基准切出多个事件（防归并退化）",
+                   base_S.get("episodes", 0) > 1, f"got {base_S}")
+        check_true("基准 E_legacy>0（防归并退化）",
+                   base_S.get("E_legacy", 0) > 0, f"got {base_S}")
+        check_true("基准 S 非 1（防满分退化）",
+                   (base_S.get("value") or 0) < 1, f"got {base_S}")
 
         for key in ("s_cmd_level", "S_episode_level"):
             check(f"影子承诺 {key} 不变", r_with[key], r_without[key])
