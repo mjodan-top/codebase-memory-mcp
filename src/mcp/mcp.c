@@ -70,6 +70,7 @@ enum {
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <sys/wait.h> /* issue #56: decode pclose() wait status */
 #endif
 #include <yyjson/yyjson.h>
 #include <stdint.h> // int64_t
@@ -483,7 +484,13 @@ static const tool_def_t TOOLS[] = {
      "TRUNCATION: enriched results are capped at limit (default 10). Response carries "
      "'total_grep_matches' (raw grep hit count) and 'total_results' (deduplicated function "
      "count) — compare to limit to detect truncation. There is no offset parameter; to see "
-     "more, raise limit or narrow the query with file_pattern / path_filter.",
+     "more, raise limit or narrow the query with file_pattern / path_filter. "
+     "COMPLETENESS: the 'status' object is the machine-readable contract — outcome "
+     "(hits|no_match|empty_scope|unindexed_scope|failed), count_relation (eq|gte|unknown: "
+     "whether total_grep_matches is exact, a lower bound, or unverified), scan_complete, "
+     "scope_mode (indexed_filelist|filesystem_fallback), indexed_files/selected_files, and "
+     "coverage_matches + coverage_samples when a path_filter hits only unindexed paths. "
+     "Never treat 0 results as a verified no-match unless status.outcome is 'no_match'.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
      "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
@@ -5565,8 +5572,13 @@ static int search_result_cmp(const void *a, const void *b) {
  * On POSIX, uses grep with colon-delimited output. */
 static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                            const char *file_pattern, const char *tmpfile, const char *filelist,
-                           const char *root_path) {
+                           const char *root_path, const char *errfile) {
 #ifdef _WIN32
+    /* issue #56 known limitation: the PowerShell pipeline swallows per-file
+     * errors (-ErrorAction SilentlyContinue), so scan failures are largely
+     * unobservable on Windows — the completeness contract's "failed" state is
+     * only fully wired on POSIX. errfile is unused here. */
+    (void)errfile;
     const char *sm = use_regex ? "" : " -SimpleMatch";
     if (scoped) {
         if (file_pattern) {
@@ -5616,12 +5628,22 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         if (file_pattern) {
             /* -0: read NUL-separated paths from the filelist so paths containing
              * spaces stay one argument (issue #687). Pairs with the NUL separator
-             * written by write_scoped_filelist. */
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                     flag, file_pattern, tmpfile, filelist);
+             * written by write_scoped_filelist.
+             * issue #56: the sh wrapper normalizes grep's exit inside each xargs
+             * batch — exit 0/1 (hits / clean no-match) both become 0, while
+             * exit >=2 (unreadable file, bad pattern, grep missing …) drops a
+             * sentinel file via a PATH-free builtin redirect. Without this,
+             * xargs remaps grep's NORMAL no-match exit 1 to 123 (POSIX), making
+             * "no match" and "read error" indistinguishable at the exit code. */
+            snprintf(cmd, cmd_sz,
+                     "xargs -0 sh -c 'grep -Hn %s --include=\"%s\" -f \"%s\" \"$@\" 2>/dev/null; "
+                     "[ \"$?\" -le 1 ] || : > \"%s\"; exit 0' sh < '%s' 2>/dev/null",
+                     flag, file_pattern, tmpfile, errfile, filelist);
         } else {
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
-                     filelist);
+            snprintf(cmd, cmd_sz,
+                     "xargs -0 sh -c 'grep -Hn %s -f \"%s\" \"$@\" 2>/dev/null; "
+                     "[ \"$?\" -le 1 ] || : > \"%s\"; exit 0' sh < '%s' 2>/dev/null",
+                     flag, tmpfile, errfile, filelist);
         }
     } else {
         if (file_pattern) {
@@ -5754,10 +5776,39 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
 }
 
 /* Phase 4: assemble JSON output from search results */
+/* issue #56: search completeness contract. Machine-decidable status for the
+ * "empty or incomplete" shapes that previously all looked like a normal
+ * zero-hit result:
+ *   - no_match        genuine 0 hits over a real, fully scanned scope
+ *   - empty_scope     path_filter selected zero indexed files (and the
+ *                     coverage report has nothing for it either)
+ *   - unindexed_scope path_filter matches only coverage-listed (excluded /
+ *                     not-indexed, #963) paths — the scope exists in the repo
+ *                     but is not searchable through the index
+ *   - failed          the scan subprocess did not execute/finish normally
+ * plus "hits". Legacy fields (results/raw_matches/files/total_*) keep their
+ * exact semantics; this object only ADDS discriminability. */
+typedef struct {
+    const char *outcome;        /* hits|no_match|empty_scope|unindexed_scope|failed */
+    const char *count_relation; /* total_grep_matches vs the true count:
+                                 * "eq" exact | "gte" lower bound | "unknown" */
+    const char *scope_mode;     /* indexed_filelist | filesystem_fallback */
+    bool scan_complete;         /* scan ran to normal completion over its scope */
+    bool counts_exact;          /* convenience: count_relation == "eq" */
+    bool grep_cap_hit;          /* stopped reading at grep_match_cap */
+    int grep_match_cap;
+    int indexed_files;    /* indexed files in the project; -1 unknown */
+    int selected_files;   /* files actually in the scan scope; -1 unknown */
+    int coverage_matches; /* coverage rows matching path_filter; -1 = not consulted */
+    const cbm_coverage_row_t *coverage_samples;
+    int coverage_sample_count;
+} search_status_t;
+
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path,
-                                    bool warn_literal_pipe, uint64_t elapsed_ms) {
+                                    bool warn_literal_pipe, uint64_t elapsed_ms,
+                                    const search_status_t *status) {
     enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -5820,8 +5871,66 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
         yyjson_mut_obj_add_strcpy(doc, root_obj, "dedup_ratio", ratio);
     }
 
+    /* issue #56: completeness contract — see search_status_t above. */
+    if (status) {
+        yyjson_mut_val *st = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, st, "outcome", status->outcome);
+        yyjson_mut_obj_add_str(doc, st, "count_relation", status->count_relation);
+        yyjson_mut_obj_add_str(doc, st, "scope_mode", status->scope_mode);
+        yyjson_mut_obj_add_bool(doc, st, "scan_complete", status->scan_complete);
+        yyjson_mut_obj_add_bool(doc, st, "counts_exact", status->counts_exact);
+        yyjson_mut_obj_add_int(doc, st, "grep_match_cap", status->grep_match_cap);
+        yyjson_mut_obj_add_bool(doc, st, "grep_cap_hit", status->grep_cap_hit);
+        if (status->indexed_files >= 0) {
+            yyjson_mut_obj_add_int(doc, st, "indexed_files", status->indexed_files);
+        }
+        if (status->selected_files >= 0) {
+            yyjson_mut_obj_add_int(doc, st, "selected_files", status->selected_files);
+        }
+        if (status->coverage_matches >= 0) {
+            yyjson_mut_obj_add_int(doc, st, "coverage_matches", status->coverage_matches);
+            yyjson_mut_val *samples = yyjson_mut_arr(doc);
+            for (int ci = 0; ci < status->coverage_sample_count; ci++) {
+                const cbm_coverage_row_t *row = &status->coverage_samples[ci];
+                yyjson_mut_val *item = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, item, "path", row->rel_path ? row->rel_path : "");
+                yyjson_mut_obj_add_strcpy(doc, item, "kind", row->kind ? row->kind : "");
+                yyjson_mut_obj_add_strcpy(doc, item, "detail", row->detail ? row->detail : "");
+                yyjson_mut_arr_add_val(samples, item);
+            }
+            yyjson_mut_obj_add_val(doc, st, "coverage_samples", samples);
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "status", st);
+    }
+
     /* Warnings: surface common foot-guns instead of leaving them silent. */
     yyjson_mut_val *warnings = yyjson_mut_arr(doc);
+    if (status && status->grep_cap_hit) {
+        char capw[CBM_SZ_256];
+        snprintf(capw, sizeof(capw),
+                 "scan stopped at the %d-match cap: total_grep_matches is a lower bound and "
+                 "results may be incomplete — narrow the pattern, file_pattern or path_filter",
+                 status->grep_match_cap);
+        yyjson_mut_arr_add_strcpy(doc, warnings, capw);
+    }
+    if (status && strcmp(status->outcome, "failed") == 0) {
+        yyjson_mut_arr_add_strcpy(
+            doc, warnings,
+            "search scan FAILED to execute — 0 results is NOT a verified no-match (the "
+            "grep/xargs subprocess did not run to completion)");
+    }
+    if (status && strcmp(status->outcome, "empty_scope") == 0) {
+        yyjson_mut_arr_add_strcpy(
+            doc, warnings,
+            "path_filter matched none of the indexed files — empty scope, not a verified "
+            "no-match over file contents");
+    }
+    if (status && strcmp(status->outcome, "unindexed_scope") == 0) {
+        yyjson_mut_arr_add_strcpy(
+            doc, warnings,
+            "path_filter matches only excluded/not-indexed paths (see status.coverage_samples) "
+            "— these files exist but are outside the indexed scan scope");
+    }
     if (warn_literal_pipe) {
         yyjson_mut_arr_add_strcpy(
             doc, warnings,
@@ -6038,16 +6147,24 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
  * excluded every indexed file). */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
                                   const char *filelist, bool has_path_filter,
-                                  cbm_regex_t *path_regex, int *out_written) {
+                                  cbm_regex_t *path_regex, int *out_written,
+                                  int *out_indexed_total) {
     *out_written = 0;
+    *out_indexed_total = -1; /* issue #56: unknown until the index list is read */
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
         return false;
     }
     char **indexed_files = NULL;
     int indexed_count = 0;
-    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK ||
-        indexed_count == 0) {
+    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK) {
+        return false;
+    }
+    /* issue #56: a KNOWN-empty index (0) is distinct from an unreadable one
+     * (-1) — never report unknown as zero. */
+    *out_indexed_total = indexed_count;
+    if (indexed_count == 0) {
+        free(indexed_files);
         return false;
     }
     FILE *fl = fopen(filelist, "wb");
@@ -6319,15 +6436,24 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * no indexed files found (project not fully indexed). */
     char filelist[CBM_SZ_256];
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
+    /* issue #56: sentinel dropped by the scoped sh wrapper when a grep batch
+     * exits >=2 (see build_grep_cmd); pre-clean any stale leftover. */
+    char errfile[CBM_SZ_256];
+    snprintf(errfile, sizeof(errfile), "%s.err", tmpfile);
+    cbm_unlink(errfile);
+
     bool scoped = false;
     int scoped_written = 0;
+    int indexed_total = -1;
 
     scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
-                                   has_path_filter ? &path_regex : NULL, &scoped_written);
+                                   has_path_filter ? &path_regex : NULL, &scoped_written,
+                                   &indexed_total);
 
     /* Collect grep matches into array */
     int gm_count = 0;
     grep_match_t *gm = NULL;
+    bool scan_failed = false; /* issue #56: subprocess did not run to completion */
     if (scoped && scoped_written == 0) {
         /* The path_filter excluded every indexed file — nothing to scan.
          * Skip the grep subprocess: xargs on an empty filelist is
@@ -6338,7 +6464,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         cbm_unlink(filelist);
     } else {
         char cmd[CBM_SZ_4K];
-        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
+        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, errfile,
                        root_path);
 
         FILE *fp = cbm_popen(cmd, "r");
@@ -6356,7 +6482,41 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
         gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
                                   grep_limit, &gm_count);
-        cbm_pclose(fp);
+        /* issue #56: normalize the child's exit status. pclose() returns a
+         * WAIT STATUS on POSIX (not the exit code), and the scoped command is
+         * wrapped in xargs, which remaps grep's exits (POSIX xargs: 123 = some
+         * invocation exited 1-125 — including grep's NORMAL no-match exit 1 —
+         * so 123 is indistinguishable from a plain no-match and stays
+         * "complete"; 124-127 = xargs/utility itself failed to run). When we
+         * stopped reading at the match cap, the early pipe close kills the
+         * child (typically SIGPIPE), so its status is meaningless — skip. */
+        int close_rc = cbm_pclose(fp);
+        if (gm_count < grep_limit) {
+            int code;
+#ifdef _WIN32
+            code = close_rc;
+#else
+            code = (close_rc == -1) ? -1 : (WIFEXITED(close_rc) ? WEXITSTATUS(close_rc) : -1);
+#endif
+            if (scoped) {
+                /* The sh wrapper (build_grep_cmd) normalizes every grep batch
+                 * to exit 0, so ANY nonzero xargs exit is now a real failure
+                 * (123 included — it can no longer mean a plain no-match). */
+                scan_failed = (code != 0);
+                /* Per-batch grep errors (exit >=2: unreadable file, bad
+                 * pattern …) surface via the sentinel file, not the exit. */
+#ifndef _WIN32
+                struct stat err_st;
+                if (stat(errfile, &err_st) == 0) {
+                    scan_failed = true;
+                }
+#endif
+            } else {
+                /* plain grep: 0 = hits, 1 = no match, >=2 = error */
+                scan_failed = (code == -1 || code > 1);
+            }
+        }
+        cbm_unlink(errfile);
         cbm_unlink(tmpfile);
         if (scoped) {
             cbm_unlink(filelist);
@@ -6368,6 +6528,51 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * Then: one SQL query per unique file for nodes, one batch query for all degrees. */
 
     cbm_store_t *store = resolve_store(srv, project);
+
+    /* issue #56: an empty scoped filelist has two distinct causes — consult
+     * the index-coverage report (#963) ONLY in that already-empty case (zero
+     * cost on the regular search path) to tell them apart. A dir-kind
+     * coverage row stores rel_path WITHOUT a trailing slash ("generated"),
+     * so also probe with '/' appended for "^generated/"-style filters. */
+    cbm_coverage_row_t *cov_rows = NULL;
+    int cov_total = 0;
+    int cov_matches = -1;
+    enum { COV_SAMPLE_MAX = 3 };
+    cbm_coverage_row_t cov_samples[COV_SAMPLE_MAX];
+    int cov_sample_count = 0;
+    if (scoped && scoped_written == 0 && has_path_filter) {
+        /* issue #56 review: only claim "0 coverage matches" after a SUCCESSFUL
+         * coverage read — an unavailable report stays -1 (unknown) so an
+         * unverified scope is never certified as empty. */
+        if (store &&
+            cbm_store_coverage_get(store, project, &cov_rows, &cov_total) == CBM_STORE_OK) {
+            cov_matches = 0;
+            for (int ci = 0; ci < cov_total; ci++) {
+                const char *rel = cov_rows[ci].rel_path;
+                if (!rel) {
+                    continue;
+                }
+                bool matched = cbm_regexec(&path_regex, rel, 0, NULL, 0) == CBM_REG_OK;
+                if (!matched) {
+                    size_t rlen = strlen(rel);
+                    char *with_slash = malloc(rlen + 2);
+                    if (with_slash) {
+                        memcpy(with_slash, rel, rlen);
+                        with_slash[rlen] = '/';
+                        with_slash[rlen + 1] = '\0';
+                        matched = cbm_regexec(&path_regex, with_slash, 0, NULL, 0) == CBM_REG_OK;
+                        free(with_slash);
+                    }
+                }
+                if (matched) {
+                    if (cov_sample_count < COV_SAMPLE_MAX) {
+                        cov_samples[cov_sample_count++] = cov_rows[ci];
+                    }
+                    cov_matches++;
+                }
+            }
+        }
+    }
 
     int sr_cap = CBM_SZ_32;
     int sr_count = 0;
@@ -6413,9 +6618,46 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
+    /* issue #56: derive the completeness contract (see search_status_t). */
+    search_status_t sstatus = {0};
+    sstatus.scope_mode = scoped ? "indexed_filelist" : "filesystem_fallback";
+    sstatus.indexed_files = indexed_total;
+    sstatus.selected_files = scoped ? scoped_written : -1;
+    sstatus.grep_match_cap = GREP_MAX_MATCHES;
+    /* Reaching the cap means we STOPPED reading — the true count may equal
+     * the cap exactly, so the count degrades to a lower bound either way. */
+    sstatus.grep_cap_hit = gm_count >= grep_limit;
+    sstatus.scan_complete = !scan_failed && !sstatus.grep_cap_hit;
+    sstatus.coverage_matches = cov_matches;
+    sstatus.coverage_samples = cov_samples;
+    sstatus.coverage_sample_count = cov_sample_count;
+    if (scan_failed && gm_count == 0) {
+        sstatus.outcome = "failed";
+        sstatus.count_relation = "unknown";
+    } else if (scoped && scoped_written == 0) {
+        sstatus.outcome = cov_matches > 0 ? "unindexed_scope" : "empty_scope";
+        /* Nothing was scanned: 0 says nothing about the file contents. */
+        sstatus.count_relation = "unknown";
+        /* Deterministically complete only when the coverage report was
+         * actually consulted; an unreadable report leaves the empty-scope
+         * conclusion unverified (issue #56 review finding 3). */
+        sstatus.scan_complete = cov_matches >= 0;
+    } else if (gm_count > 0) {
+        sstatus.outcome = "hits";
+        sstatus.count_relation = (sstatus.grep_cap_hit || scan_failed) ? "gte" : "eq";
+    } else {
+        sstatus.outcome = "no_match";
+        sstatus.count_relation = "eq";
+    }
+    sstatus.counts_exact = strcmp(sstatus.count_relation, "eq") == 0;
+
     char *result =
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
-                               root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
+                               root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0,
+                               &sstatus);
+    if (cov_rows) {
+        cbm_store_free_coverage(cov_rows, cov_total);
+    }
     free(gm);
     free(sr);
     free(raw);
