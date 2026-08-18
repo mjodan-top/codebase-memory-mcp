@@ -618,6 +618,15 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
 
+/* issue #56: single source of truth for the Projects row. Builds the project
+ * metadata (root_path, project_kind, alias, worktree/canonical roots, git
+ * common dir, HEAD sha, branch) from the pipeline's CURRENT repo_path +
+ * resolved git context and upserts it into `store`. Shared by the full path
+ * (dump_and_persist_hashes) and BOTH incremental exits (no-op fast path and
+ * row-level dump), so an alias/worktree rotation can never leave a stale
+ * root_path behind. Returns CBM_STORE_OK / CBM_STORE_ERR (already logged). */
+int cbm_pipeline_upsert_project_meta(cbm_pipeline_t *p, cbm_store_t *store);
+
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client
  * suffix is present (the stub-type signal that gates Route emission, #294).

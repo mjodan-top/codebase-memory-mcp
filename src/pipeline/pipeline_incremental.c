@@ -823,11 +823,15 @@ static void incr_fts_insert_file_cb(const char *key, void *value, void *userdata
     }
 }
 
-static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
-                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
-                             const CBMHashTable *changed_paths) {
+/* Returns 0 when the row-level dump AND the Projects-row sync both landed;
+ * CBM_STORE_ERR when the Projects row could not be synced (the content merge
+ * is rolled back — issue #56 fail-closed) or the DB could not be opened. */
+static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+                            cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
+                            const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+                            const cbm_coverage_row_t *cov, int cov_count,
+                            const CBMHashTable *changed_paths) {
+    const char *repo_path = cbm_pipeline_repo_path(p);
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -838,8 +842,13 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
      * ON DELETE CASCADE, foreign_keys=ON), then UPSERT only the changed-file
      * subgraph. Rows for unchanged files are never touched. */
     int dump_rc = CBM_STORE_ERR;
+    int meta_rc = CBM_STORE_OK;
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
-    if (hash_store) {
+    if (!hash_store) {
+        cbm_log_error("incremental.err", "msg", "dump_open_db_failed", "path", db_path);
+        return CBM_STORE_ERR;
+    }
+    {
         cbm_store_begin_bulk(hash_store);
         cbm_store_begin(hash_store);
         /* Issue #8: delete stale FTS5 rows for changed/deleted files BEFORE the
@@ -856,10 +865,35 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
             cbm_ht_foreach(changed_paths, incr_prune_file_cb, &prune);
         }
         dump_rc = cbm_gbuf_merge_changed_into_store(gbuf, hash_store, changed_paths);
-        cbm_store_commit(hash_store);
+        /* issue #56: sync the Projects row (root_path + git context) inside
+         * the SAME transaction as the content merge, AFTER the merge
+         * succeeded — a rotation must never persist the new tree's content
+         * while root_path still points at the old tree, and conversely a
+         * failed meta upsert must not leave the old graph re-labelled with
+         * the new root. On meta failure roll the whole transaction back. */
+        if (dump_rc == 0) {
+            meta_rc = cbm_pipeline_upsert_project_meta(p, hash_store);
+        }
+        if (dump_rc != 0 || meta_rc != CBM_STORE_OK) {
+            cbm_store_rollback(hash_store);
+        } else {
+            cbm_store_commit(hash_store);
+        }
         cbm_store_end_bulk(hash_store);
         cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "mode", "rowlevel", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+        /* Fail-closed: NEITHER a failed content merge NOR a failed Projects-row
+         * sync may fall through to hash/coverage/FTS persistence or artifact
+         * export — the transaction was rolled back, so persisting hashes now
+         * would mark the new tree "already indexed" while the graph still
+         * holds the old tree's rows. */
+        if (dump_rc != 0 || meta_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg",
+                          (dump_rc != 0) ? "merge_rollback" : "project_meta_rollback", "project",
+                          project);
+            cbm_store_close(hash_store);
+            return CBM_STORE_ERR;
+        }
 
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
 
@@ -891,6 +925,7 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     if (repo_path && cbm_artifact_exists(repo_path)) {
         cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
+    return 0;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
@@ -937,13 +972,21 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * which means existing hash rows (including for any mode-skipped files
      * that were already preserved by an earlier run) remain intact. */
     if (n_changed == 0 && deleted_count == 0) {
+        /* issue #56: an alias/worktree rotation with byte-identical content
+         * lands here — the graph rows are fine, but the Projects row still
+         * points at the PREVIOUS tree (root_path / worktree_root / head_sha /
+         * branch). Sync it from this run's repo_path + git context before
+         * returning success. Fail-closed: a failed upsert fails the run
+         * (caller falls back to a full reindex, which rewrites the row)
+         * instead of reporting success with stale metadata. */
+        int meta_rc = cbm_pipeline_upsert_project_meta(p, store);
         cbm_log_info("incremental.noop", "reason", "no_changes");
         free(is_changed);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
-        return 0;
+        return (meta_rc == CBM_STORE_OK) ? 0 : CBM_NOT_FOUND;
     }
 
     cbm_store_free_file_hashes(stored, stored_count);
@@ -1232,14 +1275,22 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, persist_changed);
+    int dp_rc = dump_and_persist(existing, db_path, project, p, files, file_count, mode_skipped,
+                                 mode_skipped_count, cov, cov_n, persist_changed);
     cbm_ht_foreach(persist_changed, incr_free_key_cb, NULL);
     cbm_ht_free(persist_changed);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
+
+    /* issue #56: fail-closed — a run whose persist boundary could not land
+     * both the content AND the Projects row reports failure (caller falls
+     * back to a destructive full reindex, which rewrites everything). */
+    if (dp_rc != 0) {
+        cbm_log_error("incremental.err", "msg", "dump_and_persist_failed", "rc", itoa_buf(dp_rc));
+        return CBM_NOT_FOUND;
+    }
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return 0;

@@ -1174,6 +1174,35 @@ static int64_t stat_mtime_ns(const struct stat *fst) {
 #endif
 }
 
+/* issue #56: shared Projects-row upsert — see pipeline_internal.h. */
+int cbm_pipeline_upsert_project_meta(cbm_pipeline_t *p, cbm_store_t *store) {
+    if (!p || !store || !p->project_name || !p->repo_path) {
+        return CBM_STORE_ERR;
+    }
+    char *proj_alias_tmp = cbm_git_context_read_project_alias(&p->git_ctx);
+    const char *project_kind = p->git_ctx.is_git ? "git-project" : "path-only";
+    if (proj_alias_tmp && strcmp(proj_alias_tmp, p->project_name) == 0) {
+        project_kind = "family-overlay";
+    }
+    cbm_project_t proj_meta = {
+        .name = p->project_name,
+        .root_path = p->repo_path,
+        .project_kind = project_kind,
+        .project_alias = proj_alias_tmp ? proj_alias_tmp : "",
+        .worktree_root = p->git_ctx.worktree_root ? p->git_ctx.worktree_root : "",
+        .canonical_root = p->git_ctx.canonical_root ? p->git_ctx.canonical_root : "",
+        .git_common_dir = p->git_ctx.git_common_dir ? p->git_ctx.git_common_dir : "",
+        .head_sha = p->git_ctx.head_sha ? p->git_ctx.head_sha : "",
+        .branch = p->git_ctx.branch ? p->git_ctx.branch : "",
+    };
+    int rc = cbm_store_upsert_project_ex(store, &proj_meta);
+    free(proj_alias_tmp);
+    if (rc != CBM_STORE_OK) {
+        cbm_log_error("pipeline.err", "phase", "project_meta", "project", p->project_name);
+    }
+    return rc;
+}
+
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
 static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
@@ -1214,24 +1243,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     CBM_PROF_END("persist", "1_reopen", t_reopen);
     if (hash_store) {
         CBM_PROF_START(t_delhash);
-        char *proj_alias_tmp = cbm_git_context_read_project_alias(&p->git_ctx);
-        const char *project_kind = p->git_ctx.is_git ? "git-project" : "path-only";
-        if (proj_alias_tmp && strcmp(proj_alias_tmp, p->project_name) == 0) {
-            project_kind = "family-overlay";
-        }
-        cbm_project_t proj_meta = {
-            .name = p->project_name,
-            .root_path = p->repo_path,
-            .project_kind = project_kind,
-            .project_alias = proj_alias_tmp ? proj_alias_tmp : "",
-            .worktree_root = p->git_ctx.worktree_root ? p->git_ctx.worktree_root : "",
-            .canonical_root = p->git_ctx.canonical_root ? p->git_ctx.canonical_root : "",
-            .git_common_dir = p->git_ctx.git_common_dir ? p->git_ctx.git_common_dir : "",
-            .head_sha = p->git_ctx.head_sha ? p->git_ctx.head_sha : "",
-            .branch = p->git_ctx.branch ? p->git_ctx.branch : "",
-        };
-        cbm_store_upsert_project_ex(hash_store, &proj_meta);
-        free(proj_alias_tmp);
+        (void)cbm_pipeline_upsert_project_meta(p, hash_store);
 
         cbm_store_delete_file_hashes(hash_store, p->project_name);
         CBM_PROF_END("persist", "2_delete_file_hashes", t_delhash);
