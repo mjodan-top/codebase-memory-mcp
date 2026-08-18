@@ -2010,6 +2010,10 @@ TEST(search_code_path_filter_prefilter_keeps_matches) {
     }
     ASSERT_EQ(grep_matches, 1);
 
+    /* issue #56: a scan with hits reports outcome "hits" with exact counts. */
+    ASSERT_NOT_NULL(strstr(inner, "\"outcome\":\"hits\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"counts_exact\":true"));
+
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -2056,12 +2060,208 @@ TEST(search_code_path_filter_matches_nothing) {
     ASSERT_TRUE(strstr(inner, "handler.go") == NULL);
     ASSERT_TRUE(strstr(inner, "other.go") == NULL);
 
+    /* issue #56: an empty scope (path_filter selected zero indexed files, and
+     * nothing in the coverage report matches either) must be machine-
+     * distinguishable from a true no-match — outcome says WHY it is empty. */
+    ASSERT_NOT_NULL(strstr(inner, "\"outcome\":\"empty_scope\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"scan_complete\":true"));
+
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
+
+/* issue #56 (search completeness contract): a true zero-hit scan over a
+ * non-empty indexed scope reports outcome "no_match" with exact counts.
+ * This also locks the POSIX exit-status normalization: the scoped command is
+ * `xargs -0 grep ...`, where grep's normal no-match exit 1 is remapped by
+ * xargs (POSIX: 123) and pclose() returns a wait status — a genuine no-match
+ * must NOT be misclassified as a failed scan. */
+TEST(search_code_no_match_outcome_issue56) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"NoSuchTokenAnywhere56\","
+             "\"project\":\"prefilter-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    ASSERT_NOT_NULL(strstr(inner, "\"outcome\":\"no_match\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"scan_complete\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"counts_exact\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count_relation\":\"eq\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"scope_mode\":\"indexed_filelist\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* issue #56: a path_filter that selects zero indexed files but DOES match
+ * rows in the index-coverage report (deliberately-unindexed paths, #963)
+ * must report outcome "unindexed_scope" with evidence — not a plain empty
+ * result. A dir-kind coverage row carries rel_path WITHOUT a trailing slash
+ * ("generated"), so a "^generated/" filter must still match it as a
+ * directory prefix. */
+TEST(search_code_unindexed_scope_outcome_issue56) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_coverage_row_t rows[] = {
+        {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(st, "prefilter-search", rows, 1), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"^generated/\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    ASSERT_NOT_NULL(strstr(inner, "\"outcome\":\"unindexed_scope\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"coverage_matches\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "not_indexed_dir"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* issue #56: hitting GREP_MAX_MATCHES (500) truncates the scan —
+ * total_grep_matches is then a LOWER BOUND and must be flagged, never passed
+ * off as an exact count. The early pipe close at the cap also makes the
+ * child's exit status meaningless (typically SIGPIPE); the cap path must not
+ * be misread as a failed scan. */
+TEST(search_code_grep_cap_lower_bound_issue56) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    FILE *fp = fopen(src_path, "a");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 600; i++) {
+        fprintf(fp, "// HandleRequest filler %d\n", i);
+    }
+    fclose(fp);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\","
+             "\"project\":\"prefilter-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    ASSERT_NOT_NULL(strstr(inner, "\"outcome\":\"hits\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"grep_cap_hit\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"counts_exact\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count_relation\":\"gte\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":500"));
+    ASSERT_NOT_NULL(strstr(inner, "lower bound"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+#ifndef _WIN32
+/* issue #56 review finding 1: a grep batch that ERRORS (exit >=2 — here an
+ * unreadable indexed file) must not be silently absorbed. Under xargs, grep's
+ * error exit used to collapse into the same 123 as a normal no-match; the sh
+ * wrapper's sentinel keeps the two apart. Hits from readable files still
+ * surface, but the scan is marked incomplete and the count a lower bound. */
+TEST(search_code_unreadable_file_degrades_not_silent_issue56) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    ASSERT_EQ(chmod(vendor_path, 0000), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\","
+             "\"project\":\"prefilter-search\"}}}");
+    chmod(vendor_path, 0644);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    ASSERT_NOT_NULL(strstr(inner, "\"outcome\":\"hits\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"scan_complete\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count_relation\":\"gte\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* issue #56: a scan whose subprocess could not execute at all (exit 127
+ * here: PATH emptied so `xargs`/`grep` are unfindable) must surface outcome
+ * "failed" with scan_complete=false — never a normal-looking zero-hit
+ * result. */
+TEST(search_code_scan_failure_not_silent_issue56) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char saved_path[4096];
+    const char *envp = getenv("PATH");
+    snprintf(saved_path, sizeof(saved_path), "%s", envp ? envp : "");
+    setenv("PATH", "/nonexistent-cbm-issue56", 1);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\","
+             "\"project\":\"prefilter-search\"}}}");
+    setenv("PATH", saved_path, 1);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    ASSERT_NOT_NULL(strstr(inner, "\"outcome\":\"failed\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"scan_complete\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count_relation\":\"unknown\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+#endif
 
 /* issue #283: search_code with regex=true and a syntactically invalid pattern
  * must return an explicit error, not an empty result indistinguishable from a
@@ -5723,6 +5923,13 @@ SUITE(mcp) {
 #endif
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
+    RUN_TEST(search_code_no_match_outcome_issue56);
+    RUN_TEST(search_code_unindexed_scope_outcome_issue56);
+    RUN_TEST(search_code_grep_cap_lower_bound_issue56);
+#ifndef _WIN32
+    RUN_TEST(search_code_unreadable_file_degrades_not_silent_issue56);
+    RUN_TEST(search_code_scan_failure_not_silent_issue56);
+#endif
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
