@@ -690,6 +690,18 @@ static int run_daemon(int argc, char **argv) {
 
     setup_signal_handlers();
 
+    /* A client (shim) that disconnects mid-response would otherwise deliver
+     * SIGPIPE to this process on the next write to its socket, and the default
+     * disposition terminates the WHOLE daemon — killing every other live
+     * session with it (observed 2026-09-07: last terminating signal = SIGPIPE
+     * right after a 19.3s index_repository response). Ignoring it turns that
+     * write into a plain EPIPE that mcp_uds_runner.c reports per connection.
+     * Scoped to the daemon role only: the legacy in-process stdio role keeps
+     * the default disposition, where dying on a closed stdout (exit 141) is the
+     * expected behaviour, and the shim role sets its own SIG_IGN in
+     * mcp_shim.c. */
+    (void)signal(SIGPIPE, SIG_IGN);
+
     cbm_mcp_core_t *core = cbm_mcp_core_new(NULL);
     if (!core) {
         cbm_log_error("daemon.err", "msg", "failed to create mcp core");

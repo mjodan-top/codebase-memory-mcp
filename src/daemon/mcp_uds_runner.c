@@ -6,6 +6,7 @@
 #include "daemon/mcp_uds_runner.h"
 
 #include "daemon/shim_handshake.h"
+#include "foundation/log.h"
 
 #include <errno.h>
 #ifndef _WIN32
@@ -103,6 +104,27 @@ static void *run_client_stream(void *arg) {
 
     setvbuf(out, NULL, _IONBF, 0);
     task->result = cbm_mcp_server_run(task->server, in, out);
+
+    /* Per-connection outcome, recorded BEFORE fclose() (which resets the error
+     * indicator and clobbers errno). The daemon role ignores SIGPIPE, so a
+     * client that vanished mid-response now surfaces here as a stream error
+     * instead of terminating the whole process. Both outcomes are logged so the
+     * ratio "broken vs. done" is mechanically countable over a time window —
+     * a silent write failure would otherwise be indistinguishable from a
+     * session that ended normally. */
+    {
+        const int write_failed = ferror(out) ? 1 : 0;
+        const int saved_errno = write_failed ? errno : 0;
+        char errno_str[16];
+        (void)snprintf(errno_str, sizeof(errno_str), "%d", saved_errno);
+        if (write_failed) {
+            cbm_log_warn("daemon.client_stream_broken", "errno", errno_str, "error",
+                         strerror(saved_errno));
+        } else {
+            cbm_log_info("daemon.client_stream_done", "result", task->result == 0 ? "ok" : "error");
+        }
+    }
+
     fclose(out);
     fclose(in);
     if (task->self_cleanup)
