@@ -80,6 +80,12 @@ TEST(skip_vendored) {
     ASSERT_TRUE(cbm_should_skip_dir("vendored", CBM_MODE_FULL));
     PASS();
 }
+/* #61: our own artifact dir must never be indexed as user code. */
+TEST(skip_codebase_memory_artifact_dir) {
+    ASSERT_TRUE(cbm_should_skip_dir(".codebase-memory", CBM_MODE_FULL));
+    ASSERT_TRUE(cbm_should_skip_dir(".codebase-memory", CBM_MODE_FAST));
+    PASS();
+}
 TEST(skip_terraform) {
     ASSERT_TRUE(cbm_should_skip_dir(".terraform", CBM_MODE_FULL));
     PASS();
@@ -660,6 +666,45 @@ TEST(discover_skips_worktrees) {
         if (strstr(files[i].rel_path, "main.go"))
             found_main = true;
         ASSERT_NULL(strstr(files[i].rel_path, ".worktrees"));
+    }
+    ASSERT_TRUE(found_main);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* #61: the indexer writes its own family artifact into <repo>/.codebase-memory
+ * (artifact.json + graph.db.zst). Walking that directory feeds our own
+ * metadata back into the symbol graph — measured at 9 -> 23 nodes (+156%) on a
+ * 3-file repo — so users end up searching indexer internals instead of their
+ * code. Discovery must see exactly the same file set whether or not the
+ * artifact dir is present, which is what this asserts. */
+TEST(discover_skips_own_artifact_dir) {
+    char *base = th_mktempdir("cbm_disc_art");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    /* Real artifact payload shape, plus an indexable source file: the
+     * exclusion must be by directory, not by file suffix. */
+    th_write_file(TH_PATH(base, ".codebase-memory/artifact.json"),
+                  "{\"project\":\"x\",\"schema_version\":1}\n");
+    th_write_file(TH_PATH(base, ".codebase-memory/leaked.go"), "package leaked\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* Exactly the user's own file — nothing from the artifact dir. */
+    ASSERT_EQ(count, 1);
+
+    bool found_main = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, "main.go"))
+            found_main = true;
+        ASSERT_NULL(strstr(files[i].rel_path, ".codebase-memory"));
     }
     ASSERT_TRUE(found_main);
 
@@ -1329,6 +1374,8 @@ SUITE(discover) {
 
     /* Go test ports (cross-platform) */
     RUN_TEST(discover_skips_worktrees);
+    RUN_TEST(skip_codebase_memory_artifact_dir);
+    RUN_TEST(discover_skips_own_artifact_dir);
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);
     RUN_TEST(discover_symlink_skipped);

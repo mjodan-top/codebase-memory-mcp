@@ -48,7 +48,13 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* Deploy */
     ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
-    ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+    ".qdrant_code_embeddings", ".tmp", "vendor", "vendored",
+    /* This tool's own output (#61): .codebase-memory holds the family artifact
+     * (artifact.json + graph.db.zst) that WE write into the repo being indexed.
+     * Walking it feeds our own metadata back into the symbol graph — measured
+     * at +156% nodes on a 3-file repo (9 -> 23) — and pollutes user searches
+     * with this indexer's own internals. Never a legitimate index target. */
+    ".codebase-memory", NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
     "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
