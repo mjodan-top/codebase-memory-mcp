@@ -2866,11 +2866,29 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
                     snprintf(artdir, sizeof(artdir), "%s/.codebase-memory", fam_root);
                     snprintf(zst, sizeof(zst), "%s/graph.db.zst", artdir);
                     snprintf(meta, sizeof(meta), "%s/artifact.json", artdir);
+                    char ga[CBM_SZ_2K];
+                    snprintf(ga, sizeof(ga), "%s/.gitattributes", artdir);
                     int rc1 = cbm_unlink(zst); int e1 = errno;
                     int rc2 = cbm_unlink(meta); int e2 = errno;
+                    /* Also drop the .gitattributes that cbm_artifact_export()
+                     * writes next to the payload (ensure_gitattributes()).
+                     * Leaving it behind makes both rmdir() calls fail, so the
+                     * snapshot dir survives as a husk that contradicts
+                     * family_snapshot_deleted=true — on 2026-09-08 that husk
+                     * sent a real investigation chasing a non-existent
+                     * "leftover snapshot" (#61). A later export recreates it. */
+                    (void)cbm_unlink(ga);
                     if ((rc1 == 0 || e1 == ENOENT) && (rc2 == 0 || e2 == ENOENT)) {
-                        (void)cbm_rmdir(artdir);
-                        (void)cbm_rmdir(fam_root);
+                        /* Residue is not a delete failure (the payload IS gone),
+                         * but it must not be silent either: without this line a
+                         * surviving dir looks identical to a clean delete. */
+                        if (cbm_rmdir(artdir) != 0 && errno != ENOENT) {
+                            cbm_log_warn("delete_project.family_dir_residue", "path", artdir,
+                                         "error", strerror(errno));
+                        } else if (cbm_rmdir(fam_root) != 0 && errno != ENOENT) {
+                            cbm_log_warn("delete_project.family_dir_residue", "path", fam_root,
+                                         "error", strerror(errno));
+                        }
                         family_deleted = true;
                     }
                 }
