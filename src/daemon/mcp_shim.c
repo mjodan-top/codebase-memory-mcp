@@ -8,12 +8,19 @@
 #include "daemon/shim_handshake.h"
 #include "daemon/uds_lifecycle.h"
 
+/* Path/dir helpers only (no MCP server, store, or graph): the structural
+ * guarantee documented in mcp_shim.h stays intact — see the journal block
+ * below for why the cache-dir convention is reused instead of re-derived. */
+#include "foundation/compat_fs.h" /* cbm_mkdir_p */
+#include "foundation/platform.h"  /* cbm_resolve_cache_dir */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -26,9 +33,22 @@ enum {
     CBM_SHIM_RELAY_BUF_SIZE = 65536,
 };
 
+/* Last diagnostic emitted by this process, remembered so the connect-outcome
+ * journal below can name the failure WITHOUT duplicating the state string
+ * literals at a second site: every state name has exactly one definition
+ * point, namely its diag()/diag_errno() call. The shim's connect path is
+ * single-threaded (the relay thread-free poll loop runs after it), so plain
+ * file-static storage is sufficient. */
+static const char *g_last_diag_state = NULL;
+static const char *g_last_diag_detail = NULL;
+static int g_last_diag_errno = 0;
+
 /* All diagnostics go to stderr, one line, machine-greppable
  * ("shim.<state>=<detail>"), never touching stdout (MCP transport). */
 static void diag(const char *state, const char *detail_key, const char *detail_val) {
+    g_last_diag_state = state;
+    g_last_diag_detail = detail_val;
+    g_last_diag_errno = 0;
     if (detail_val) {
         (void)fprintf(stderr, "codebase-memory-mcp: shim.%s %s=%s\n", state, detail_key,
                       detail_val);
@@ -38,8 +58,131 @@ static void diag(const char *state, const char *detail_key, const char *detail_v
 }
 
 static void diag_errno(const char *state, int err) {
+    g_last_diag_state = state;
+    g_last_diag_detail = NULL;
+    g_last_diag_errno = err;
     (void)fprintf(stderr, "codebase-memory-mcp: shim.%s errno=%d error=%s\n", state, err,
                   strerror(err));
+}
+
+/* ── Connect-outcome journal (persistent + mechanically aggregatable) ─────
+ *
+ * WHY THIS EXISTS (2026-09-07 incident): the daemon was killed by SIGPIPE and
+ * stayed dead for ~30 hours. Every new session's shim correctly failed closed,
+ * but its ONLY trace was one stderr line inside that session (swallowed by the
+ * host agent), while the daemon's own log simply stopped growing. Nothing
+ * persistent could answer "how many sessions lost the daemon, starting when,
+ * for what reason" — the failure was 100% reproducible yet invisible.
+ *
+ * So every shim start appends exactly one line here, for BOTH outcomes: a
+ * failure line alone cannot yield a rate, and AGENTS.md §5 requires the
+ * degraded and healthy sides to be equally countable. This machine
+ * deliberately runs no active alerting; the log IS the discovery mechanism, so
+ * the format is stable key=value (matching foundation/log.h) and one event per
+ * line, countable by event name over any time window.
+ *
+ * Fail-open by construction: a journal that cannot be written must never
+ * change the shim's exit code, its stdout (MCP transport), or its errno.
+ *
+ * Not cbm_log(): that writes to stderr and would need a global sink callback
+ * to reach a file — extra global state and a tee of unrelated lines in a role
+ * that deliberately initializes nothing. A single write() to an O_APPEND fd is
+ * also atomic for short lines, so concurrent shim processes (one per session)
+ * never interleave. The cache-dir + /logs location is NOT re-derived here: it
+ * reuses cbm_resolve_cache_dir(), the same authority mcp.c and
+ * index_supervisor.c use for their logs, so CBM_CACHE_DIR keeps moving all of
+ * them together. */
+enum {
+    CBM_SHIM_JOURNAL_LINE_MAX = 512,
+    CBM_SHIM_JOURNAL_PATH_MAX = 1024,
+};
+
+/* Resolve the journal file path. CBM_SHIM_LOG overrides it (same convention as
+ * CBM_INDEX_LOG); CBM_SHIM_LOG=off|0|none disables journaling entirely.
+ * Returns 0 on success, -1 when disabled or unresolvable (caller stays silent). */
+static int shim_journal_path(char *out, size_t out_size) {
+    const char *override = getenv("CBM_SHIM_LOG");
+    if (override && override[0]) {
+        if (strcmp(override, "off") == 0 || strcmp(override, "0") == 0 ||
+            strcmp(override, "none") == 0) {
+            return -1;
+        }
+        int n = snprintf(out, out_size, "%s", override);
+        return (n > 0 && (size_t)n < out_size) ? 0 : -1;
+    }
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir || !cdir[0]) {
+        return -1;
+    }
+    char dir[CBM_SHIM_JOURNAL_PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s/logs", cdir);
+    if (n < 0 || (size_t)n >= sizeof(dir)) {
+        return -1;
+    }
+    (void)cbm_mkdir_p(dir, 0755);
+    n = snprintf(out, out_size, "%s/shim.log", dir);
+    return (n > 0 && (size_t)n < out_size) ? 0 : -1;
+}
+
+static void shim_journal_utc_now(char *out, size_t out_size) {
+    time_t now = time(NULL);
+    struct tm tmv;
+    if (gmtime_r(&now, &tmv) && strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", &tmv) > 0) {
+        return;
+    }
+    (void)snprintf(out, out_size, "unknown");
+}
+
+/* Append one key=value line describing this shim's connect outcome. */
+static void shim_journal(const char *event, const char *socket_path) {
+    const int saved_errno = errno; /* never perturb the caller's errno */
+    char path[CBM_SHIM_JOURNAL_PATH_MAX];
+    if (shim_journal_path(path, sizeof(path)) != 0) {
+        errno = saved_errno;
+        return;
+    }
+
+    char ts[32];
+    shim_journal_utc_now(ts, sizeof(ts));
+
+    /* No diag() ran => nothing went wrong on the way in. */
+    const char *state = g_last_diag_state ? g_last_diag_state : "attached";
+    const char *level = g_last_diag_state ? "warn" : "info";
+    char line[CBM_SHIM_JOURNAL_LINE_MAX];
+    int n = snprintf(line, sizeof(line), "ts=%s level=%s msg=%s state=%s", ts, level, event, state);
+    if (n > 0 && (size_t)n < sizeof(line) && g_last_diag_errno != 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " errno=%d error=%s", g_last_diag_errno,
+                      strerror(g_last_diag_errno));
+    }
+    if (n > 0 && (size_t)n < sizeof(line) && g_last_diag_detail) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " detail=%s", g_last_diag_detail);
+    }
+    if (n > 0 && (size_t)n < sizeof(line)) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " socket=%s pid=%d",
+                      socket_path ? socket_path : "-", (int)getpid());
+    }
+    if (n < 0) {
+        errno = saved_errno;
+        return;
+    }
+    /* Bounded line length: on truncation still terminate with a newline, so a
+     * long socket path can never fuse two records into one unparsable line. */
+    size_t len = (size_t)n < sizeof(line) - 1 ? (size_t)n : sizeof(line) - 2;
+    line[len] = '\n';
+    len++;
+
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        errno = saved_errno;
+        return;
+    }
+    ssize_t w;
+    do {
+        w = write(fd, line, len);
+    } while (w < 0 && errno == EINTR);
+    (void)w;
+    (void)close(fd);
+    errno = saved_errno;
 }
 
 static long long shim_now_ms(void) {
@@ -285,18 +428,24 @@ int cbm_mcp_shim_run(const cbm_shim_options_t *opts, int stdin_fd, int stdout_fd
     char resolved[108];
     if (cbm_uds_socket_path_resolve(resolved, sizeof(resolved), opts->socket_path) != 0) {
         diag_errno("resolve_failed", errno);
+        shim_journal("shim.connect_failed", opts->socket_path);
         return CBM_SHIM_EXIT_USAGE;
     }
 
     cbm_shim_exit_t connect_exit = CBM_SHIM_EXIT_OK;
     int uds_fd = shim_connect(resolved, connect_timeout_ms, &connect_exit);
     if (uds_fd < 0) {
+        /* state/errno come from the diag_errno() shim_connect already emitted,
+         * so the journal reports the precise reason (stale socket vs. daemon
+         * absent vs. permission denied) without a second copy of those names. */
+        shim_journal("shim.connect_failed", resolved);
         return (int)connect_exit;
     }
 
     cbm_shim_hs_result_t hs = cbm_shim_handshake_client(uds_fd, handshake_timeout_ms);
     if (hs != CBM_SHIM_HS_OK) {
         diag("handshake_failed", "result", cbm_shim_hs_result_name(hs));
+        shim_journal("shim.connect_failed", resolved);
         close(uds_fd);
         switch (hs) {
         case CBM_SHIM_HS_VERSION_MISMATCH:
@@ -308,7 +457,17 @@ int cbm_mcp_shim_run(const cbm_shim_options_t *opts, int stdin_fd, int stdout_fd
         }
     }
 
+    /* Healthy side of the ratio: without this line "3 failures" is not a rate
+     * and a permanently broken daemon looks the same as an idle machine. */
+    shim_journal("shim.connect_ok", resolved);
+
     int rc = shim_relay(stdin_fd, uds_fd, stdout_fd);
     close(uds_fd);
+    if (rc == CBM_SHIM_EXIT_MIDSTREAM_LOST) {
+        /* The daemon died with a live session attached — exactly the 2026-09-07
+         * shape. Journaling it pins the moment the daemon went away, which the
+         * connect-time lines alone can only bracket. */
+        shim_journal("shim.session_lost", resolved);
+    }
     return rc;
 }

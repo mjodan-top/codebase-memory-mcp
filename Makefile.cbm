@@ -659,6 +659,12 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 TEST_PLATFORM_TARGETS :=
 ifneq ($(IS_MINGW),yes)
 TEST_PLATFORM_TARGETS += test-uds-lifecycle test-mcp-uds-runner
+# Deliberately part of the default `test` gate rather than a standalone script:
+# the outage it guards against (2026-09-07, a client disconnect killing the whole
+# daemon) stayed invisible for ~30h, and a live E2E nobody runs would not have
+# caught it either. Costs ~2s once the production binary exists.
+TEST_PLATFORM_TARGETS += test-daemon-client-disconnect
+TEST_PLATFORM_TARGETS += test-shim-journal
 endif
 
 test: $(BUILD_DIR)/test-runner $(TEST_PLATFORM_TARGETS)
@@ -857,6 +863,21 @@ security: cbm
 	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="
+
+# Regression gate for the 2026-09-07 SIGPIPE outage: a real production daemon,
+# a real client that closes the socket before reading its response, and the
+# assertion that the daemon both survives and keeps serving — plus that each
+# broken stream is logged with a countable event and its errno.
+.PHONY: test-daemon-client-disconnect
+test-daemon-client-disconnect: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_daemon_client_disconnect.sh
+
+# Regression gate for the client-side half of the 2026-09-07 outage: the shim's
+# connect outcome must land in a persistent, countable journal, so a dead daemon
+# is discoverable from logs instead of one stderr line the host agent swallows.
+.PHONY: test-shim-journal
+test-shim-journal: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_shim_journal.sh
 
 # Issue #28: production daemon + two UDS shims + HTTP per-state live E2E.
 .PHONY: test-per-state-live-e2e
