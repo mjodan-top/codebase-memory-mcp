@@ -1254,6 +1254,59 @@ TEST(tool_delete_project_reports_family_flags) {
     PASS();
 }
 
+/* #61: the response claiming family_snapshot_deleted is only trustworthy if the
+ * disk agrees. A real snapshot dir also holds the merge-driver .gitattributes
+ * written by cbm_artifact_export(); when that file survived, BOTH rmdir() calls
+ * failed and the directory lingered — indistinguishable from a snapshot that was
+ * never deleted. On 2026-09-08 that husk sent a real investigation chasing a
+ * non-existent "leftover snapshot". Assert the payload AND the directory are
+ * gone, not just that the response mentions the flag. */
+TEST(tool_delete_project_family_snapshot_leaves_no_husk) {
+    char *cache = th_mktempdir("cbm_famdel_cache");
+    ASSERT_NOT_NULL(cache);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *proj = "husk-proj";
+    char fam[CBM_SZ_1K];
+    char artdir[CBM_SZ_1K];
+    snprintf(fam, sizeof(fam), "%s/families/%s", cache, proj);
+    snprintf(artdir, sizeof(artdir), "%s/.codebase-memory", fam);
+
+    /* The snapshot branch only runs after the project's own .db was found and
+     * unlinked, so the fixture needs that file too — without it delete_project
+     * returns an error and never touches the snapshot at all. */
+    th_write_file(TH_PATH(cache, "husk-proj.db"), "sqlite-stub");
+
+    /* Full payload exactly as artifact export writes it. */
+    th_write_file(TH_PATH(artdir, "graph.db.zst"), "not-really-zst");
+    th_write_file(TH_PATH(artdir, "artifact.json"), "{\"schema_version\":1}\n");
+    th_write_file(TH_PATH(artdir, ".gitattributes"), "*.zst binary\n");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_store_upsert_project(st, proj, "/tmp/husk-proj");
+    cbm_mcp_server_set_project(srv, proj);
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"delete_family_snapshot\":true}", proj);
+    char *resp = cbm_mcp_handle_tool(srv, "delete_project", args);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    struct stat sb;
+    ASSERT(stat(artdir, &sb) != 0);
+    ASSERT(stat(fam, &sb) != 0);
+
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -5700,6 +5753,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_family_snapshot_not_found);
     RUN_TEST(tool_delete_project_reports_family_flags);
+    RUN_TEST(tool_delete_project_family_snapshot_leaves_no_husk);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
