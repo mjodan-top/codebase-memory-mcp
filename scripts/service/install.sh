@@ -95,7 +95,17 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$BIN" ] || die "--bin is required"
-[ -n "$SOCK" ] || die "--socket is required"
+# --socket is optional: when omitted we derive the SAME default that
+# cbm_uds_socket_path_resolve() (src/daemon/uds_lifecycle.c) picks when no
+# override is configured. That function is the authority for this path; the
+# shim resolves it independently, so any drift between the two silently
+# strands every client on a socket nobody is listening on.
+# tests/e2e/test_launchd_self_heal.sh asserts the two still agree.
+if [ -z "$SOCK" ]; then
+    [ -n "${HOME:-}" ] ||
+        die "--socket is required here (no HOME to derive the default socket path from)"
+    SOCK="$HOME/.codebase-memory-daemon/daemon.sock"
+fi
 [ -e "$BIN" ] || die "--bin '$BIN' does not exist"
 [ -x "$BIN" ] || die "--bin '$BIN' is not executable"
 # Absolute paths: the service manager runs without our cwd.
@@ -121,6 +131,15 @@ install_launchd() {
     fi
 
     mkdir -p "$AGENT_DIR" "$LOG_DIR"
+
+    # Under socket activation LAUNCHD binds the socket — and launchd does NOT
+    # create its parent directory (#60). A missing parent makes `launchctl
+    # bootstrap` fail with error 5, which is exactly what drove this project
+    # off socket activation once before (back when the default socket lived in
+    # /tmp and got swept). Create it here, 0700 so only this user can reach it.
+    SOCK_DIR=$(dirname "$SOCK")
+    mkdir -p "$SOCK_DIR"
+    chmod 700 "$SOCK_DIR"
 
     cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -175,6 +194,13 @@ install_systemd() {
         die "unit files for '$LABEL' already exist in $UNIT_DIR — run uninstall.sh first (no half-overwrite)"
 
     mkdir -p "$UNIT_DIR"
+
+    # Same reason as the launchd side (#60): with socket activation the service
+    # manager binds ListenStream= itself and does not create the parent
+    # directory for us.
+    SOCK_DIR=$(dirname "$SOCK")
+    mkdir -p "$SOCK_DIR"
+    chmod 700 "$SOCK_DIR"
 
     cat >"$SOCKET_UNIT" <<EOF
 [Unit]

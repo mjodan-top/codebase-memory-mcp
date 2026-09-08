@@ -665,6 +665,11 @@ TEST_PLATFORM_TARGETS += test-uds-lifecycle test-mcp-uds-runner
 # caught it either. Costs ~2s once the production binary exists.
 TEST_PLATFORM_TARGETS += test-daemon-client-disconnect
 TEST_PLATFORM_TARGETS += test-shim-journal
+# The other half of the 2026-09-07 outage (#60): the daemon died and nothing
+# brought it back for ~30h. Asserts recovery is structural (socket activation),
+# with the pre-fix RunAtLoad+KeepAlive shape as a built-in counter-example.
+# Self-skips on non-Darwin.
+TEST_PLATFORM_TARGETS += test-launchd-self-heal
 endif
 
 test: $(BUILD_DIR)/test-runner $(TEST_PLATFORM_TARGETS)
@@ -878,6 +883,12 @@ test-daemon-client-disconnect: $(BUILD_DIR)/codebase-memory-mcp
 .PHONY: test-shim-journal
 test-shim-journal: $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_shim_journal.sh
+
+# Issue #60: kill the daemon and require that a plain client connection brings
+# it back with no human in the loop.
+.PHONY: test-launchd-self-heal
+test-launchd-self-heal: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_launchd_self_heal.sh
 
 # Issue #28: production daemon + two UDS shims + HTTP per-state live E2E.
 .PHONY: test-per-state-live-e2e

@@ -120,11 +120,29 @@ int cbm_uds_socket_path_resolve(char *out, size_t out_size, const char *override
         n = snprintf(candidate, sizeof(candidate), "%s", override_path);
     } else {
         const char *runtime = getenv("XDG_RUNTIME_DIR");
-        if (runtime && runtime[0] != '\0')
+        const char *home = getenv("HOME");
+        if (runtime && runtime[0] != '\0') {
             n = snprintf(candidate, sizeof(candidate), "%s/codebase-memory/daemon.sock", runtime);
-        else
+        } else if (home && home[0] != '\0') {
+            /* Issue #60: the default must live somewhere PERSISTENT. It used to
+             * be /tmp/codebase-memory-<uid>/, which the OS reaps periodically
+             * (and empties on reboot on macOS). Under socket activation the
+             * service manager — not us — binds the socket, and it will NOT
+             * create the parent directory: once /tmp was swept, `launchctl
+             * bootstrap` failed with error 5 and the whole self-healing
+             * on-demand mode had to be abandoned for a hand-written
+             * RunAtLoad+KeepAlive plist that (measured 2026-09-08) launchd
+             * never actually restarts. A persistent parent keeps socket
+             * activation viable, which is what makes the daemon come back by
+             * itself after it dies. */
+            n = snprintf(candidate, sizeof(candidate), "%s/.codebase-memory-daemon/daemon.sock",
+                         home);
+        } else {
+            /* No HOME at all (minimal container/CI env): last-resort fallback.
+             * Deliberately NOT reached on a normal desktop login. */
             n = snprintf(candidate, sizeof(candidate), "/tmp/codebase-memory-%lu/daemon.sock",
                          (unsigned long)geteuid());
+        }
     }
     if (n < 0 || (size_t)n >= sizeof(candidate) || (size_t)n >= out_size) {
         errno = ENAMETOOLONG;
