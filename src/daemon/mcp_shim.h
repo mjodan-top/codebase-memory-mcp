@@ -21,6 +21,16 @@
  * stdout carries ONLY bytes read verbatim from the daemon's UDS connection
  * (which are, by construction, legal MCP frames written by cbm_mcp_server_run
  * on the daemon side). All shim-owned diagnostics go to stderr.
+ *
+ * CONNECT-OUTCOME JOURNAL: in addition to the stderr diagnostic, every run
+ * appends exactly one key=value line recording its outcome (reached the daemon
+ * / failed to, and why) to <cache_dir>/logs/shim.log — because a per-session
+ * stderr line is invisible once the host agent swallows it, which is how a
+ * dead daemon went unnoticed for ~30 hours on 2026-09-07. CBM_SHIM_LOG
+ * overrides the path; CBM_SHIM_LOG=off|0|none disables it. The journal is
+ * strictly fail-open: it never changes the exit code, stdout, or errno, and it
+ * pulls in only path helpers (foundation/platform.h, foundation/compat_fs.h),
+ * so the structural guarantee above is unaffected.
  */
 
 #ifdef __cplusplus
