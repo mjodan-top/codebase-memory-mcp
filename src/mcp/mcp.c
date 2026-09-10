@@ -312,6 +312,15 @@ typedef struct {
     const char *input_schema; /* JSON string */
 } tool_def_t;
 
+/* Shared schema for the `project` argument of every query tool. Spells out
+ * every accepted form so agents stop guessing (#65): 7-day review showed 50% of
+ * daemon-window misses were an absolute repo path passed as `project`. */
+#define MCP_PROJECT_PROP_SCHEMA                                                            \
+    "{\"type\":\"string\",\"description\":\"Indexed project. Accepts: project name "       \
+    "(from list_projects), its project_alias, the repo root directory name, the absolute " \
+    "root_path it was indexed from, or any path inside that repo / a git worktree of the " \
+    "same repo (resolved via git common-dir).\"}"
+
 static const tool_def_t TOOLS[] = {
     {"index_repository", "Index repository",
      "Index a repository into the knowledge graph. "
@@ -361,7 +370,7 @@ static const tool_def_t TOOLS[] = {
      "'has_more' (true when total > offset+returned). Detect truncation with has_more, then "
      "page by re-calling with offset=offset+limit until has_more is false. Narrow first via "
      "label/file_pattern/min_degree before paginating large result sets.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA ","
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
      "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
      "indexed as individual words (updateCloudClient → update, cloud, client). Results are "
@@ -409,7 +418,7 @@ static const tool_def_t TOOLS[] = {
      "f.kind = \\\"parse_partial\\\" RETURN f.file_path, f.detail. Absence from this graph is "
      "NOT a completeness guarantee.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
-     "query\"},\"project\":{\"type\":\"string\"},"
+     "query\"},\"project\":" MCP_PROJECT_PROP_SCHEMA ","
      "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"missed\"],\"default\":\"code\","
      "\"description\":\"Which graph to query: the code knowledge graph (default) or the "
      "missed graph (only files not fully indexed, laid out as their file structure).\"},"
@@ -454,7 +463,7 @@ static const tool_def_t TOOLS[] = {
 
     {"get_graph_schema", "Get graph schema",
      "Get the schema of the knowledge graph (node labels, edge types)",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA "},\"required\":["
      "\"project\"]}"},
 
     {"get_architecture", "Get architecture",
@@ -465,7 +474,8 @@ static const tool_def_t TOOLS[] = {
      "the real architectural seams, which often cut across the folder layout. Optional path scopes "
      "analysis to nodes under that directory prefix (file_path).",
      /* The aspects enum mirrors VALID_ASPECTS (see aspect_is_valid) — update both together. */
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":"
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA
+     ",\"path\":{\"type\":"
      "\"string\",\"description\":\"Optional directory prefix to scope architecture (e.g. "
      "apps/hoa)\"},"
      "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"all\","
@@ -498,17 +508,18 @@ static const tool_def_t TOOLS[] = {
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
      "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
 
-    {"list_projects", "List projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
+    {"list_projects", "List projects", "List all indexed projects",
+     "{\"type\":\"object\",\"properties\":{}}"},
 
     {"list_family_snapshots", "List family snapshots", "List local family snapshot caches",
      "{\"type\":\"object\",\"properties\":{}}"},
 
     {"delete_family_snapshot", "Delete family snapshot", "Delete a local family snapshot cache",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":[\"project\"]}"},
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA
+     "},\"required\":[\"project\"]}"},
 
-    {"delete_project", "Delete project",
-     "Delete a project from the index",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+    {"delete_project", "Delete project", "Delete a project from the index",
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA ","
      "\"delete_family_snapshot\":{\"type\":\"boolean\",\"default\":false}},\"required\":["
      "\"project\"]}"},
 
@@ -524,11 +535,12 @@ static const tool_def_t TOOLS[] = {
      "query_graph(graph=\"missed\"). The report also carries 'not_indexed' — files/dirs excluded "
      "BY DESIGN (gitignore/.cbmignore/skip-lists): deliberate and deterministic, not failures; "
      "change the ignore rules and re-index to include them.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA "},\"required\":["
      "\"project\"]}"},
 
     {"detect_changes", "Detect changes", "Detect code changes and their impact",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA
+     ",\"scope\":{\"type\":"
      "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
@@ -536,7 +548,8 @@ static const tool_def_t TOOLS[] = {
      "[\"project\"]}"},
 
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
+     "{\"type\":\"object\",\"properties\":{\"project\":" MCP_PROJECT_PROP_SCHEMA
+     ",\"mode\":{\"type\":"
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
@@ -839,6 +852,7 @@ static char *normalize_project_arg(char *project) {
 /* Forward decl — definition lives below alongside resolve_store_fallback_scan,
  * whose cache-dir helpers it reuses. */
 static char *resolve_bare_project_name(char *project);
+static char *resolve_project_by_git_repo(char *project, const char *raw_path);
 
 /* Resolve the project argument, accepting the canonical "project" key plus the
  * aliases a caller naturally reaches for (#640): list_projects surfaces the
@@ -860,7 +874,16 @@ static char *get_project_arg(const char *args_json) {
     /* Bare directory-name / alias resolution (spike S2): map e.g. "coder" to
      * the indexed project whose root_path basename or alias is "coder", when
      * that mapping is unique. See resolve_bare_project_name below. */
-    return resolve_bare_project_name(normalize_project_arg(p));
+    if (!p || (!strchr(p, '/') && !strchr(p, '\\'))) {
+        return resolve_bare_project_name(normalize_project_arg(p));
+    }
+    /* Path form: normalize_project_arg rewrites it into a name, so keep the
+     * raw path for the git-identity fallback (#65). */
+    char *raw = heap_strdup(p);
+    char *resolved = resolve_bare_project_name(normalize_project_arg(p));
+    resolved = resolve_project_by_git_repo(resolved, raw);
+    free(raw);
+    return resolved;
 }
 
 int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val) {
@@ -1288,7 +1311,21 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         char full_path[CBM_SZ_2K];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
         char iname[CBM_SZ_1K];
-        if (!db_internal_project_name(full_path, iname, sizeof(iname), NULL)) {
+        cbm_store_t *st = NULL;
+        if (!db_internal_project_name(full_path, iname, sizeof(iname), &st)) {
+            continue;
+        }
+        /* #65: advertise only projects whose root still exists on disk. Deleted
+         * worktrees / tmp repos (145 of 153 locally) would otherwise drown the
+         * hint in names that resolve but answer every query with 0 results. */
+        bool root_alive = true;
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(st, iname, &proj) == CBM_STORE_OK) {
+            root_alive = proj.root_path && proj.root_path[0] && cbm_is_dir(proj.root_path);
+            cbm_project_free_fields(&proj);
+        }
+        cbm_store_close(st);
+        if (!root_alive) {
             continue;
         }
         /* Element-boundary write: only emit this name if the WHOLE element —
@@ -1645,6 +1682,125 @@ static char *resolve_bare_project_name(char *project) {
         cbm_log_info("mcp.project_bare_name_resolved", "passed", project, "resolved", match);
         free(project);
         return heap_strdup(match);
+    }
+    return project;
+}
+
+/* Strip a trailing "/.git" (or bare ".git" dir marker) and trailing slashes so
+ * two roots can be compared textually. Writes into `out`. */
+static void repo_key_normalize(const char *path, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s", path ? path : "");
+    cbm_normalize_path_sep(out);
+    size_t len = strlen(out);
+    while (len > 1 && out[len - 1] == '/') {
+        out[--len] = '\0';
+    }
+    if (len >= SLEN("/.git") && strcmp(out + len - SLEN("/.git"), "/.git") == 0) {
+        out[len - SLEN("/.git")] = '\0';
+    }
+}
+
+/* Git identity of a directory: its canonical_root (the common-dir's repo root,
+ * shared by every worktree of one repo). Falls back to worktree_root, then to
+ * the realpath of the input itself for non-git dirs. Returns false when the
+ * path does not exist on disk (nothing to compare against). */
+static bool path_repo_key(const char *path, char *out, size_t out_sz) {
+    if (!path || !path[0] || !cbm_is_dir(path)) {
+        return false;
+    }
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(path, &ctx);
+    const char *key = NULL;
+    if (ctx.is_git && ctx.canonical_root && ctx.canonical_root[0]) {
+        key = ctx.canonical_root;
+    } else if (ctx.is_git && ctx.worktree_root && ctx.worktree_root[0]) {
+        key = ctx.worktree_root;
+    } else {
+        key = path;
+    }
+    repo_key_normalize(key, out, out_sz);
+    cbm_git_context_free(&ctx);
+    return out[0] != '\0';
+}
+
+/* Absolute-path project resolution (#65): agents pass the repo they are
+ * standing in as `project` — "/Users/me/work/solo/run-solo-company" — while the
+ * project was indexed through a stable alias symlink or from a sibling
+ * worktree, so neither basename nor project_alias matches and every query
+ * tool answers "project not found or not indexed". In the 7-day review
+ * (2026-09-02→09-09) that single shape was 50% of all misses inside the daemon
+ * window, and each one flipped the session back to grep.
+ *
+ * Resolve by git identity instead: take the passed path's canonical repo root
+ * (git common-dir → same for every worktree of one repo) and adopt the UNIQUE
+ * indexed project whose root_path lives in that same repo AND still exists on
+ * disk. Stale projects (root gone) are never candidates — 145 of 153 local
+ * projects were deleted worktrees at the time of writing. Ambiguous (>1) and
+ * no-match stay unchanged so the existing not-found error applies.
+ *
+ * Only paths that look like paths (contain a separator) are considered; bare
+ * names already went through the basename/alias scan above. Takes ownership
+ * of `project` like resolve_bare_project_name. */
+static char *resolve_project_by_git_repo(char *project, const char *raw_path) {
+    if (!project || !raw_path || !raw_path[0]) {
+        return project;
+    }
+    /* Already addresses a db (name / basename / alias resolved) — nothing to do. */
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    if (db_path[0] && cbm_file_exists(db_path)) {
+        return project;
+    }
+    char want[CBM_SZ_2K];
+    if (!path_repo_key(raw_path, want, sizeof(want))) {
+        return project;
+    }
+
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        return project;
+    }
+
+    char match[CBM_SZ_1K] = "";
+    int candidates = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *n = entry->name;
+        size_t len = strlen(n);
+        if (!is_project_db_file(n, len)) {
+            continue;
+        }
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
+        char iname[CBM_SZ_1K];
+        cbm_store_t *st = NULL;
+        if (!db_internal_project_name(full_path, iname, sizeof(iname), &st)) {
+            continue;
+        }
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(st, iname, &proj) == CBM_STORE_OK) {
+            char have[CBM_SZ_2K];
+            bool hit = proj.root_path && path_repo_key(proj.root_path, have, sizeof(have)) &&
+                       strcmp(have, want) == 0;
+            cbm_project_free_fields(&proj);
+            if (hit && strcmp(match, iname) != 0) {
+                candidates++;
+                snprintf(match, sizeof(match), "%s", iname);
+            }
+        }
+        cbm_store_close(st);
+    }
+    cbm_closedir(d);
+
+    if (candidates == 1 && match[0]) {
+        cbm_log_info("mcp.project_git_repo_resolved", "passed", raw_path, "resolved", match);
+        free(project);
+        return heap_strdup(match);
+    }
+    if (candidates > 1) {
+        cbm_log_info("mcp.project_git_repo_ambiguous", "passed", raw_path, "candidates", match);
     }
     return project;
 }
