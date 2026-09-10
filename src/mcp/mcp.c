@@ -2064,6 +2064,16 @@ static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
+    /* The internal `name` is often an alias (e.g. "coder-fam") or a path-mangled
+     * slug (e.g. "Users-zkf-work-digi") that looks nothing like the repo the caller
+     * has in mind, so callers guess between several spellings of the same project.
+     * Publish the root directory's basename as an explicit, human-recognizable
+     * handle; it is accepted by the same resolver that accepts `name`. */
+    if (root_path_buf[0]) {
+        const char *base = strrchr(root_path_buf, '/');
+        base = (base && base[1]) ? base + 1 : root_path_buf;
+        yyjson_mut_obj_add_strcpy(doc, p, "repo_dir_name", base);
+    }
     add_project_cache_json(doc, p, project_name, root_path_buf[0] ? root_path_buf : NULL);
     add_git_context_json(doc, p, root_path_buf[0] ? root_path_buf : NULL);
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
@@ -6422,6 +6432,45 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
         char ratio[CBM_SZ_32];
         snprintf(ratio, sizeof(ratio), "%.1fx", (double)gm_count / (double)(sr_count + raw_count));
         yyjson_mut_obj_add_strcpy(doc, root_obj, "dedup_ratio", ratio);
+    }
+
+    /* Result status: an empty `results` array is ambiguous on its own — it can mean
+     * "this repo genuinely has no such text" or "grep DID match, but every hit fell
+     * outside an indexed graph node (comments, config, docs, unparsed regions), so
+     * enrichment produced nothing". Callers that only read `results` treat both as
+     * "not found" and fall back to grep. Emit an explicit machine-readable status so
+     * the two are distinguishable, and point at raw_matches when it holds the answer.
+     * Counted both ways (see result_status values) so log aggregation can compute how
+     * often enrichment drops every hit. */
+    const char *result_status = NULL;
+    if (sr_count > 0) {
+        result_status = "enriched";
+    } else if (gm_count > 0) {
+        /* grep matched but nothing survived graph enrichment */
+        result_status = raw_count > 0 ? "raw_only" : "dropped_by_enrichment";
+    } else {
+        result_status = "no_match";
+    }
+    yyjson_mut_obj_add_str(doc, root_obj, "result_status", result_status);
+    if (sr_count == 0 && gm_count > 0) {
+        char em[CBM_SZ_1K];
+        if (raw_count > 0) {
+            snprintf(em, sizeof(em),
+                     "results is empty but grep matched %d line(s): the hits are outside any "
+                     "indexed function/class (comments, config, docs). The matches ARE in "
+                     "'raw_matches' below (%d shown) - read them instead of falling back to grep.",
+                     gm_count, raw_count);
+        } else {
+            snprintf(em, sizeof(em),
+                     "results is empty but grep matched %d line(s); enrichment dropped all of "
+                     "them. This is an index-coverage gap, NOT proof the pattern is absent - "
+                     "re-run with mode='files' to see the matching files.",
+                     gm_count);
+        }
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "empty_results_reason", em);
+        char gmc[CBM_SZ_32];
+        snprintf(gmc, sizeof(gmc), "%d", gm_count);
+        cbm_log_warn("search.enrichment_dropped_all", "grep_matches", gmc);
     }
 
     /* Warnings: surface common foot-guns instead of leaving them silent. */
