@@ -623,13 +623,27 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
     free(resp);
 
+    /* Page 2 (offset 8, page size 8) holds tools 8..15. The TOOLS table now
+     * has more than 16 entries (prune_projects, #66), so this page must
+     * advertise a nextCursor and the tail lives on page 3. */
     resp = cbm_mcp_server_handle(
         srv,
         "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
-    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\":\"16\""));
+    ASSERT_NOT_NULL(strstr(resp, "prune_projects"));
     ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_NULL(strstr(resp, "ingest_traces"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/"
+                                      "list\",\"params\":{\"cursor\":\"16\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":203"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
+    ASSERT_NULL(strstr(resp, "manage_adr"));
     free(resp);
 
     cbm_mcp_server_free(srv);
