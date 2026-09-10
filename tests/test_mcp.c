@@ -4074,6 +4074,104 @@ TEST(tool_bad_project_error_valid_json_issue235) {
 }
 #undef BADPROJ_JSON_DBNAME
 
+/* ── not-found hint must point at index_repository (both branches) ──
+ *
+ * Field evidence (svc-feishu, 2026-09-10): four "project not found or not
+ * indexed" replies in a row and the agent silently fell back to grep, because
+ * the hint only said "use list_projects". With projects present (count > 0)
+ * the hint must name BOTH causes — wrong name vs. repo never indexed — and tell
+ * the agent to call index_repository once (single-flight merges duplicates).
+ * With an empty cache (count == 0) the hint must say the same. Body stays
+ * valid JSON and available_projects/count keep their shape. */
+static char *nfh_query_unknown_project(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
+             "\"search_graph\",\"arguments\":{\"label\":\"Function\","
+             "\"project\":\"definitely-not-a-real-project-nfh\"}}}");
+    char *body = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+    return body;
+}
+
+TEST(tool_bad_project_hint_names_index_repository) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-badproj-nfh-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* Branch 1: count == 0 (empty cache). */
+    char *body0 = nfh_query_unknown_project();
+
+    /* Branch 2: count > 0 (one indexed db present). */
+    char dbname[512];
+    snprintf(dbname, sizeof(dbname), "%s/nfh_indexed_project.db", cache);
+    cbm_store_t *st = cbm_store_open_path(dbname);
+    if (st) {
+        cbm_store_upsert_project(st, "nfh_indexed_project", cache);
+        cbm_store_close(st);
+    }
+    char *body1 = nfh_query_unknown_project();
+
+    /* Evaluate BEFORE cleanup so a RED still restores the environment. */
+    bool ok0 = false, ok1 = false, aps_ok = false;
+    if (body0) {
+        yyjson_doc *d = yyjson_read(body0, strlen(body0), 0);
+        if (d) {
+            yyjson_val *hint = yyjson_obj_get(yyjson_doc_get_root(d), "hint");
+            const char *h = hint && yyjson_is_str(hint) ? yyjson_get_str(hint) : "";
+            ok0 = strstr(h, "index_repository") && strstr(h, "single-flight");
+            yyjson_doc_free(d);
+        }
+    }
+    if (body1) {
+        yyjson_doc *d = yyjson_read(body1, strlen(body1), 0);
+        if (d) {
+            yyjson_val *root = yyjson_doc_get_root(d);
+            yyjson_val *hint = yyjson_obj_get(root, "hint");
+            const char *h = hint && yyjson_is_str(hint) ? yyjson_get_str(hint) : "";
+            /* both causes named, index_repository is a one-shot, single-flight explained */
+            ok1 = strstr(h, "available_projects") && strstr(h, "index_repository") &&
+                  strstr(h, "ONCE") && strstr(h, "single-flight");
+            yyjson_val *aps = yyjson_obj_get(root, "available_projects");
+            yyjson_val *cnt = yyjson_obj_get(root, "count");
+            aps_ok = aps && yyjson_is_arr(aps) && cnt && yyjson_is_int(cnt) &&
+                     yyjson_arr_size(aps) == (size_t)yyjson_get_int(cnt) &&
+                     yyjson_get_int(cnt) == 1;
+            yyjson_doc_free(d);
+        }
+    }
+    free(body0);
+    free(body1);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(dbname);
+    char side[540];
+    snprintf(side, sizeof(side), "%s-wal", dbname);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", dbname);
+    cbm_unlink(side);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(ok0);
+    ASSERT_TRUE(ok1);
+    ASSERT_TRUE(aps_ok);
+    PASS();
+}
+
 /* ── #704: project resolution must key on the db's INTERNAL project name ──
  *
  * Issue #704: project resolution is registry-less and filename-addressed.
@@ -5872,6 +5970,7 @@ SUITE(mcp) {
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
+    RUN_TEST(tool_bad_project_hint_names_index_repository);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
     RUN_TEST(tool_resolve_bare_project_name_spike_s2);
 
