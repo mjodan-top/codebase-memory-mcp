@@ -670,6 +670,10 @@ TEST_PLATFORM_TARGETS += test-shim-journal
 # with the pre-fix RunAtLoad+KeepAlive shape as a built-in counter-example.
 # Self-skips on non-Darwin.
 TEST_PLATFORM_TARGETS += test-launchd-self-heal
+# #65: `project` passed as an absolute repo / worktree path must resolve to the
+# alias-indexed project of the same git repo, and the not-found hint must only
+# advertise projects whose root still exists. Real git repo + worktree + index.
+TEST_PLATFORM_TARGETS += test-project-arg-path-resolve
 endif
 
 test: $(BUILD_DIR)/test-runner $(TEST_PLATFORM_TARGETS)
@@ -891,6 +895,12 @@ test-launchd-self-heal: $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_launchd_self_heal.sh
 
 # Issue #28: production daemon + two UDS shims + HTTP per-state live E2E.
+# Issue #65: absolute path / sibling worktree as `project` → same-repo project;
+# stale (root-deleted) projects are excluded from the not-found hint.
+.PHONY: test-project-arg-path-resolve
+test-project-arg-path-resolve: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_project_arg_path_resolve.sh
+
 .PHONY: test-per-state-live-e2e
 test-per-state-live-e2e: $(BUILD_DIR)/codebase-memory-mcp
 	CBM_E2E_BIN="$(CURDIR)/$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test-per-state-live-e2e.sh
