@@ -234,8 +234,19 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     result->outcome = r.outcome;
     result->exit_code = r.exit_code;
     result->term_signal = r.term_signal;
-    if (r.outcome == CBM_PROC_CLEAN) {
+    if (r.outcome == CBM_PROC_CLEAN || r.outcome == CBM_PROC_EXIT_NONZERO) {
+        /* CLEAN: the worker's result. EXIT_NONZERO: the worker ran the handler
+         * to completion, wrote its (isError) result, and then exited with the
+         * CLI's non-zero code for an error result — a GRACEFUL failure (e.g.
+         * "repo_path is required" from a mangled arg), not a crash. Hand the real
+         * response back so the caller can surface the actual reason instead of a
+         * generic "crashed on a file". A signal/hang leaves no complete response
+         * (the file is absent or partial) and stays NULL. */
         result->response = slurp_file(resp_path);
+        if (result->response && result->response[0] == '\0') {
+            free(result->response);
+            result->response = NULL;
+        }
     }
     (void)remove(resp_path);
 
@@ -261,6 +272,11 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
         (void)remove(log_path);
     } else if (r.outcome == CBM_PROC_CLEAN) {
         cbm_log_info("index.supervisor.profile_log", "log", log_path);
+    } else if (r.outcome == CBM_PROC_EXIT_NONZERO && result->response) {
+        /* Graceful failure with the worker's own response in hand: not a crash.
+         * Say so explicitly so the log is not misread as "crashed on a file". */
+        cbm_log_warn("index.supervisor.worker_reported_error", "exit_code", exit_buf, "log",
+                     log_path);
     } else {
         cbm_log_warn("index.supervisor.worker_failed", "outcome", cbm_proc_outcome_str(r.outcome),
                      "exit_code", exit_buf, "log", log_path);
