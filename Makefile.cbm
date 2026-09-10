@@ -677,6 +677,9 @@ TEST_PLATFORM_TARGETS += test-project-arg-path-resolve
 # #65: a project whose indexed root was deleted must fail loud (root_missing),
 # not return a clean total=0 that reads as "the symbol does not exist".
 TEST_PLATFORM_TARGETS += test-stale-root-fail-loud
+# Issue #66: prune_projects must list/delete exactly the projects whose
+# root_path is gone and never touch a live one. Isolated CBM_CACHE_DIR, ~3s.
+TEST_PLATFORM_TARGETS += test-prune-projects
 endif
 
 test: $(BUILD_DIR)/test-runner $(TEST_PLATFORM_TARGETS)
@@ -903,6 +906,12 @@ test-shim-journal: $(BUILD_DIR)/codebase-memory-mcp
 .PHONY: test-launchd-self-heal
 test-launchd-self-heal: $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_launchd_self_heal.sh
+
+# Issue #66: prune stale projects (root_path gone) — dry_run / age filter /
+# real delete / live-project safety, all against an isolated cache dir.
+.PHONY: test-prune-projects
+test-prune-projects: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_prune_projects.sh
 
 # Issue #28: production daemon + two UDS shims + HTTP per-state live E2E.
 # Issue #65: absolute path / sibling worktree as `project` → same-repo project;
