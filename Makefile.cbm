@@ -674,6 +674,9 @@ TEST_PLATFORM_TARGETS += test-launchd-self-heal
 # alias-indexed project of the same git repo, and the not-found hint must only
 # advertise projects whose root still exists. Real git repo + worktree + index.
 TEST_PLATFORM_TARGETS += test-project-arg-path-resolve
+# #65: a project whose indexed root was deleted must fail loud (root_missing),
+# not return a clean total=0 that reads as "the symbol does not exist".
+TEST_PLATFORM_TARGETS += test-stale-root-fail-loud
 endif
 
 test: $(BUILD_DIR)/test-runner $(TEST_PLATFORM_TARGETS)
@@ -880,6 +883,13 @@ security: cbm
 .PHONY: test-daemon-client-disconnect
 test-daemon-client-disconnect: $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_daemon_client_disconnect.sh
+
+# Regression gate for #65: after `rm -rf <root>` every query tool answers
+# {"error":"root_missing"} and list_projects hides the project by default
+# (stale_count) unless include_stale=true.
+.PHONY: test-stale-root-fail-loud
+test-stale-root-fail-loud: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_stale_root_fail_loud.sh
 
 # Regression gate for the client-side half of the 2026-09-07 outage: the shim's
 # connect outcome must land in a persistent, countable journal, so a dead daemon

@@ -34,6 +34,19 @@
 #define cbm_getcwd getcwd
 #endif
 
+/* #65: every query tool now refuses a project whose root_path is gone
+ * (root_missing) instead of answering with an empty result. Fixtures that seed
+ * a project row with a placeholder root ("/tmp/issue-552") must therefore make
+ * that directory exist, or the tool under test never runs. Routed through a
+ * wrapper so the seeding call sites stay unchanged. */
+static int test_upsert_project_with_root(cbm_store_t *st, const char *proj, const char *root) {
+    if (root && root[0]) {
+        cbm_mkdir_p(root, 0755);
+    }
+    return cbm_store_upsert_project(st, proj, root);
+}
+#define cbm_store_upsert_project test_upsert_project_with_root
+
 static char mcp_log_buf[4096];
 
 static void mcp_capture_log(const char *line) {
@@ -3827,6 +3840,7 @@ static bool spike_s2_make_db(const char *dir, const char *filename, const char *
     proj.name = internal;
     proj.root_path = root_path;
     proj.project_alias = alias;
+    cbm_mkdir_p(root_path, 0755); /* #65: root must exist for queries to run */
     bool ok = (cbm_store_upsert_project_ex(st, &proj) == CBM_STORE_OK);
     if (ok) {
         char qn[256];
