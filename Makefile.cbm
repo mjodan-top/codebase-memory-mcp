@@ -680,6 +680,9 @@ TEST_PLATFORM_TARGETS += test-stale-root-fail-loud
 # Issue #66: prune_projects must list/delete exactly the projects whose
 # root_path is gone and never touch a live one. Isolated CBM_CACHE_DIR, ~3s.
 TEST_PLATFORM_TARGETS += test-prune-projects
+# Supervised worker that fails gracefully (isError result, exit 1) must surface
+# its own error text, not "crashed on a file". Real spawn, isolated cache, ~3s.
+TEST_PLATFORM_TARGETS += test-supervisor-surface-worker-error
 endif
 
 test: $(BUILD_DIR)/test-runner $(TEST_PLATFORM_TARGETS)
@@ -893,6 +896,10 @@ test-daemon-client-disconnect: $(BUILD_DIR)/codebase-memory-mcp
 .PHONY: test-stale-root-fail-loud
 test-stale-root-fail-loud: $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_stale_root_fail_loud.sh
+
+.PHONY: test-supervisor-surface-worker-error
+test-supervisor-surface-worker-error: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && BIN="$(BUILD_DIR)/codebase-memory-mcp" tests/e2e/test_supervisor_surface_worker_error.sh
 
 # Regression gate for the client-side half of the 2026-09-07 outage: the shim's
 # connect outcome must land in a persistent, countable journal, so a dead daemon

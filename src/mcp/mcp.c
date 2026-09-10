@@ -5033,6 +5033,21 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         supervisor_invalidate_store(srv);
         return resp;
     }
+    if (wr.outcome == CBM_PROC_EXIT_NONZERO && wr.response) {
+        /* Graceful failure: the worker completed the handler, wrote its isError
+         * result (e.g. "repo_path is required" from a mangled arg) and exited
+         * non-zero via the CLI's error-result exit code. Nothing crashed and no
+         * file is to blame, so the recovery loop would only re-run the same
+         * failure `cap` times and then mislabel it "crashed on a file". Return
+         * the worker's real response verbatim so the agent sees the actual reason. */
+        char *resp = wr.response; /* transfer ownership to caller */
+        wr.response = NULL;
+        cbm_index_worker_result_free(&wr);
+        supervisor_invalidate_store(srv);
+        cbm_log_warn("index.supervisor.worker_error", "outcome",
+                     cbm_proc_outcome_str(CBM_PROC_EXIT_NONZERO), "action", "return_response");
+        return resp;
+    }
 
     /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the
      * worker PARALLEL (there are no sequential production runs) with the
@@ -5074,6 +5089,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *resp = NULL;
+    char *graceful_resp = NULL;  /* worker's own isError response on a non-zero exit */
     int quarantined = 0;         /* files pinned + added to the quarantine list so far */
     char **prev_suspects = NULL; /* previous failed round's in-flight set */
     int prev_n = 0;
@@ -5141,8 +5157,14 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             continue;
         }
         /* SPAWN_FAILED / nonzero exit / non-fault kill → not a crash we can
-         * attribute; stop and report a contained failure. */
+         * attribute; stop. A graceful non-zero exit that carries the worker's own
+         * isError response is returned verbatim (same as the first attempt); the
+         * rest report a contained failure. */
         last_outcome = wr2.outcome;
+        if (wr2.outcome == CBM_PROC_EXIT_NONZERO && wr2.response) {
+            graceful_resp = wr2.response; /* transfer ownership to caller */
+            wr2.response = NULL;
+        }
         cbm_index_worker_result_free(&wr2);
         break;
     }
@@ -5176,7 +5198,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     supervisor_invalidate_store(srv);
 
     if (resp) {
+        free(graceful_resp);
         return resp;
+    }
+    if (graceful_resp) {
+        cbm_log_warn("index.supervisor.worker_error", "outcome",
+                     cbm_proc_outcome_str(CBM_PROC_EXIT_NONZERO), "action", "return_response");
+        return graceful_resp;
     }
     return build_worker_failure_response(args, last_outcome);
 }
