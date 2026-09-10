@@ -527,6 +527,21 @@ static const tool_def_t TOOLS[] = {
      "\"delete_family_snapshot\":{\"type\":\"boolean\",\"default\":false}},\"required\":["
      "\"project\"]}"},
 
+    {"prune_projects", "Prune stale projects",
+     "Find (and optionally delete) indexed projects whose root_path directory no longer exists "
+     "on disk — deleted worktrees, /tmp test repos, moved checkouts. Such stale projects still "
+     "answer queries from their frozen graph (silently empty), crowd list_projects, and waste "
+     "cache space. Default dry_run=true only LISTS candidates; pass dry_run=false to actually "
+     "delete them (same path as delete_project, including the family snapshot residue cleanup). "
+     "Projects whose root_path still exists are NEVER touched. older_than_days keeps projects "
+     "indexed within the last N days even if their root is gone (protects a repo that was just "
+     "moved and is about to be re-indexed).",
+     "{\"type\":\"object\",\"properties\":{\"dry_run\":{\"type\":\"boolean\",\"default\":true,"
+     "\"description\":\"true (default): list candidates only. false: delete them.\"},"
+     "\"older_than_days\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Only prune "
+     "projects whose last index (indexed_at, falling back to the .db mtime) is older than "
+     "this many days. Omit for no age filter.\"}}}"},
+
     {"index_status", "Index status",
      "Get the indexing status of a project: node/edge counts, root path, git context, and the "
      "indexing-COVERAGE report — which files the indexer could NOT fully cover (best-effort "
@@ -3206,6 +3221,258 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     free(name);
 
     char *result = cbm_mcp_text_result(json, is_error);
+    free(json);
+    return result;
+}
+
+/* prune_projects (#66) — find (and optionally delete) indexed projects whose
+ * root_path no longer exists on disk.
+ *
+ * Why: worktree/tmp checkouts get deleted but their .db stays in the cache
+ * forever. Those stale projects still resolve, answer search_code with a
+ * frozen graph (silently total=0 for anything added later) and crowd
+ * list_projects — 145/153 of the projects on the 2026-09-09 host were such
+ * husks. delete_project only takes one name at a time, so cleaning up meant
+ * hand-picking names from list_projects.
+ *
+ * Contract:
+ *   - A project is a candidate iff it has a recorded root_path AND that path
+ *     does not exist. Projects with an empty/unknown root_path are never
+ *     touched (we cannot prove they are stale).
+ *   - older_than_days (optional) additionally requires last_indexed to be
+ *     older than N days; last_indexed = projects.indexed_at (ISO 8601 UTC),
+ *     falling back to the .db mtime when the column is empty/unparseable.
+ *   - dry_run=true (default) only lists; dry_run=false routes each candidate
+ *     through handle_delete_project (same locking / watcher / store-close
+ *     path) with delete_family_snapshot=false — a stale worktree shares its
+ *     family snapshot with the live main checkout, so pruning must never
+ *     touch it. */
+
+/* Like cbm_mcp_get_bool_arg but distinguishes "absent" from "false". */
+static bool cbm_mcp_get_bool_arg_default(const char *args_json, const char *key, bool default_val) {
+    if (!args_json) {
+        return default_val;
+    }
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) {
+        return default_val;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *val = root ? yyjson_obj_get(root, key) : NULL;
+    bool result = default_val;
+    if (val && yyjson_is_bool(val)) {
+        result = yyjson_get_bool(val);
+    }
+    yyjson_doc_free(doc);
+    return result;
+}
+
+/* Parse "YYYY-MM-DDTHH:MM:SS[Z]" (what the indexer writes to indexed_at) into
+ * epoch seconds. Returns -1 when the string is missing or not in that shape. */
+static int64_t parse_iso8601_utc(const char *s) {
+    if (!s || !s[0]) {
+        return -1;
+    }
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
+    int n = sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &sec);
+    if (n < 3 || y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31) {
+        return -1;
+    }
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = y - 1900;
+    tmv.tm_mon = mo - 1;
+    tmv.tm_mday = d;
+    tmv.tm_hour = h;
+    tmv.tm_min = mi;
+    tmv.tm_sec = sec;
+#ifdef _WIN32
+    time_t t = _mkgmtime(&tmv);
+#else
+    time_t t = timegm(&tmv);
+#endif
+    return t < 0 ? -1 : (int64_t)t;
+}
+
+static char *handle_prune_projects(cbm_mcp_server_t *srv, const char *args) {
+    bool dry_run = cbm_mcp_get_bool_arg_default(args, "dry_run", true);
+    /* CBM_NOT_FOUND is -1, which would swallow a user-supplied -1; use a
+     * sentinel no caller can plausibly pass so negatives are rejected loudly. */
+    static const int AGE_UNSET = -2147483647;
+    int older_than_days = cbm_mcp_get_int_arg(args, "older_than_days", AGE_UNSET);
+    if (older_than_days != AGE_UNSET && older_than_days < 0) {
+        return cbm_mcp_text_result(
+            "{\"error\":\"older_than_days must be >= 0\",\"hint\":\"omit it for no age filter\"}",
+            true);
+    }
+    const int64_t now = (int64_t)time(NULL);
+    const int64_t max_age_s = older_than_days == AGE_UNSET ? -1 : (int64_t)older_than_days * 86400;
+
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        char msg[CBM_SZ_1K];
+        snprintf(msg, sizeof(msg),
+                 "{\"error\":\"cannot read cache directory: %s\",\"hint\":"
+                 "\"Check directory permissions or run index_repository first.\"}",
+                 dir_path);
+        return cbm_mcp_text_result(msg, true);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *candidates = yyjson_mut_arr(doc);
+    yyjson_mut_val *skipped = yyjson_mut_arr(doc);
+
+    /* Pass 1: collect. The store is opened read-only per db and closed again
+     * before any deletion so we never unlink a file we still hold open. */
+    while (true) {
+        cbm_dirent_t *entry = cbm_readdir(d);
+        if (!entry) {
+            break;
+        }
+        const char *fname = entry->name;
+        size_t len = strlen(fname);
+        if (!is_project_db_file(fname, len)) {
+            continue;
+        }
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, fname);
+
+        char project_name[CBM_SZ_1K];
+        cbm_store_t *pstore = NULL;
+        struct stat st;
+        bool have_st = stat(full_path, &st) == 0;
+        if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &pstore)) {
+            continue; /* ghost / unreadable — not a resolvable project, leave it */
+        }
+
+        cbm_project_t proj = {0};
+        bool have_proj = cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK;
+        char root_path_buf[CBM_SZ_1K] = "";
+        int64_t last_indexed = -1;
+        if (have_proj) {
+            if (proj.root_path) {
+                snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
+            }
+            last_indexed = parse_iso8601_utc(proj.indexed_at);
+            cbm_project_free_fields(&proj);
+        }
+        cbm_store_close(pstore);
+        if (last_indexed < 0 && have_st) {
+            last_indexed = (int64_t)st.st_mtime;
+        }
+
+        if (!root_path_buf[0]) {
+            yyjson_mut_val *s = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, s, "name", project_name);
+            yyjson_mut_obj_add_str(doc, s, "reason", "no_root_path");
+            yyjson_mut_arr_add_val(skipped, s);
+            continue;
+        }
+        if (cbm_file_exists(root_path_buf)) {
+            continue; /* live project — NEVER a candidate */
+        }
+        if (max_age_s >= 0 && last_indexed >= 0 && (now - last_indexed) < max_age_s) {
+            yyjson_mut_val *s = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, s, "name", project_name);
+            yyjson_mut_obj_add_strcpy(doc, s, "root_path", root_path_buf);
+            yyjson_mut_obj_add_str(doc, s, "reason", "newer_than_older_than_days");
+            yyjson_mut_arr_add_val(skipped, s);
+            continue;
+        }
+
+        yyjson_mut_val *c = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, c, "name", project_name);
+        yyjson_mut_obj_add_strcpy(doc, c, "root_path", root_path_buf);
+        yyjson_mut_obj_add_int(doc, c, "size_bytes", have_st ? (int64_t)st.st_size : -1);
+        if (last_indexed >= 0) {
+            char ts[32];
+            time_t li = (time_t)last_indexed;
+            struct tm tmv;
+#ifdef _WIN32
+            gmtime_s(&tmv, &li);
+#else
+            gmtime_r(&li, &tmv);
+#endif
+            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+            yyjson_mut_obj_add_strcpy(doc, c, "last_indexed", ts);
+        } else {
+            yyjson_mut_obj_add_null(doc, c, "last_indexed");
+        }
+        yyjson_mut_arr_add_val(candidates, c);
+    }
+    cbm_closedir(d);
+
+    /* Pass 2 (dry_run=false): delete via the canonical delete_project path. */
+    yyjson_mut_val *deleted = yyjson_mut_arr(doc);
+    yyjson_mut_val *failed = yyjson_mut_arr(doc);
+    int64_t freed_bytes = 0;
+    if (!dry_run) {
+        size_t idx, max;
+        yyjson_mut_val *c;
+        yyjson_mut_arr_foreach(candidates, idx, max, c) {
+            const char *pname = yyjson_mut_get_str(yyjson_mut_obj_get(c, "name"));
+            int64_t sz = yyjson_mut_get_sint(yyjson_mut_obj_get(c, "size_bytes"));
+
+            yyjson_mut_doc *adoc = yyjson_mut_doc_new(NULL);
+            yyjson_mut_val *aroot = yyjson_mut_obj(adoc);
+            yyjson_mut_doc_set_root(adoc, aroot);
+            yyjson_mut_obj_add_str(adoc, aroot, "project", pname);
+            yyjson_mut_obj_add_bool(adoc, aroot, "delete_family_snapshot", false);
+            char *ajson = yy_doc_to_str(adoc);
+            yyjson_mut_doc_free(adoc);
+
+            char *res = handle_delete_project(srv, ajson);
+            free(ajson);
+
+            /* handle_delete_project wraps its JSON in an MCP text result; the
+             * status we care about is "deleted". Anything else → failed. */
+            bool ok = res && strstr(res, "\\\"status\\\":\\\"deleted\\\"") != NULL;
+            if (!ok && res) {
+                ok = strstr(res, "\"status\":\"deleted\"") != NULL;
+            }
+            if (ok) {
+                yyjson_mut_arr_add_strcpy(doc, deleted, pname);
+                if (sz > 0) {
+                    freed_bytes += sz;
+                }
+            } else {
+                yyjson_mut_val *f = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, f, "name", pname);
+                yyjson_mut_obj_add_str(doc, f, "reason", "delete_project did not report deleted");
+                yyjson_mut_arr_add_val(failed, f);
+                cbm_log_warn("prune_projects.delete_failed", "project", pname);
+            }
+            free(res);
+        }
+    }
+
+    yyjson_mut_obj_add_bool(doc, root, "dry_run", dry_run);
+    if (older_than_days != AGE_UNSET) {
+        yyjson_mut_obj_add_int(doc, root, "older_than_days", older_than_days);
+    } else {
+        yyjson_mut_obj_add_null(doc, root, "older_than_days");
+    }
+    yyjson_mut_obj_add_int(doc, root, "count", (int64_t)yyjson_mut_arr_size(candidates));
+    yyjson_mut_obj_add_val(doc, root, "candidates", candidates);
+    yyjson_mut_obj_add_val(doc, root, "skipped", skipped);
+    if (!dry_run) {
+        yyjson_mut_obj_add_val(doc, root, "deleted", deleted);
+        yyjson_mut_obj_add_val(doc, root, "failed", failed);
+        yyjson_mut_obj_add_int(doc, root, "freed_bytes", freed_bytes);
+    } else if (yyjson_mut_arr_size(candidates) > 0) {
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               "dry_run=true: nothing was deleted. Re-run with dry_run=false to "
+                               "remove these projects.");
+    }
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json, false);
     free(json);
     return result;
 }
@@ -7187,6 +7454,9 @@ static char *mcp_handle_tool_unlocked(cbm_mcp_server_t *srv, const char *tool_na
     }
     if (strcmp(tool_name, "delete_project") == 0) {
         return handle_delete_project(srv, args_json);
+    }
+    if (strcmp(tool_name, "prune_projects") == 0) {
+        return handle_prune_projects(srv, args_json);
     }
     if (strcmp(tool_name, "trace_path") == 0 || strcmp(tool_name, "trace_call_path") == 0) {
         return handle_trace_call_path(srv, args_json);

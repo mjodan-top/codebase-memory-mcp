@@ -422,6 +422,7 @@ codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
+| `prune_projects` | List (default `dry_run=true`) or delete (`dry_run=false`) indexed projects whose `root_path` no longer exists — deleted worktrees, `/tmp` test repos. Optional `older_than_days` age filter. Live projects are never touched. |
 | `index_status` | Check indexing status of a project. |
 
 ### Querying
