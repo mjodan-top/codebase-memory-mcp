@@ -1440,15 +1440,29 @@ static char *build_project_list_error(const char *reason) {
     enum { ERR_BUF_SZ = 5120 };
     char buf[ERR_BUF_SZ];
     if (count > 0) {
+        /* Two distinct causes share this error; spell both out so an agent does
+         * not fall back to grep. (a) wrong name → check available_projects;
+         * (b) repo never indexed → index_repository ONCE (same-repo concurrent
+         * calls are merged by the single-flight lock, later callers wait and
+         * reuse the result). Budget: projects (<= CBM_SZ_4K) + reason + ~500 B
+         * of scaffolding/hint must stay < ERR_BUF_SZ. */
         snprintf(buf, sizeof(buf),
-                 "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
-                 "then pass it as the \\\"project\\\" "
-                 "argument.\",\"available_projects\":[%s],\"count\":%d}",
+                 "{\"error\":\"%s\",\"hint\":\"Two possible causes. "
+                 "(a) Wrong project name: pick the exact name from available_projects "
+                 "(or call list_projects) and pass it as the \\\"project\\\" argument. "
+                 "(b) This repository is not indexed yet: call "
+                 "index_repository(repo_path=<absolute repo path>) ONCE, then retry; "
+                 "concurrent calls for the same repository are merged by a single-flight "
+                 "lock (later callers wait and reuse the result), so do not re-trigger it. "
+                 "Do not fall back to grep.\","
+                 "\"available_projects\":[%s],\"count\":%d}",
                  reason, projects, count);
     } else {
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"No projects indexed yet. "
-                 "Call index_repository first.\"}",
+                 "Call index_repository(repo_path=<absolute repo path>) once, then retry; "
+                 "concurrent calls for the same repository are merged by a single-flight "
+                 "lock. Do not fall back to grep.\"}",
                  reason);
     }
     return heap_strdup(buf);
