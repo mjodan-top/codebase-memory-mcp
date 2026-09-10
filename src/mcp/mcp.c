@@ -508,8 +508,12 @@ static const tool_def_t TOOLS[] = {
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
      "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
 
-    {"list_projects", "List projects", "List all indexed projects",
-     "{\"type\":\"object\",\"properties\":{}}"},
+    {"list_projects", "List projects",
+     "List indexed projects. Projects whose root_path no longer exists on disk are hidden by "
+     "default and reported in 'stale_count'; pass include_stale=true to list them too.",
+     "{\"type\":\"object\",\"properties\":{\"include_stale\":{\"type\":\"boolean\","
+     "\"default\":false,\"description\":\"Also list projects whose indexed root directory has "
+     "been deleted (stale). Default false.\"}}}"},
 
     {"list_family_snapshots", "List family snapshots", "List local family snapshot caches",
      "{\"type\":\"object\",\"properties\":{}}"},
@@ -1156,6 +1160,8 @@ cbm_mcp_session_phase_t cbm_mcp_server_session_phase(const cbm_mcp_server_t *srv
 /* ── Cache dir + project DB path helpers ───────────────────────── */
 
 /* Returns the cache directory. Writes to buf, returns buf for convenience. */
+static bool dir_exists(const char *path);
+
 static const char *cache_dir(char *buf, size_t bufsz) {
     const char *dir = cbm_resolve_cache_dir();
     if (!dir) {
@@ -1982,8 +1988,14 @@ static void maybe_backfill_project_cache_metadata(cbm_store_t *pstore, const cha
 
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
-static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, int64_t size_bytes) {
+/* Returns true when the db was appended to `arr`, false when it was skipped.
+ * With include_stale=false a project whose root_path no longer exists on disk is
+ * not appended and *stale_count is bumped instead (#65). This is the ONLY
+ * filter applied here — #19 was list_projects silently dropping healthy
+ * projects, so nothing else may be hidden. */
+static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
+                                     const char *name, size_t name_len, int64_t size_bytes,
+                                     bool include_stale, int *stale_count) {
     (void)name_len;
 
     char full_path[CBM_SZ_2K];
@@ -1997,7 +2009,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     char project_name[CBM_SZ_1K];
     cbm_store_t *pstore = NULL;
     if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &pstore)) {
-        return; /* ghost / unreadable — not a resolvable project */
+        return false; /* ghost / unreadable — not a resolvable project */
     }
 
     int nodes = cbm_store_count_nodes(pstore, project_name);
@@ -2013,6 +2025,13 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     }
     cbm_store_close(pstore);
 
+    /* Stale = a recorded root_path that is gone. A project with no root_path
+     * at all is not judged here (unknown, not stale) and stays listed. */
+    if (!include_stale && root_path_buf[0] && !dir_exists(root_path_buf)) {
+        (*stale_count)++;
+        return false;
+    }
+
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
@@ -2022,13 +2041,17 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
     yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
     yyjson_mut_arr_add_val(arr, p);
+    return true;
 }
 
 /* list_projects: scan cache directory for .db files.
- * Each project is a single .db file — no central registry needed. */
+ * Each project is a single .db file — no central registry needed.
+ * include_stale (default false): also list projects whose root_path has been
+ * deleted; by default they are hidden and counted in stale_count (#65). */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     (void)srv;
-    (void)args;
+    bool include_stale = cbm_mcp_get_bool_arg(args, "include_stale");
+    int stale_count = 0;
 
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
@@ -2063,14 +2086,24 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         if (size_bytes < 0) {
             continue;
         }
-        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
+        (void)build_project_json_entry(doc, arr, dir_path, name, len, size_bytes, include_stale,
+                                       &stale_count);
     }
     cbm_closedir(d);
 
     yyjson_mut_obj_add_val(doc, root, "projects", arr);
+    yyjson_mut_obj_add_int(doc, root, "stale_count", stale_count);
+    if (stale_count > 0) {
+        char hint[CBM_SZ_1K];
+        snprintf(hint, sizeof(hint),
+                 "%d stale project(s) hidden (root_path no longer exists); pass "
+                 "include_stale=true to see them, or delete_project to remove them.",
+                 stale_count);
+        yyjson_mut_obj_add_strcpy(doc, root, "stale_hint", hint);
+    }
 
     /* Guide user when no projects are indexed */
-    if (yyjson_mut_arr_size(arr) == 0) {
+    if (yyjson_mut_arr_size(arr) == 0 && stale_count == 0) {
         yyjson_mut_obj_add_str(doc, root, "hint",
                                "No projects indexed. Call index_repository(repo_path=...) first.");
     }
@@ -2103,12 +2136,75 @@ static char *verify_project_indexed(cbm_store_t *store, const char *project) {
     return NULL;
 }
 
+/* True when `path` names an existing directory. */
+static bool dir_exists(const char *path) {
+    struct stat st;
+    return path && path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Error payload for a project whose indexed root directory no longer exists
+ * (#65): the db is intact but describes a tree that has been deleted (a
+ * removed worktree, an expired /tmp checkout, a moved repo). Querying it
+ * "succeeds" with total=0 — byte-identical to "the code has no such symbol" —
+ * and callers act on that false negative (the 2026-09 review: 33% of the
+ * misses in the outage window were exactly this). Caller must free(). */
+static char *build_root_missing_error(const char *project, const char *root_path) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "error", "root_missing");
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project ? project : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "root_path", root_path ? root_path : "");
+    yyjson_mut_obj_add_str(doc, root, "hint",
+                           "root directory no longer exists — re-index with "
+                           "index_repository(repo_path=...) or remove with delete_project; "
+                           "results from the stale graph would be silently empty");
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+/* verify_project_root_present — companion to verify_project_indexed (#65).
+ * Returns a heap-allocated isError result when the project's root_path is
+ * gone from disk, NULL when it is present (or when the project row cannot be
+ * read — verify_project_indexed owns that case). Callers that receive a
+ * non-NULL value must free their own arguments before returning it. */
+static char *verify_project_root_present(cbm_store_t *store, const char *project) {
+    cbm_project_t proj = {0};
+    if (cbm_store_get_project(store, project, &proj) != CBM_STORE_OK) {
+        return NULL;
+    }
+    char *res = NULL;
+    if (!dir_exists(proj.root_path)) {
+        char *err = build_root_missing_error(project, proj.root_path);
+        res = cbm_mcp_text_result(err, true);
+        free(err);
+    }
+    cbm_project_free_fields(&proj);
+    return res;
+}
+
+/* Same check for handlers that already hold the root_path (search_code,
+ * detect_changes). Caller must free() the result. */
+static char *root_missing_result_if_gone(const char *project, const char *root_path) {
+    if (dir_exists(root_path)) {
+        return NULL;
+    }
+    char *err = build_root_missing_error(project, root_path);
+    char *res = cbm_mcp_text_result(err, true);
+    free(err);
+    return res;
+}
+
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
+    if (!not_indexed) {
+        not_indexed = verify_project_root_present(store, project);
+    }
     if (not_indexed) {
         free(project);
         return not_indexed;
@@ -2574,6 +2670,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
+    if (!not_indexed) {
+        not_indexed = verify_project_root_present(store, project);
+    }
     if (not_indexed) {
         free(project);
         return not_indexed;
@@ -2743,6 +2842,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *not_indexed = verify_project_indexed(store, project);
+    if (!not_indexed) {
+        not_indexed = verify_project_root_present(store, project);
+    }
     if (not_indexed) {
         free(project);
         free(query);
@@ -2923,9 +3025,19 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
-        yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
         cbm_project_t proj_info = {0};
-        if (cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK) {
+        bool have_info = cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK;
+        /* #65: a project whose root was deleted is not "ready" — every query
+         * against it is refused with root_missing, so say so up front. */
+        bool root_gone = have_info && !dir_exists(proj_info.root_path);
+        yyjson_mut_obj_add_str(doc, root, "status",
+                               root_gone ? "root_missing" : (nodes > 0 ? "ready" : "empty"));
+        if (root_gone) {
+            yyjson_mut_obj_add_str(doc, root, "hint",
+                                   "root directory no longer exists; re-index with "
+                                   "index_repository(repo_path=...) or delete_project");
+        }
+        if (have_info) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
             yyjson_mut_obj_add_strcpy(doc, root, "project_kind",
@@ -2948,7 +3060,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             cbm_project_free_fields(&proj_info);
         }
         add_coverage_report(doc, root, store, project);
-        if (nodes == 0) {
+        if (nodes == 0 && !root_gone) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
                 "Project is empty. Re-run index_repository(repo_path=...) to populate.");
@@ -3178,6 +3290,9 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
+    if (!not_indexed) {
+        not_indexed = verify_project_root_present(store, project);
+    }
     if (not_indexed) {
         free(project);
         free(scope_path);
@@ -3830,6 +3945,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *not_indexed = verify_project_indexed(store, project);
+    if (!not_indexed) {
+        not_indexed = verify_project_root_present(store, project);
+    }
     if (not_indexed) {
         free(func_name);
         free(project);
@@ -5600,6 +5718,9 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *not_indexed = verify_project_indexed(store, project);
+    if (!not_indexed) {
+        not_indexed = verify_project_root_present(store, project);
+    }
     if (not_indexed) {
         free(qn);
         free(project);
@@ -6400,6 +6521,19 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
+    /* #65: a deleted root must not degrade into a clean 0-match result. */
+    char *root_gone = root_missing_result_if_gone(project, root_path);
+    if (root_gone) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return root_gone;
+    }
+
     if (!validate_search_args(root_path, file_pattern)) {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
@@ -6672,6 +6806,16 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(base_branch);
         free(scope);
         return res;
+    }
+
+    /* #65: git diff against a deleted tree would fail as "no changes". */
+    char *root_gone = root_missing_result_if_gone(project, root_path);
+    if (root_gone) {
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return root_gone;
     }
 
     if (!validate_search_path_arg(root_path)) {
