@@ -2199,6 +2199,56 @@ TEST(search_code_literal_pipe_warns_issue282) {
     PASS();
 }
 
+/* issue #73: callers arriving from a grep habit write POSIX BRE alternation
+ * ("foo\|bar"). The tool runs grep -E, where "\|" is an escaped LITERAL '|' —
+ * so such a pattern matched nothing on both paths (regex=false matched the
+ * bytes; regex=true matched a literal '|'). Measured on 48h of real traffic
+ * this was the largest single source of zero-result searches (77/217 frames).
+ * It must now be normalized to ERE alternation and reported. */
+TEST(search_code_bre_alternation_normalized_issue73) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* BRE alternation: must be rewritten to 'HandleRequest|Nope' and matched. */
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest\\\\|Nope\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "bre_alternation_normalized"));
+    /* The caller must be able to see what actually ran. */
+    ASSERT_NOT_NULL(strstr(resp, "effective_pattern"));
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest|Nope"));
+    free(resp);
+
+    /* Regression: a real ERE alternation must NOT be flagged as normalized. */
+    char *plain =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest|Nope\","
+                                   "\"regex\":true,\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_NULL(strstr(plain, "bre_alternation_normalized"));
+    free(plain);
+
+    /* Regression: a MIXED pattern is ambiguous — leave it untouched, do not
+     * guess which '|' the caller meant. */
+    char *mixed =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"a|b\\\\|c\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(mixed);
+    ASSERT_NULL(strstr(mixed, "bre_alternation_normalized"));
+    free(mixed);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* issue #272: '&' in a path / file_pattern is neutralised by the command's
  * quoting and must no longer be rejected as "invalid characters". */
 TEST(search_code_ampersand_accepted_issue272) {
@@ -5905,6 +5955,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
+    RUN_TEST(search_code_bre_alternation_normalized_issue73);
     RUN_TEST(search_code_ampersand_accepted_issue272);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
