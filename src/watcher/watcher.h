@@ -43,6 +43,11 @@ void cbm_watcher_free(cbm_watcher_t *w);
 /* Add a project to the watch list. root_path is copied. */
 void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path);
 
+/* Like cbm_watcher_watch, but seed the HEAD baseline with the commit the index
+ * was built from (NULL/"" = no seed). Same-root re-registration is a no-op. */
+void cbm_watcher_watch_seeded(cbm_watcher_t *w, const char *project_name, const char *root_path,
+                              const char *indexed_head);
+
 /* Remove a project from the watch list. */
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 

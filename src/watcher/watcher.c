@@ -407,7 +407,15 @@ void cbm_watcher_free(cbm_watcher_t *w) {
 
 /* ── Watch list management ──────────────────────────────────────── */
 
-void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
+/* Register (or refresh) a project watch. indexed_head, when non-empty, seeds
+ * the HEAD baseline with the commit the on-disk index was built from, so the
+ * first poll after a daemon restart reindexes a project whose HEAD moved while
+ * nobody was watching it (a clean tree would otherwise baseline at the current
+ * HEAD and never be detected as changed). Re-registering the same project at
+ * the same root keeps the existing state — a session connect must not throw
+ * away a seeded baseline or an in-flight missing-root streak. */
+void cbm_watcher_watch_seeded(cbm_watcher_t *w, const char *project_name, const char *root_path,
+                              const char *indexed_head) {
     if (!w || !project_name || !root_path) {
         return;
     }
@@ -419,12 +427,21 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
-    /* Remove old entry first (key points to state's project_name) */
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *old = cbm_ht_get(w->projects, project_name);
+    if (old && old->root_path && strcmp(old->root_path, root_path) == 0) {
+        if (indexed_head && indexed_head[0] && !old->baseline_done) {
+            snprintf(old->last_head, sizeof(old->last_head), "%s", indexed_head);
+        }
+        cbm_mutex_unlock(&w->projects_lock);
+        return; /* already watching this root — keep baseline */
+    }
     if (old) {
+        /* Deferred free: a concurrent poll_once snapshot may still hold it. */
         cbm_ht_delete(w->projects, project_name);
-        state_free(old);
+        if (!defer_state_free(w, old)) {
+            state_free(old);
+        }
     }
 
     project_state_t *s = state_new(project_name, root_path);
@@ -433,9 +450,17 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         cbm_log_warn("watcher.watch.oom", "project", project_name, "path", root_path);
         return;
     }
+    if (indexed_head && indexed_head[0]) {
+        snprintf(s->last_head, sizeof(s->last_head), "%s", indexed_head);
+    }
     cbm_ht_set(w->projects, s->project_name, s);
     cbm_mutex_unlock(&w->projects_lock);
-    cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
+    cbm_log_info("watcher.watch", "project", project_name, "path", root_path, "seeded",
+                 (indexed_head && indexed_head[0]) ? "true" : "false");
+}
+
+void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
+    cbm_watcher_watch_seeded(w, project_name, root_path, NULL);
 }
 
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
@@ -496,7 +521,9 @@ static void init_baseline(project_state_t *s) {
     s->baseline_done = true;
 
     if (s->is_git) {
-        git_head(s->root_path, s->last_head, sizeof(s->last_head));
+        if (s->last_head[0] == '\0') {
+            git_head(s->root_path, s->last_head, sizeof(s->last_head));
+        }
         s->file_count = git_file_count(s->root_path);
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -518,11 +545,14 @@ static bool check_changes(project_state_t *s) {
     char head[CBM_SZ_64] = {0};
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
-            /* HEAD moved — commit, checkout, pull */
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+            /* HEAD moved — commit, checkout, pull. last_head is advanced by
+             * poll_project only after a SUCCESSFUL reindex: advancing it here
+             * would make a failed/skipped reindex swallow the move forever. */
             return true;
         }
-        strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+        if (s->last_head[0] == '\0') {
+            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+        }
     }
 
     /* Check working tree */
@@ -610,8 +640,14 @@ static void poll_project(const char *key, void *val, void *ud) {
 
     /* Initialize baseline on first poll */
     if (!s->baseline_done) {
+        bool seeded = s->last_head[0] != '\0';
         init_baseline(s);
-        return;
+        if (!seeded) {
+            return;
+        }
+        /* Seeded from the index: compare against it right away instead of
+         * waiting an interval, so a restart catches up on the first poll. */
+        s->next_poll_ns = ctx->now;
     }
 
     /* Skip non-git projects */

@@ -1885,6 +1885,161 @@ TEST(watcher_null_watch_count) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+/* ── Restart restore (seeded baseline) ─────────────────────────────
+ * The daemon re-registers indexed projects on start, seeded with the HEAD
+ * the index was built from. Before this, a clean tree whose HEAD moved while
+ * the daemon was down was baselined at the NEW head and never reindexed. */
+
+static int seeded_repo(char *tmpdir, size_t n, char *old_head, size_t hn) {
+    snprintf(tmpdir, n, "/tmp/cbm_watcher_seed_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        return -1;
+    if (wt_git(tmpdir, "init -q") != 0)
+        return -1;
+    char p[300];
+    th_write_file(wt_path(p, sizeof(p), tmpdir, "a.go"), "package a\n");
+    wt_git(tmpdir, "add a.go");
+    wt_git(tmpdir, "commit -q -m one");
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD", tmpdir);
+    FILE *fp = popen(cmd, "r");
+    if (!fp || !fgets(old_head, (int)hn, fp)) {
+        if (fp)
+            pclose(fp);
+        return -1;
+    }
+    pclose(fp);
+    old_head[strcspn(old_head, "\r\n")] = '\0';
+    th_write_file(wt_path(p, sizeof(p), tmpdir, "a.go"), "package a\n\nfunc A() {}\n");
+    wt_git(tmpdir, "commit -q -am two"); /* HEAD moves, tree stays clean */
+    return 0;
+}
+
+TEST(watcher_seeded_head_moved_reindexes_on_first_poll) {
+    char tmpdir[256], old_head[128];
+    if (seeded_repo(tmpdir, sizeof(tmpdir), old_head, sizeof(old_head)) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("fixture failed");
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    index_call_count = 0;
+    cbm_watcher_watch_seeded(w, "seed-repo", tmpdir, old_head);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* caught up on the very first poll */
+    cbm_watcher_touch(w, "seed-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* and settled: no reindex loop */
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_unseeded_head_moved_is_missed) {
+    /* Characterization of the pre-fix behavior the seed exists to fix. */
+    char tmpdir[256], old_head[128];
+    if (seeded_repo(tmpdir, sizeof(tmpdir), old_head, sizeof(old_head)) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("fixture failed");
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    index_call_count = 0;
+    cbm_watcher_watch(w, "seed-repo", tmpdir);
+    cbm_watcher_poll_once(w);
+    cbm_watcher_touch(w, "seed-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_seeded_head_equal_no_reindex) {
+    char tmpdir[256], old_head[128];
+    if (seeded_repo(tmpdir, sizeof(tmpdir), old_head, sizeof(old_head)) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("fixture failed");
+    }
+    char cmd[600], cur[128] = "";
+    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD", tmpdir);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        if (!fgets(cur, sizeof(cur), fp))
+            cur[0] = '\0';
+        pclose(fp);
+    }
+    cur[strcspn(cur, "\r\n")] = '\0';
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    index_call_count = 0;
+    cbm_watcher_watch_seeded(w, "seed-repo", tmpdir, cur);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0); /* index already current: no spurious work */
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+static int fail_then_ok_calls = 0;
+static int fail_first_index(const char *project_name, const char *root_path, void *ud) {
+    (void)project_name;
+    (void)root_path;
+    (void)ud;
+    return fail_then_ok_calls++ == 0 ? -1 : 0;
+}
+
+TEST(watcher_failed_reindex_keeps_head_move_pending) {
+    /* A skipped/failed reindex (pipeline busy) must not advance last_head,
+     * or the move is swallowed and the index stays stale forever. */
+    char tmpdir[256], old_head[128];
+    if (seeded_repo(tmpdir, sizeof(tmpdir), old_head, sizeof(old_head)) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("fixture failed");
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, fail_first_index, NULL);
+    fail_then_ok_calls = 0;
+    cbm_watcher_watch_seeded(w, "seed-repo", tmpdir, old_head);
+    cbm_watcher_poll_once(w); /* reindex fails */
+    ASSERT_EQ(fail_then_ok_calls, 1);
+    cbm_watcher_touch(w, "seed-repo");
+    cbm_watcher_poll_once(w); /* still pending → retried, succeeds */
+    ASSERT_EQ(fail_then_ok_calls, 2);
+    cbm_watcher_touch(w, "seed-repo");
+    cbm_watcher_poll_once(w); /* settled */
+    ASSERT_EQ(fail_then_ok_calls, 2);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_same_root_rewatch_keeps_state) {
+    /* A session connecting from an already-restored root must not reset the
+     * seeded baseline (that would re-open the restart hole). */
+    char tmpdir[256], old_head[128];
+    if (seeded_repo(tmpdir, sizeof(tmpdir), old_head, sizeof(old_head)) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("fixture failed");
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    index_call_count = 0;
+    cbm_watcher_watch_seeded(w, "seed-repo", tmpdir, old_head);
+    cbm_watcher_watch(w, "seed-repo", tmpdir); /* session connect */
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 SUITE(watcher) {
     /* Adaptive interval */
     RUN_TEST(poll_interval_base);
@@ -1897,6 +2052,11 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_unwatch);
     RUN_TEST(watcher_unwatch_nonexistent);
     RUN_TEST(watcher_watch_replace);
+    RUN_TEST(watcher_seeded_head_moved_reindexes_on_first_poll);
+    RUN_TEST(watcher_unseeded_head_moved_is_missed);
+    RUN_TEST(watcher_seeded_head_equal_no_reindex);
+    RUN_TEST(watcher_failed_reindex_keeps_head_move_pending);
+    RUN_TEST(watcher_same_root_rewatch_keeps_state);
     RUN_TEST(watcher_null_safety);
 
     /* Polling */
