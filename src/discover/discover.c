@@ -740,6 +740,36 @@ static void walk_push_subdir(walk_frame_t *stack, int *top, const char *abs_path
     (*top)++;
 }
 
+/* A subdirectory whose `.git` is a FILE pointing into `<repo>/.git/worktrees/`
+ * is a linked worktree: a full parallel checkout of the same repo. Walking it
+ * duplicates the whole codebase and (via the 1.5x file-count guard) forces a
+ * full rebuild (#81). Submodules (`gitdir: .../modules/...`) are real content
+ * and stay indexed. */
+static bool is_linked_worktree_dir(const char *abs_path) {
+    char dot_git[CBM_SZ_4K];
+    snprintf(dot_git, sizeof(dot_git), "%s/.git", abs_path);
+    struct stat st;
+    if (safe_stat(dot_git, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    FILE *f = cbm_fopen(dot_git, "rb");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_4K] = {0};
+    bool linked = false;
+    if (fgets(line, sizeof(line), f) && strncmp(line, "gitdir:", 7) == 0) {
+        for (char *c = line; *c; c++) {
+            if (*c == '\\') {
+                *c = '/';
+            }
+        }
+        linked = strstr(line, "/worktrees/") != NULL;
+    }
+    fclose(f);
+    return linked;
+}
+
 static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *frame,
                                    const cbm_discover_opts_t *opts,
                                    const cbm_gitignore_t *gitignore,
@@ -762,7 +792,8 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
 
     if (S_ISDIR(st.st_mode)) {
         if (!should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
-                                   frame->local_gi, frame->local_gi_prefix)) {
+                                   frame->local_gi, frame->local_gi_prefix) &&
+            !is_linked_worktree_dir(abs_path)) {
             walk_push_subdir(stack, top, abs_path, rel_path, frame);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */

@@ -1288,7 +1288,39 @@ TEST(discover_nested_gitignore_stacks_with_root) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* #81: an untracked linked worktree nested in the repo is a parallel checkout
+ * of the same code — skip it; a submodule (gitdir under .git/modules) stays. */
+TEST(discover_skips_nested_linked_worktree) {
+    char *base = th_mktempdir("cbm_disc_wt");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".wt-x/.git"), "gitdir: /r/.git/worktrees/-wt-x\n");
+    th_write_file(TH_PATH(base, ".wt-x/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "sub/.git"), "gitdir: ../.git/modules/sub\n");
+    th_write_file(TH_PATH(base, "sub/lib.go"), "package sub\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+    int rc = cbm_discover_ex2(base, &opts, &files, &count, &excluded, &excluded_count, NULL, NULL,
+                              NULL);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 2);
+    for (int i = 0; i < count; i++) {
+        ASSERT_TRUE(strstr(files[i].rel_path, ".wt-x") == NULL);
+    }
+    ASSERT_TRUE(discover_excluded_contains(excluded, excluded_count, ".wt-x"));
+
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 SUITE(discover) {
+    RUN_TEST(discover_skips_nested_linked_worktree);
     /* Directory skip — always */
     RUN_TEST(skip_git);
     RUN_TEST(skip_node_modules);
