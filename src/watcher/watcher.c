@@ -39,6 +39,8 @@ typedef struct {
     char *project_name;
     char *root_path;
     char last_head[CBM_SZ_64]; /* git HEAD hash */
+    uint64_t dirty_fp;         /* fingerprint of the dirty tree last indexed OK (0 = clean) */
+    uint64_t pending_fp;       /* fingerprint observed by the current check_changes */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
@@ -150,10 +152,62 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return CBM_NOT_FOUND;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
-static bool git_is_dirty(const char *root_path) {
+/* Dirty-tree fingerprint. A tree that simply STAYS dirty (an untracked scratch
+ * dir, a long-lived local edit) used to trigger a reindex on every poll
+ * forever. Instead fold each `git status --porcelain` line plus the listed
+ * path's mtime/size into a FNV-1a hash; the watcher reindexes only when the
+ * fingerprint differs from the one last indexed successfully. Returns 0 for a
+ * clean tree. Also covers submodules via `git submodule foreach`. */
+static uint64_t fnv1a(uint64_t h, const void *data, size_t n) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t fold_porcelain(uint64_t h, FILE *fp, const char *root_path, bool *any) {
+    char line[CBM_SZ_4K];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        *any = true;
+        h = fnv1a(h, line, len);
+        /* porcelain v1: "XY <path>" or "XY <old> -> <new>" */
+        if (len > 3 && root_path) {
+            const char *rel = line + 3;
+            const char *arrow = strstr(rel, " -> ");
+            if (arrow) {
+                rel = arrow + 4;
+            }
+            char full[CBM_SZ_4K];
+            snprintf(full, sizeof(full), "%s/%s", root_path, rel);
+            size_t fl = strlen(full);
+            if (fl > 0 && full[fl - SKIP_ONE] == '/') {
+                full[fl - SKIP_ONE] = '\0';
+            }
+            struct stat st;
+            if (stat(full, &st) == 0) {
+                int64_t sig[2] = {(int64_t)st.st_mtime, (int64_t)st.st_size};
+#if defined(__APPLE__)
+                sig[0] = (int64_t)st.st_mtimespec.tv_sec * NS_PER_SEC + st.st_mtimespec.tv_nsec;
+#elif !defined(_WIN32)
+                sig[0] = (int64_t)st.st_mtim.tv_sec * NS_PER_SEC + st.st_mtim.tv_nsec;
+#endif
+                h = fnv1a(h, sig, sizeof(sig));
+            }
+        }
+    }
+    return h;
+}
+
+static uint64_t git_dirty_fingerprint(const char *root_path) {
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C \"%s\" status --porcelain "
@@ -161,53 +215,31 @@ static bool git_is_dirty(const char *root_path) {
              root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        return false;
+        return 0;
     }
-
-    char line[CBM_SZ_256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
+    bool any = false;
+    uint64_t h = fold_porcelain(1469598103934665603ULL, fp, root_path, &any);
     cbm_pclose(fp);
 
-    if (dirty) {
-        return true;
-    }
-
 #if !defined(_WIN32)
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. Use `git submodule foreach` as a portable
-     * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
-     * an inner shell command that cmd.exe cannot pass intact; the parent-repo
-     * status check above already covers the common (non-submodule) case. */
+    /* Submodules: uncommitted changes inside a submodule are invisible to the
+     * parent's git status. Paths here are submodule-relative, so only the
+     * status text is folded (no stat). POSIX-only: see git history. */
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
              "'git status --porcelain --untracked-files=normal 2>/dev/null' "
              "2>/dev/null",
              root_path);
     fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
+    if (fp) {
+        h = fold_porcelain(h, fp, NULL, &any);
+        cbm_pclose(fp);
     }
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
 #endif
-    return dirty;
+    if (!any) {
+        return 0;
+    }
+    return h ? h : 1; /* 0 is reserved for "clean" */
 }
 
 /* Count tracked files via git ls-files */
@@ -555,8 +587,11 @@ static bool check_changes(project_state_t *s) {
         }
     }
 
-    /* Check working tree */
-    return git_is_dirty(s->root_path);
+    /* Check working tree: reindex only when the dirty state CHANGED since the
+     * last successful index (a tree that merely stays dirty is not a change).
+     * Going dirty → clean is a change too (edits reverted/committed). */
+    s->pending_fp = git_dirty_fingerprint(s->root_path);
+    return s->pending_fp != s->dirty_fp;
 }
 
 /* Context for poll_once foreach callback */
@@ -673,8 +708,9 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
+            /* Update HEAD + dirty fingerprint after successful reindex */
             git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            s->dirty_fp = s->pending_fp;
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
