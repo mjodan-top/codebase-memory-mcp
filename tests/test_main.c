@@ -165,6 +165,7 @@ extern void suite_store_edges(void);
 extern void suite_store_search(void);
 extern void suite_cypher(void);
 extern void suite_uds_lifecycle(void);
+extern void suite_shim_frames(void);
 extern void suite_mcp(void);
 extern void suite_mcp_session(void);
 extern void suite_language(void);
@@ -310,6 +311,7 @@ int main(int argc, char **argv) {
 
     /* Daemon UDS lifecycle (Issue #25) */
     RUN_SELECTED_SUITE(uds_lifecycle);
+    RUN_SELECTED_SUITE(shim_frames);
 
     /* MCP connection session boundary (Issue #26) */
     RUN_SELECTED_SUITE(mcp_session);
