@@ -893,8 +893,10 @@ TEST(watcher_git_removed_no_crash) {
 }
 
 TEST(watcher_continued_dirty) {
-    /* If working tree stays dirty, each poll should re-trigger reindex.
-     * Port of repeated git sentinel detection behavior. */
+    /* #76 contract change: a tree that STAYS dirty with the same content is
+     * indexed once, not on every poll (that re-ran the pipeline every few
+     * seconds forever on any repo with a scratch file). A further edit is
+     * still detected — see watcher_persistently_dirty_tree_reindexes_once. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cont_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -932,10 +934,10 @@ TEST(watcher_continued_dirty) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty — should detect again */
+    /* Still dirty, unchanged — already indexed, must NOT re-trigger */
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 2);
+    ASSERT_EQ(index_call_count, 1);
 
     /* Commit to clean up, then poll — should not trigger */
     wt_git(tmpdir, "add file.txt");
@@ -2040,6 +2042,46 @@ TEST(watcher_same_root_rewatch_keeps_state) {
     PASS();
 }
 
+TEST(watcher_persistently_dirty_tree_reindexes_once) {
+    /* A tree that stays dirty must not reindex on every poll; a further edit
+     * to the dirty file must still be detected. */
+    char tmpdir[256], old_head[128];
+    if (seeded_repo(tmpdir, sizeof(tmpdir), old_head, sizeof(old_head)) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("fixture failed");
+    }
+    char p[300];
+    th_write_file(wt_path(p, sizeof(p), tmpdir, "scratch.txt"), "one\n");
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    index_call_count = 0;
+    cbm_watcher_watch(w, "dirty-repo", tmpdir);
+    cbm_watcher_poll_once(w); /* baseline */
+    cbm_watcher_touch(w, "dirty-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* dirty → indexed once */
+    for (int i = 0; i < 3; i++) {
+        cbm_watcher_touch(w, "dirty-repo");
+        cbm_watcher_poll_once(w);
+    }
+    ASSERT_EQ(index_call_count, 1); /* still the same dirt → no churn */
+    th_write_file(wt_path(p, sizeof(p), tmpdir, "scratch.txt"), "one\ntwo, longer\n");
+    cbm_watcher_touch(w, "dirty-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* edited again → detected */
+    cbm_unlink(p);
+    cbm_watcher_touch(w, "dirty-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 3); /* dirty → clean is a change too */
+    cbm_watcher_touch(w, "dirty-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 3);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 SUITE(watcher) {
     /* Adaptive interval */
     RUN_TEST(poll_interval_base);
@@ -2057,6 +2099,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_seeded_head_equal_no_reindex);
     RUN_TEST(watcher_failed_reindex_keeps_head_move_pending);
     RUN_TEST(watcher_same_root_rewatch_keeps_state);
+    RUN_TEST(watcher_persistently_dirty_tree_reindexes_once);
     RUN_TEST(watcher_null_safety);
 
     /* Polling */
