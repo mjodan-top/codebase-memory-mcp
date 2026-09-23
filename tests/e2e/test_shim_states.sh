@@ -5,7 +5,7 @@
 # subprocess (except S_VERSION_MISMATCH_FAILCLOSED, which is explicitly
 # allowed to use a fake daemon that only implements the handshake — see the
 # Issue #27 shams/seams/fakes contract), a REAL pathname UDS socket, REAL
-# stdio pipes, and a REAL SIGKILL for the midstream-loss state. No mocked
+# stdio pipes, and a REAL SIGKILL for the daemon-restart states. No mocked
 # sockets, no fabricated success, no raw text written to stdout.
 set -eu
 
@@ -170,37 +170,146 @@ else
     note "behavioural proof: retry against the same absent path still fails closed (rc=$rc2)"
 fi
 
-# ── S_MIDSTREAM_LOST_FAILCLOSED ─────────────────────────────────────────
-note "S_MIDSTREAM_LOST_FAILCLOSED: SIGKILL a dedicated daemon mid-session (does not touch the shared daemon used by other states)"
-MID_SOCK="$CASE_DIR/mid-daemon.sock"
-"$BIN" daemon --socket "$MID_SOCK" >"$CASE_DIR/mid-daemon.log" 2>&1 &
-MID_DAEMON_PID=$!
-wait_for_socket "$MID_SOCK"
-rm -f "$CASE_DIR/mid.fifo"
-mkfifo "$CASE_DIR/mid.fifo"
-(
-    set +e
-    exec 9<>"$CASE_DIR/mid.fifo"
-    "$BIN" --socket "$MID_SOCK" <&9 >"$CASE_DIR/mid.out" 2>"$CASE_DIR/mid.err" &
-    SHIM_PID=$!
-    printf '%s\n' "$INIT_MSG" >&9
-    i=0
-    while [ ! -s "$CASE_DIR/mid.out" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
-    kill -KILL "$MID_DAEMON_PID" 2>/dev/null
-    wait "$SHIM_PID" 2>/dev/null
-    echo "$?" > "$CASE_DIR/mid.rc"
-    exit 0
-)
-wait "$MID_DAEMON_PID" 2>/dev/null || true
-MID_RC=$(cat "$CASE_DIR/mid.rc" 2>/dev/null || echo -1)
-if [ "$MID_RC" != "76" ]; then
-    fail "S_MIDSTREAM_LOST_FAILCLOSED: expected exit 76, got $MID_RC"
+# ── Daemon restart mid-session (reconnect contract) ─────────────────────
+# A single REAL shim process drives a whole session through a REAL daemon
+# SIGKILL. driver.py plays the MCP host over the shim's real stdio pipes.
+cat <<'PYEOF' > "$CASE_DIR/driver.py"
+import json, os, select, signal, subprocess, sys, time
+
+mode, bin_path, sock, case_dir = sys.argv[1:5]
+log = open(os.path.join(case_dir, mode + ".driver.log"), "w")
+env = dict(os.environ)
+env["CBM_CACHE_DIR"] = os.path.join(case_dir, "cache")
+env["CBM_SHIM_LOG"] = os.path.join(case_dir, mode + ".shim.log")
+daemon = None
+
+def start_daemon():
+    d = subprocess.Popen([bin_path, "daemon", "--socket", sock], env=env,
+                         stdout=open(os.path.join(case_dir, mode + ".daemon.log"), "ab"),
+                         stderr=subprocess.STDOUT)
+    for _ in range(200):
+        if os.path.exists(sock):
+            return d
+        time.sleep(0.05)
+    raise SystemExit("socket never appeared")
+
+def die(msg):
+    log.write("FAIL " + msg + "\n"); log.flush()
+    print("FAIL " + msg); sys.exit(1)
+
+daemon = start_daemon()
+shim = subprocess.Popen([bin_path, "--socket", sock], env=env, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=open(os.path.join(case_dir, mode + ".err"), "wb"))
+buf = b""
+
+def send(obj):
+    shim.stdin.write((json.dumps(obj) + "\n").encode()); shim.stdin.flush()
+
+def recv(timeout=20):
+    global buf
+    deadline = time.time() + timeout
+    while b"\n" not in buf:
+        left = deadline - time.time()
+        if left <= 0:
+            die("timeout waiting for a response")
+        r, _, _ = select.select([shim.stdout], [], [], left)
+        if r:
+            chunk = os.read(shim.stdout.fileno(), 65536)
+            if not chunk:
+                die("shim stdout closed (rc=%s)" % shim.poll())
+            buf += chunk
+    line, buf = buf.split(b"\n", 1)
+    log.write("<< " + line.decode() + "\n"); log.flush()
+    return json.loads(line)
+
+send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                 "clientInfo": {"name": "e2e", "version": "0"}}})
+if "protocolVersion" not in json.dumps(recv().get("result", {})):
+    die("initialize failed")
+send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+if not recv().get("result", {}).get("tools"):
+    die("tools/list empty")
+
+if mode == "inflight":
+    # Freeze the daemon so the request is provably written but unanswered,
+    # then kill it: the shim must answer id 3 itself, with an error.
+    os.kill(daemon.pid, signal.SIGSTOP)
+    send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+          "params": {"name": "list_projects", "arguments": {}}})
+    time.sleep(0.3)
+os.kill(daemon.pid, signal.SIGKILL)
+daemon.wait()
+
+if mode == "inflight":
+    r = recv()
+    if r.get("id") != 3 or "error" not in r or "restarted" not in r["error"].get("message", ""):
+        die("in-flight request did not get a restart error: %r" % r)
+
+if mode == "noreturn":
+    rc = shim.wait(timeout=30)
+    print("RC %d" % rc)
+    sys.exit(0)
+
+time.sleep(0.5)
+daemon = start_daemon()
+send({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+      "params": {"name": "list_projects", "arguments": {}}})
+r = recv()
+if r.get("id") != 4 or "result" not in r:
+    die("tools/call after restart failed: %r" % r)
+shim.stdin.close()
+rc = shim.wait(timeout=20)
+daemon.send_signal(signal.SIGTERM); daemon.wait(timeout=20)
+if buf.strip():
+    die("unexpected extra stdout (replayed initialize leaked?): %r" % buf)
+print("RC %d" % rc)
+PYEOF
+
+journal_count() { # $1=journal $2=event
+    [ -f "$1" ] || { echo 0; return 0; }
+    awk -v want="msg=$2" '{ for (i = 1; i <= NF; i++) if ($i == want) { n++; break } } END { print n + 0 }' "$1"
+}
+
+# (a) daemon SIGKILLed then restarted: the same shim finishes a tools/call.
+note "S_RECONNECTED: SIGKILL the daemon, restart it, same shim completes tools/call"
+set +e
+out=$(timeout 90 python3 "$CASE_DIR/driver.py" restart "$BIN" "$CASE_DIR/re.sock" "$CASE_DIR")
+set -e
+if [ "$out" != "RC 0" ]; then
+    fail "S_RECONNECTED: driver said '$out' (stderr: $(cat "$CASE_DIR/restart.err" 2>/dev/null))"
 fi
-grep -q 'midstream_loss' "$CASE_DIR/mid.err" || fail "S_MIDSTREAM_LOST_FAILCLOSED: missing structured stderr diagnostic"
-if ! grep -q '"protocolVersion"' "$CASE_DIR/mid.out"; then
-    fail "S_MIDSTREAM_LOST_FAILCLOSED: stdout should still contain the pre-kill valid initialize response"
+grep -q 'shim.reconnect_ok' "$CASE_DIR/restart.err" || fail "S_RECONNECTED: missing shim.reconnect_ok stderr diagnostic"
+[ "$(journal_count "$CASE_DIR/restart.shim.log" shim.reconnect_ok)" -eq 1 ] || fail "S_RECONNECTED: expected 1 shim.reconnect_ok journal record"
+[ "$(journal_count "$CASE_DIR/restart.shim.log" shim.session_lost)" -eq 0 ] || fail "S_RECONNECTED: a recovered session must not journal shim.session_lost"
+note "S_RECONNECTED: OK ($out, $(grep 'reconnect_ok' "$CASE_DIR/restart.err"))"
+
+# (b) daemon never returns: fail closed with 76 once the (shortened) budget ends.
+note "S_MIDSTREAM_LOST_FAILCLOSED: SIGKILL the daemon, never restart it -> exit 76 after the reconnect budget"
+set +e
+t0=$(date +%s)
+out=$(CBM_SHIM_RECONNECT_TIMEOUT_MS=1500 timeout 60 python3 "$CASE_DIR/driver.py" noreturn "$BIN" "$CASE_DIR/nr.sock" "$CASE_DIR")
+t1=$(date +%s)
+set -e
+if [ "$out" != "RC 76" ]; then
+    fail "S_MIDSTREAM_LOST_FAILCLOSED: expected RC 76, driver said '$out'"
 fi
-note "S_MIDSTREAM_LOST_FAILCLOSED: OK (exit=$MID_RC)"
+grep -q 'midstream_loss' "$CASE_DIR/noreturn.err" || fail "S_MIDSTREAM_LOST_FAILCLOSED: missing structured stderr diagnostic"
+[ "$(journal_count "$CASE_DIR/noreturn.shim.log" shim.reconnect_failed)" -eq 1 ] || fail "S_MIDSTREAM_LOST_FAILCLOSED: expected 1 shim.reconnect_failed journal record"
+[ "$(journal_count "$CASE_DIR/noreturn.shim.log" shim.session_lost)" -eq 1 ] || fail "S_MIDSTREAM_LOST_FAILCLOSED: expected 1 shim.session_lost journal record"
+[ $((t1 - t0)) -lt 20 ] || fail "S_MIDSTREAM_LOST_FAILCLOSED: reconnect budget not honoured ($((t1 - t0))s)"
+note "S_MIDSTREAM_LOST_FAILCLOSED: OK ($out in $((t1 - t0))s)"
+
+# (c) request in flight at the moment of the kill: host gets an error for its id.
+note "S_INFLIGHT_ERRORED: request unanswered when the daemon dies gets a JSON-RPC error, session continues"
+set +e
+out=$(timeout 90 python3 "$CASE_DIR/driver.py" inflight "$BIN" "$CASE_DIR/if.sock" "$CASE_DIR")
+set -e
+if [ "$out" != "RC 0" ]; then
+    fail "S_INFLIGHT_ERRORED: driver said '$out' (stderr: $(cat "$CASE_DIR/inflight.err" 2>/dev/null))"
+fi
+note "S_INFLIGHT_ERRORED: OK ($out)"
 
 # ── S_VERSION_MISMATCH_FAILCLOSED ───────────────────────────────────────
 # Allowed fake (per Issue #27 shams/seams/fakes): a minimal daemon that only
@@ -269,4 +378,4 @@ if [ "$FAIL" -ne 0 ]; then
     echo "[shim-e2e] one or more states FAILED" >&2
     exit 1
 fi
-echo "[shim-e2e] all 9 states PASSED"
+echo "[shim-e2e] all 11 states PASSED"

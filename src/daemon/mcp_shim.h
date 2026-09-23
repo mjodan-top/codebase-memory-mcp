@@ -22,6 +22,17 @@
  * (which are, by construction, legal MCP frames written by cbm_mcp_server_run
  * on the daemon side). All shim-owned diagnostics go to stderr.
  *
+ * RECONNECT (daemon restart mid-session): when the daemon closes a live
+ * session while the host's stdin is still open, the shim answers every
+ * in-flight request with a JSON-RPC error (original id, "daemon restarted,
+ * retry"), re-attaches to the SAME socket with backoff for a bounded budget
+ * (CBM_SHIM_RECONNECT_TIMEOUT_MS, default 30000; 0 disables), re-runs the
+ * handshake, and replays the host's cached initialize + initialized frames
+ * (swallowing the daemon's answer to the replayed initialize). This is still
+ * the same daemon over the same socket — never a local server. If the budget
+ * runs out, the old fail-closed exit (76, shim.midstream_loss) stands. Frame
+ * awareness is limited to shim_frames.h; bytes are still forwarded verbatim.
+ *
  * CONNECT-OUTCOME JOURNAL: in addition to the stderr diagnostic, every run
  * appends exactly one key=value line recording its outcome (reached the daemon
  * / failed to, and why) to <cache_dir>/logs/shim.log — because a per-session
@@ -53,6 +64,10 @@ typedef struct cbm_shim_options {
     const char *socket_path;  /* NULL -> resolve default via cbm_uds_socket_path_resolve */
     int connect_timeout_ms;   /* bounded connect() deadline; <=0 -> default */
     int handshake_timeout_ms; /* bounded handshake deadline; <=0 -> default */
+    /* Total budget for re-attaching to the same socket after the daemon drops a
+     * live session. 0 -> CBM_SHIM_RECONNECT_TIMEOUT_MS env, else 30000 ms;
+     * <0 -> never reconnect (legacy immediate fail-closed). */
+    int reconnect_timeout_ms;
 } cbm_shim_options_t;
 
 /* Runs the shim against the given stdio file descriptors (normally 0/1) using
