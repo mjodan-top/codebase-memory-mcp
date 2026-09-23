@@ -5537,6 +5537,87 @@ TEST(incremental_reindex_refreshes_project_head_sha) {
     PASS();
 }
 
+/* Daemon restart: cbm_mcp_restore_watches re-registers every indexed project
+ * whose root still exists (auto_watch honoured, vanished roots skipped). */
+TEST(restore_watches_registers_indexed_projects_on_restart) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-restore-watch-repo-XXXXXX");
+    if (!cbm_mkdtemp(repo)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-restore-watch-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        th_rmtree(repo);
+        PASS();
+    }
+    char src[512];
+    snprintf(src, sizeof(src), "%s/main.py", repo);
+    ASSERT_EQ(th_write_file(src, "def restore_target():\n    return 1\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_sv = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sv_copy = saved_sv ? strdup(saved_sv) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    /* "Before the restart": index once. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"name\":\"restore-watch\"}", repo);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    /* "After the restart": a fresh watcher knows nothing until restored. */
+    cbm_store_t *ws = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(ws, NULL, NULL);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_EQ(cbm_mcp_restore_watches(w), 1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    ASSERT_EQ(cbm_mcp_restore_watches(w), 1); /* idempotent */
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    cbm_watcher_free(w);
+
+    /* auto_watch=false → nothing restored. */
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "false");
+    cbm_config_close(cfg);
+    w = cbm_watcher_new(ws, NULL, NULL);
+    ASSERT_EQ(cbm_mcp_restore_watches(w), 0);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    cbm_watcher_free(w);
+    cfg = cbm_config_open(cache);
+    cbm_config_delete(cfg, CBM_CONFIG_AUTO_WATCH);
+    cbm_config_close(cfg);
+
+    /* Root gone → skipped (never registered, so pruning cannot delete it). */
+    th_rmtree(repo);
+    w = cbm_watcher_new(ws, NULL, NULL);
+    ASSERT_EQ(cbm_mcp_restore_watches(w), 0);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    cbm_watcher_free(w);
+    cbm_store_close(ws);
+
+    cleanup_project_db(cache, "restore-watch");
+    if (saved_sv_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sv_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_sv_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* Drive the already-indexed connect path (initialize → maybe_auto_index →
  * watcher registration) and return the resulting watch count.
  * auto_watch_value: NULL leaves the key unset (exercises the default),
@@ -6109,6 +6190,7 @@ SUITE(mcp) {
 
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(tool_index_repository_success_registers_explicit_path_with_watcher);
+    RUN_TEST(restore_watches_registers_indexed_projects_on_restart);
     RUN_TEST(incremental_reindex_refreshes_project_head_sha);
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
