@@ -7113,6 +7113,27 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    /* ── Phase 0.44: grep-escaped metachars under regex=false ──
+     * Agents escape '(' '.' '[' out of grep habit ("runArchivedRestore\\(").
+     * In literal mode the backslash is matched as a byte, so the search
+     * silently returns 0 (24h replay 09-23: a residual empty). A literal
+     * backslash before an ERE metachar is vanishingly rare in code; drop it. */
+    bool literal_unescaped_applied = false;
+    if (!use_regex && pattern && strchr(pattern, '\\')) {
+        char *dst = pattern;
+        for (const char *p = pattern; *p; p++) {
+            if (*p == '\\' && p[1] && strchr("().[]{}*+?^$", p[1])) {
+                literal_unescaped_applied = true;
+                continue;
+            }
+            *dst++ = *p;
+        }
+        *dst = '\0';
+        if (literal_unescaped_applied) {
+            cbm_log_warn("search.literal_unescaped", "pattern", pattern);
+        }
+    }
+
     /* ── Phase 0.45: literal '|' alternation → ERE ─────────────
      * regex=false with a bare '|' ("lag_ms|clock_ms", "foo(|bar(") is almost
      * always meant as alternation — agents write it the way they write rg.
@@ -7301,7 +7322,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *result =
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
-                               root_path, pat_has_pipe && !use_regex, bre_alternation_applied, literal_alternation_applied,
+                               root_path, pat_has_pipe && !use_regex, bre_alternation_applied,
+                               literal_alternation_applied || literal_unescaped_applied,
                                pattern, cbm_now_ms() - search_t0);
     free(gm);
     free(sr);

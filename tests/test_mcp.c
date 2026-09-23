@@ -2211,6 +2211,18 @@ TEST(search_code_literal_pipe_warns_issue282) {
     ASSERT_NULL(strstr(paren, "invalid regex"));
     free(paren);
 
+    /* grep-escaped '(' under regex=false: the backslash is dropped so the
+     * literal "HandleRequest(" is searched instead of "HandleRequest\\(". */
+    char *esc =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":933,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest\\\\(\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(esc);
+    ASSERT_NOT_NULL(strstr(esc, "HandleRequest"));
+    ASSERT_NULL(strstr(esc, "\"no_match\""));
+    free(esc);
+
     /* A real literal pipe ("a || b", "|x") is left untouched and only warned. */
     char *oror =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":932,\"method\":\"tools/call\","
