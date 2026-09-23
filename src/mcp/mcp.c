@@ -2083,6 +2083,70 @@ static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     return true;
 }
 
+int cbm_mcp_restore_watches(struct cbm_watcher *w) {
+    if (!w) {
+        return 0;
+    }
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+
+    cbm_config_t *cfg = cbm_config_open(dir_path);
+    bool enabled = cfg ? cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_WATCH, true) : true;
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+    if (!enabled) {
+        cbm_log_info("watcher.restore.skipped", "reason", "auto_watch_off");
+        return 0;
+    }
+
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        cbm_log_warn("watcher.restore.err", "reason", "cache_dir_unreadable", "path", dir_path);
+        return 0;
+    }
+    int restored = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *name = entry->name;
+        if (!is_project_db_file(name, strlen(name))) {
+            continue;
+        }
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
+        char project_name[CBM_SZ_1K];
+        cbm_store_t *pstore = NULL;
+        if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &pstore)) {
+            continue; /* ghost / empty / corrupt db */
+        }
+        char root[CBM_SZ_1K] = "";
+        char head[CBM_SZ_64] = "";
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
+            if (proj.root_path) {
+                snprintf(root, sizeof(root), "%s", proj.root_path);
+            }
+            if (proj.head_sha) {
+                snprintf(head, sizeof(head), "%s", proj.head_sha);
+            }
+            cbm_project_free_fields(&proj);
+        }
+        cbm_store_close(pstore);
+        if (!root[0]) {
+            continue;
+        }
+        if (!dir_exists(root)) {
+            cbm_log_info("watcher.restore.skip", "project", project_name, "reason", "root_missing",
+                         "path", root);
+            continue;
+        }
+        cbm_watcher_watch_seeded(w, project_name, root, head);
+        restored++;
+    }
+    cbm_closedir(d);
+    return restored;
+}
+
 /* list_projects: scan cache directory for .db files.
  * Each project is a single .db file — no central registry needed.
  * include_stale (default false): also list projects whose root_path has been

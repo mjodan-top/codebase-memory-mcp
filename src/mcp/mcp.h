@@ -111,6 +111,13 @@ void cbm_mcp_core_free(cbm_mcp_core_t *core);
  * The core does not own the watcher. */
 void cbm_mcp_core_set_watcher(cbm_mcp_core_t *core, struct cbm_watcher *w);
 
+/* Register every indexed project in the cache dir whose root_path still
+ * exists with the watcher, seeding each with its indexed head_sha. Honours the
+ * persisted auto_watch config (false = restore nothing). Roots that are gone
+ * are skipped, never registered (registration would arm stale-root pruning,
+ * which deletes the db). Returns the number of projects registered. */
+int cbm_mcp_restore_watches(struct cbm_watcher *w);
+
 /* Drop the core's cached project store (closed if owned). Call after an
  * out-of-band index run (watcher re-index, UI /api/index) rewrote the DB so
  * attached sessions reopen it instead of reading a stale connection (#28). */

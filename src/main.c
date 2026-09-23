@@ -742,6 +742,14 @@ static int run_daemon(int argc, char **argv) {
     if (g_watcher && cbm_thread_create(&watcher_tid, 0, daemon_watcher_thread, g_watcher) == 0) {
         watcher_started = true;
         cbm_mcp_core_set_watcher(core, g_watcher);
+        /* A restart used to leave every project unwatched until a session
+         * happened to connect from its root — projects then silently went
+         * stale for weeks. Re-register every indexed project whose root still
+         * exists, seeded with the HEAD the index was built from. */
+        int restored = cbm_mcp_restore_watches(g_watcher);
+        char restored_str[16];
+        (void)snprintf(restored_str, sizeof(restored_str), "%d", restored);
+        cbm_log_info("daemon.watcher.restored", "projects", restored_str);
     } else {
         cbm_log_warn("daemon.watcher.unavailable", "reason", "thread_create_failed");
         cbm_watcher_free(g_watcher);
