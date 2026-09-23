@@ -6476,6 +6476,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path,
                                     bool warn_literal_pipe, bool bre_alternation_applied,
+                                    bool literal_alternation_applied,
                                     const char *effective_pattern, uint64_t elapsed_ms) {
     enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
@@ -6580,6 +6581,12 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
 
     /* The caller's pattern was rewritten before it ran — say so explicitly and
      * echo what actually executed, so a surprising hit count is attributable. */
+    if (literal_alternation_applied) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "literal_alternation_normalized", true);
+        if (effective_pattern) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "effective_pattern", effective_pattern);
+        }
+    }
     if (bre_alternation_applied) {
         yyjson_mut_obj_add_bool(doc, root_obj, "bre_alternation_normalized", true);
         if (effective_pattern) {
@@ -6595,6 +6602,12 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
             "pattern used POSIX BRE alternation ('\\|'), which this tool's ERE engine would "
             "match as a literal '|' (zero hits). It was normalized to '|' and run with "
             "regex=true - see 'effective_pattern'. Write 'foo|bar' with regex=true directly.");
+    }
+    if (literal_alternation_applied) {
+        yyjson_mut_arr_add_strcpy(
+            doc, warnings,
+            "pattern had a bare '|' with regex=false; it was run as alternation (regex=true, "
+            "other metacharacters escaped) - see 'effective_pattern'.");
     }
     if (warn_literal_pipe) {
         yyjson_mut_arr_add_strcpy(
@@ -7100,6 +7113,37 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    /* ── Phase 0.45: literal '|' alternation → ERE ─────────────
+     * regex=false with a bare '|' ("lag_ms|clock_ms", "foo(|bar(") is almost
+     * always meant as alternation — agents write it the way they write rg.
+     * Matched literally it silently returns 0 (24h replay 09-23: 2 of the 7
+     * residual empty searches). Rewrite it: escape every ERE metachar except
+     * '|' and run with regex=true. Left untouched when it looks like a real
+     * literal pipe: whitespace, '||', or an empty alternative. */
+    bool literal_alternation_applied = false;
+    if (!use_regex && pattern && pat_has_pipe && !strstr(pattern, "||") &&
+        pattern[0] != '|' && pattern[strlen(pattern) - 1] != '|' &&
+        !strpbrk(pattern, " \t")) {
+        size_t plen = strlen(pattern);
+        char *alt = malloc(plen * 2 + 1);
+        if (alt) {
+            char *dst = alt;
+            for (const char *p = pattern; *p; p++) {
+                if (*p != '|' && strchr("\\^$.?*+()[]{}", *p)) {
+                    *dst++ = '\\';
+                }
+                *dst++ = *p;
+            }
+            *dst = '\0';
+            free(pattern);
+            pattern = alt;
+            use_regex = true;
+            literal_alternation_applied = true;
+            pat_has_pipe = false;
+            cbm_log_warn("search.literal_alternation_normalized", "pattern", pattern);
+        }
+    }
+
     /* ── Phase 0.5: Multi-word → regex conversion ───────────── */
     /* If pattern contains whitespace and is not already a regex, convert to a
      * regex that matches all words in order: "foo bar baz" → "foo.*bar.*baz".
@@ -7257,7 +7301,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *result =
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
-                               root_path, pat_has_pipe && !use_regex, bre_alternation_applied,
+                               root_path, pat_has_pipe && !use_regex, bre_alternation_applied, literal_alternation_applied,
                                pattern, cbm_now_ms() - search_t0);
     free(gm);
     free(sr);
