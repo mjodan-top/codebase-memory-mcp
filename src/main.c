@@ -604,7 +604,7 @@ static int daemon_watcher_index_fn(const char *project_name, const char *root_pa
     }
     if (!cbm_pipeline_try_lock()) {
         cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
+        return CBM_NOT_FOUND; /* not indexed — keep the change pending, retry next poll */
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
