@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/time.h> /* utimes — #81 sweep test */
 #include <sys/stat.h> /* chmod / stat for read-only query reproductions */
 #ifdef _WIN32
 #include <direct.h>
@@ -2396,6 +2397,204 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Issue #81: atomic full rebuild ─────────────────────────────── */
+
+typedef struct {
+    cbm_mcp_server_t *reader; /* a second session holding a cached store handle */
+    const char *project;
+    int calls;
+    bool saw_old;         /* old symbol still answered during the rebuild */
+    bool saw_new;         /* new symbol leaked before publish (must stay false) */
+    bool building_exists; /* the .building file was present during the rebuild */
+    int fail;             /* nonzero → abort the publish */
+} rebuild_probe_t;
+
+static bool graph_has_symbol(cbm_mcp_server_t *srv, const char *project, const char *name) {
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"^%s$\",\"limit\":5}",
+             project, name);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    bool found = resp && strstr(resp, name) && !strstr(resp, "not found") &&
+                 !strstr(resp, "\\\"total\\\":0") && !strstr(resp, "\"total\":0");
+    free(resp);
+    return found;
+}
+
+static int rebuild_probe_hook(const char *final_path, const char *build_path, void *ud) {
+    rebuild_probe_t *pr = ud;
+    pr->calls++;
+    struct stat st;
+    pr->building_exists = stat(build_path, &st) == 0 && stat(final_path, &st) == 0;
+    pr->saw_old = graph_has_symbol(pr->reader, pr->project, "old_func");
+    pr->saw_new = graph_has_symbol(pr->reader, pr->project, "new_func");
+    return pr->fail;
+}
+
+static void write_src(const char *dir, const char *name, const char *body) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *fp = fopen(path, "w");
+    if (fp) {
+        fputs(body, fp);
+        fclose(fp);
+    }
+}
+
+/* Index a 1-file repo, then grow it past the incremental threshold (file count
+ * > 1.5x stored hashes) so the second index takes the FULL-rebuild path. */
+static int rebuild_fixture(char *tmp_dir, size_t tsz, char *cache, size_t csz, char **saved_copy,
+                           char **project, cbm_mcp_server_t **writer, cbm_mcp_server_t **reader) {
+    snprintf(tmp_dir, tsz, "/tmp/cbm-rebuild-atomic-XXXXXX");
+    snprintf(cache, csz, "/tmp/cbm-rebuild-atomic-cache-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir) || !cbm_mkdtemp(cache)) {
+        return -1;
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    write_src(tmp_dir, "main.py", "def old_func():\n    return 1\n");
+    *project = cbm_project_name_from_path(tmp_dir);
+    *writer = cbm_mcp_server_new(NULL);
+    *reader = cbm_mcp_server_new(NULL);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp_dir);
+    char *resp = cbm_mcp_handle_tool(*writer, "index_repository", args);
+    int ok = resp && response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+    free(resp);
+    if (!ok) {
+        return -1;
+    }
+    /* Warm the reader's cached handle on the OLD db inode. */
+    if (!graph_has_symbol(*reader, *project, "old_func")) {
+        return -1;
+    }
+    write_src(tmp_dir, "main.py", "def new_func():\n    return 2\n");
+    write_src(tmp_dir, "b.py", "def b_func():\n    return 3\n");
+    write_src(tmp_dir, "c.py", "def c_func():\n    return 4\n");
+    return 0;
+}
+
+static void rebuild_fixture_free(const char *tmp_dir, const char *cache, char *saved_copy,
+                                 char *project, cbm_mcp_server_t *writer,
+                                 cbm_mcp_server_t *reader) {
+    cbm_pipeline_set_prepublish_hook(NULL, NULL);
+    cbm_mcp_server_free(reader);
+    cbm_mcp_server_free(writer);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    char path[512];
+    const char *files[] = {"main.py", "b.py", "c.py"};
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmp_dir, files[i]);
+        remove(path);
+    }
+    th_rmtree(tmp_dir);
+    th_rmtree(cache);
+}
+
+TEST(full_rebuild_keeps_old_db_queryable_then_swaps) {
+    char tmp_dir[256], cache[256];
+    char *saved_copy = NULL, *project = NULL;
+    cbm_mcp_server_t *writer = NULL, *reader = NULL;
+    ASSERT_EQ(rebuild_fixture(tmp_dir, sizeof(tmp_dir), cache, sizeof(cache), &saved_copy,
+                              &project, &writer, &reader),
+              0);
+
+    rebuild_probe_t pr = {.reader = reader, .project = project};
+    cbm_pipeline_set_prepublish_hook(rebuild_probe_hook, &pr);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp_dir);
+    char *resp = cbm_mcp_handle_tool(writer, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    free(resp);
+
+    /* During the rebuild: old index answered, new one not yet visible. */
+    ASSERT_EQ(pr.calls, 1);
+    ASSERT_TRUE(pr.building_exists);
+    ASSERT_TRUE(pr.saw_old);
+    ASSERT_FALSE(pr.saw_new);
+
+    /* After publish: the SAME reader (cached handle on the replaced inode)
+     * must see the new graph, and no build leftovers remain. */
+    ASSERT_TRUE(graph_has_symbol(reader, project, "new_func"));
+    ASSERT_FALSE(graph_has_symbol(reader, project, "old_func"));
+    char bpath[512];
+    struct stat st;
+    snprintf(bpath, sizeof(bpath), "%s/%s.db%s", cache, project, CBM_BUILDING_SUFFIX);
+    ASSERT_NEQ(stat(bpath, &st), 0);
+
+    rebuild_fixture_free(tmp_dir, cache, saved_copy, project, writer, reader);
+    PASS();
+}
+
+TEST(full_rebuild_failure_leaves_old_db_intact) {
+    char tmp_dir[256], cache[256];
+    char *saved_copy = NULL, *project = NULL;
+    cbm_mcp_server_t *writer = NULL, *reader = NULL;
+    ASSERT_EQ(rebuild_fixture(tmp_dir, sizeof(tmp_dir), cache, sizeof(cache), &saved_copy,
+                              &project, &writer, &reader),
+              0);
+
+    rebuild_probe_t pr = {.reader = reader, .project = project, .fail = 1};
+    cbm_pipeline_set_prepublish_hook(rebuild_probe_hook, &pr);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp_dir);
+    char *resp = cbm_mcp_handle_tool(writer, "index_repository", args);
+    free(resp);
+    cbm_pipeline_set_prepublish_hook(NULL, NULL);
+    ASSERT_EQ(pr.calls, 1);
+
+    /* Old DB untouched and still answering, via the cached reader and a fresh one. */
+    ASSERT_TRUE(graph_has_symbol(reader, project, "old_func"));
+    ASSERT_FALSE(graph_has_symbol(reader, project, "new_func"));
+    cbm_mcp_server_t *fresh = cbm_mcp_server_new(NULL);
+    ASSERT_TRUE(graph_has_symbol(fresh, project, "old_func"));
+    cbm_mcp_server_free(fresh);
+    char bpath[512];
+    struct stat st;
+    snprintf(bpath, sizeof(bpath), "%s/%s.db%s", cache, project, CBM_BUILDING_SUFFIX);
+    ASSERT_NEQ(stat(bpath, &st), 0);
+
+    rebuild_fixture_free(tmp_dir, cache, saved_copy, project, writer, reader);
+    PASS();
+}
+
+TEST(sweep_stale_building_removes_only_old_leftovers) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-sweep-building-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+    char stale[512], stale_wal[512], young[512], live[512];
+    snprintf(stale, sizeof(stale), "%s/a.db%s", cache, CBM_BUILDING_SUFFIX);
+    snprintf(stale_wal, sizeof(stale_wal), "%s-wal", stale);
+    snprintf(young, sizeof(young), "%s/b.db%s", cache, CBM_BUILDING_SUFFIX);
+    snprintf(live, sizeof(live), "%s/a.db", cache);
+    const char *all[] = {stale, stale_wal, young, live};
+    for (int i = 0; i < 4; i++) {
+        FILE *fp = fopen(all[i], "w");
+        ASSERT_NOT_NULL(fp);
+        fputs("x", fp);
+        fclose(fp);
+    }
+    struct timeval old_tv[2] = {{.tv_sec = time(NULL) - 3600}, {.tv_sec = time(NULL) - 3600}};
+    ASSERT_EQ(utimes(stale, old_tv), 0);
+
+    ASSERT_EQ(cbm_pipeline_sweep_stale_building(cache, 60), 1);
+    struct stat st;
+    ASSERT_NEQ(stat(stale, &st), 0);
+    ASSERT_NEQ(stat(stale_wal, &st), 0);
+    ASSERT_EQ(stat(young, &st), 0); /* may be another process's in-flight build */
+    ASSERT_EQ(stat(live, &st), 0);  /* live DBs are never touched */
+    cbm_unlink(young);
+    cbm_unlink(live);
+    cbm_rmdir(cache);
     PASS();
 }
 
@@ -6124,6 +6323,9 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
+    RUN_TEST(full_rebuild_keeps_old_db_queryable_then_swaps);
+    RUN_TEST(full_rebuild_failure_leaves_old_db_intact);
+    RUN_TEST(sweep_stale_building_removes_only_old_leftovers);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_project_alias_lifetime_issue28);

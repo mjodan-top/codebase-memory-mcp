@@ -69,6 +69,22 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * Discovers files, extracts, resolves, and dumps to SQLite. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
+/* Issue #81: a full rebuild writes <db>CBM_BUILDING_SUFFIX and renames it
+ * over the live <db> only once complete, so the old index stays queryable. */
+#define CBM_BUILDING_SUFFIX ".building"
+
+/* Test hook: called after the .building DB is complete, before it replaces
+ * final_path. Nonzero return aborts the publish (the .building is removed and
+ * the live DB is left untouched). NULL clears. Process-global. */
+typedef int (*cbm_pipeline_prepublish_hook_fn)(const char *final_path, const char *build_path,
+                                               void *ud);
+void cbm_pipeline_set_prepublish_hook(cbm_pipeline_prepublish_hook_fn fn, void *ud);
+
+/* Remove leftover <name>.db.building (+ -wal/-shm) files in cache_dir whose
+ * mtime is at least min_age_sec old (younger ones may be an in-flight build of
+ * another process). Returns the number of build files removed. */
+int cbm_pipeline_sweep_stale_building(const char *cache_dir, int min_age_sec);
+
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
 

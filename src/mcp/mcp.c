@@ -956,6 +956,8 @@ struct cbm_mcp_core {
     bool owns_store;                /* true if the core opened the store */
     char *current_project;          /* which project store is open for (heap) */
     time_t store_last_used;         /* last named-project access */
+    dev_t store_dev;                /* #81: (dev,ino) of the file `store` was opened on */
+    ino_t store_ino;                /*      0/0 = unknown (e.g. in-memory store) */
     struct cbm_watcher *watcher;    /* external process-level ref (not owned) */
     struct cbm_config *config;      /* external process-level ref (not owned) */
     cbm_mutex_t mutex;              /* serializes shared resource access */
@@ -1219,6 +1221,35 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project);
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
+/* #81: remember which inode the cached store was opened on. A full rebuild
+ * atomically renames a new DB over <project>.db; an open handle would keep
+ * reading the replaced (unlinked) inode forever, so the cache must notice. */
+static void core_record_store_identity(cbm_mcp_core_t *core) {
+    core->store_dev = 0;
+    core->store_ino = 0;
+    const char *path = core->store ? cbm_store_db_path(core->store) : NULL;
+    struct stat st;
+    if (path && stat(path, &st) == 0) {
+        core->store_dev = st.st_dev;
+        core->store_ino = st.st_ino;
+    }
+}
+
+/* True when the cached store's file was replaced (different inode) or removed. */
+static bool core_store_file_replaced(const cbm_mcp_core_t *core) {
+    if (core->store_ino == 0) {
+        return false; /* identity unknown (in-memory / never recorded) */
+    }
+    const char *path = cbm_store_db_path(core->store);
+    struct stat st;
+    if (!path || stat(path, &st) != 0) {
+        return true;
+    }
+    return st.st_ino != core->store_ino || st.st_dev != core->store_dev;
+}
+
+static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project);
+
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
@@ -1226,11 +1257,20 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 
     srv->core->store_last_used = time(NULL);
 
-    /* Already open for this project? */
+    /* Already open for this project — and still the live file? */
     if (srv->core->current_project && strcmp(srv->core->current_project, project) == 0 &&
         srv->core->store) {
-        return srv->core->store;
+        if (!core_store_file_replaced(srv->core)) {
+            return srv->core->store;
+        }
+        cbm_log_info("store.reopen", "project", project, "reason", "db_file_replaced");
     }
+    cbm_store_t *st = resolve_store_open(srv, project);
+    core_record_store_identity(srv->core);
+    return st;
+}
+
+static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
 
     /* Close old store */
     if (srv->core->owns_store && srv->core->store) {
