@@ -244,6 +244,9 @@ GREP_RE = re.compile(r"^(grep|rg|egrep|fgrep)$")
 # 防守层显式声明语义，防未来切分逻辑变化回退。
 REMOTE_WRAPPERS = {"ssh", "mosh", "et", "autossh", "tmux"}
 
+# 页内精定位的具体文件上限（grep_corpus.FEW_FILES_MAX 同一口径）
+FEW_FILES_MAX = 3
+
 # 带值标志：`-A 6` 的 `6` 是标志的值，不是文件/pattern（与 metrics 的
 # GREP_NOFILE_OK 同一套口径）。`--include=*.mjs` 的 `=` 形式自带值，不吃下一个 token。
 VALUED_FLAGS = {
@@ -384,12 +387,15 @@ def analyze_segment(seg, is_first, cwd="", env=None):
     if targets_all_unindexed(file_args, cwd):
         return "allow"
 
-    # 单个具体文件（无通配、非目录样式）→ 页内精定位，放行
+    # 少量具体文件（≤3，无通配、非目录样式、非递归）→ 页内精定位，放行。
+    # 调用方已经知道在哪几个文件里，MCP 无法替代「在这几页里找」；
+    # 09-23 实测：被拦的 51 次具体文件 grep 只有 1 次转向 MCP，
+    # 其余都被拆成逐个文件 grep 或 sed 精读——拦截只多花一轮。
     if (
-        len(file_args) == 1
+        1 <= len(file_args) <= FEW_FILES_MAX
         and not recursive
-        and not any(ch in file_args[0] for ch in "*?[")
-        and "." in file_args[0].rsplit("/", 1)[-1]
+        and all(not any(ch in f for ch in "*?[") and "." in f.rstrip("/").rsplit("/", 1)[-1]
+                for f in file_args)
     ):
         return "allow"
 
