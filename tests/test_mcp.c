@@ -5455,6 +5455,88 @@ TEST(tool_index_repository_success_registers_explicit_path_with_watcher) {
     PASS();
 }
 
+static int tm_git(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C '%s' -c user.name=t -c user.email=t@example.invalid %s >/dev/null 2>&1", dir,
+             args);
+    return system(cmd);
+}
+
+static void tm_db_head(const char *cache, const char *project, char *out, size_t n) {
+    out[0] = '\0';
+    char db[1024];
+    snprintf(db, sizeof(db), "%s/%s.db", cache, project);
+    cbm_store_t *st = cbm_store_open_path_query(db);
+    if (!st) {
+        return;
+    }
+    cbm_project_t proj = {0};
+    if (cbm_store_get_project(st, project, &proj) == CBM_STORE_OK && proj.head_sha) {
+        snprintf(out, n, "%s", proj.head_sha);
+    }
+    cbm_project_free_fields(&proj);
+    cbm_store_close(st);
+}
+
+/* The incremental path must refresh projects.head_sha: it used to freeze at the
+ * last FULL index, so index_status / the restart watch seed saw a HEAD
+ * thousands of commits old although the graph itself was current. */
+TEST(incremental_reindex_refreshes_project_head_sha) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-incr-head-repo-XXXXXX");
+    if (!cbm_mkdtemp(repo)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-incr-head-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        th_rmtree(repo);
+        PASS();
+    }
+    char src[512];
+    snprintf(src, sizeof(src), "%s/main.py", repo);
+    ASSERT_EQ(th_write_file(src, "def head_one():\n    return 1\n"), 0);
+    ASSERT_EQ(tm_git(repo, "init -q"), 0);
+    ASSERT_EQ(tm_git(repo, "add main.py"), 0);
+    ASSERT_EQ(tm_git(repo, "commit -q -m one"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"name\":\"incr-head\"}", repo);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    char h1[128];
+    tm_db_head(cache, "incr-head", h1, sizeof(h1));
+    ASSERT(h1[0] != '\0');
+
+    ASSERT_EQ(th_write_file(src, "def head_one():\n    return 1\n\ndef head_two():\n    return 2\n"),
+              0);
+    ASSERT_EQ(tm_git(repo, "commit -q -am two"), 0);
+    resp = cbm_mcp_handle_tool(srv, "index_repository", args); /* incremental route */
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    char h2[128];
+    tm_db_head(cache, "incr-head", h2, sizeof(h2));
+    ASSERT(h2[0] != '\0');
+    ASSERT(strcmp(h1, h2) != 0);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, "incr-head");
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    PASS();
+}
+
 /* Drive the already-indexed connect path (initialize → maybe_auto_index →
  * watcher registration) and return the resulting watch count.
  * auto_watch_value: NULL leaves the key unset (exercises the default),
@@ -6027,6 +6109,7 @@ SUITE(mcp) {
 
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(tool_index_repository_success_registers_explicit_path_with_watcher);
+    RUN_TEST(incremental_reindex_refreshes_project_head_sha);
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
