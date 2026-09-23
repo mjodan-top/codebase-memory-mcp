@@ -14,6 +14,7 @@
 | `grep_corpus.py` | 从会话 jsonl 抽取 grep/rg 帧，按意图分类，固化成语料 |
 | `grep_corpus_test.py` | 分类器的 golden test（36 例手工标注） |
 | `mcp_takeover_bench.py` | 把语料里的 `code_symbol` 帧真的重放给 MCP，出接管率 |
+| `mcp-gap-24h.py` | 近 N 小时两个缺口指标：A=该用没用 MCP 的比例，B=用了 MCP 但没拿到期望结果的比例；`--json-out` 追加 JSONL 供迭代对比 |
 
 ## 跑法
 
@@ -60,6 +61,11 @@ python3 scripts/metrics/mcp_takeover_bench.py --limit 40      # 抽样快跑
 
 剩余未接管的最大一块是 `pattern_shape`（48 帧）：主标识符过于宽泛，MCP 返回几百条等于没答。
 这属于结果排序/收窄问题，与 pattern 改写不同源。
+
+### A/B 缺口（`mcp-gap-24h.py`）
+- A 分母 = code_symbol grep（放行 + 被 hook 拦）+ MCP 调用；分子 = 放行的 code_symbol grep + 被拦后下一步没转 MCP 的。
+- B 分母 = MCP 调用；分子 = empty / error / project_not_found / root_missing / timeout / flood / snippet_ambiguous / no_output，以及命中后 15 分钟内又用同一关键词做跨文件 grep 的。
+- 2026-09-23 基线（24h）：A 63.6%（150/236），B 45.1%（32/71）。按「≤3 个具体文件 = 页内精定位」修正口径后 A 为 55.0%（105/191）。B 的 32 次里：10 次 error 全部是 daemon 重启后 shim 报 Transport closed，4 次 not_found + 2 次 timeout 发生在全量重建窗口（#81）。
 
 ## 已知局限
 

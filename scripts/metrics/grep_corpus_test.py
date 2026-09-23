@@ -24,7 +24,7 @@ CASES = [
     ("rg 'func NewPoolClient' gateway-go/", "/r", "code_symbol", "rg 默认递归+定义关键字"),
     ("grep -rn --include=*.go 'markDead' .", "/r", "code_symbol", "include 限定代码扩展名"),
     ("cd /repo && grep -rn 'parse_session' scripts/", "/r", "code_symbol", "链式 cd 后递归扫"),
-    ("grep -n 'coder/pool/report' a.go b.go", "/r", "code_symbol", "多代码文件跨文件扫"),
+    ("grep -n 'coder/pool/report' a.go b.go c.go d.go", "/r", "code_symbol", "4 个以上代码文件=跨文件扫"),
     ("rg 'class SessionManager'", "/Users/zkf/work/repo", "code_symbol", "rg 无参递归扫代码 cwd"),
     ("grep -rn 'searchGraph\\|searchCode' src/mcp/", "/r", "code_symbol", "交替符号名扫目录"),
     ("grep -rnE 'def (index_repository|prune_projects)' .", "/r", "code_symbol", "def 前缀找定义"),
@@ -38,6 +38,7 @@ CASES = [
     ("grep -e 'trace_path' -rn src/", "/r", "code_symbol", "-e 形式 pattern"),
 
     # ---------- text_search：grep 本就正确 ----------
+    ("grep -n 'coder/pool/report' a.go b.go", "/r", "text_search", "≤3 个具体文件=页内精定位"),
     ("grep -n 'ERROR' daemon.err", "/r", "text_search", "日志文件"),
     ("cat x.log | grep -n 'timeout'", "/r", "text_search", "管道中游过滤"),
     ("ssh esweb168 'grep -rn foo /etc'", "/r", "text_search", "远端执行，本地索引零覆盖"),

@@ -29,6 +29,12 @@ CASES = [
     ("grep -c foo *.mjs", True),  # glob 多文件
     # 页内精定位 → 放行
     ('grep -n "close" services/matter-service/store.mjs', False),
+    # ≤3 个具体文件 → 页内精定位放行；第 4 个起算跨文件扫射
+    ('grep -n "close" a/store.mjs b/route.ts', False),
+    ('grep -n "close" a/store.mjs b/route.ts c/x.go', False),
+    ('grep -n "close" a/store.mjs b/route.ts c/x.go d/y.rs', True),
+    ('grep -rn "close" a/store.mjs b/route.ts', True),  # 递归标志仍拦
+    ('grep -n "close" a/store.mjs src/', True),  # 混入目录仍拦
     # 非代码文本 → 放行
     ('grep "tools/call" ~/Library/Logs/codebase-memory-mcp/daemon.err', False),
     # 管道过滤 → 放行
@@ -58,8 +64,10 @@ CASES = [
     ("grep -l -i postreview $MEM/*.md 2>/dev/null", False),
     # 裸重定向符 `>` 的目标 token 也要跳过
     ("grep -n foo file.md > /tmp/out.txt", False),
-    # 带值标志修复不放松拦截：-A 值后还有代码 glob 多文件照拦
-    ('grep -n "x" -A 3 src/a.c src/b.c', True),
+    # 带值标志修复不放松拦截：-A 值后超过 FEW_FILES_MAX 个代码文件照拦
+    ('grep -n "x" -A 3 src/a.c src/b.c src/c.c src/d.c', True),
+    # 少量（<=3）具体文件、非递归 → 页内精定位放行（-A 值不被误当文件）
+    ('grep -n "x" -A 3 src/a.c src/b.c', False),
     # 重定向剥离后仍是递归扫代码 → 照拦
     ("grep -rn setStatus src/ 2>/dev/null", True),
     # --- 项目外目标豁免（不在任何 git 仓库内 = 索引不覆盖，MCP 替代不了） ---

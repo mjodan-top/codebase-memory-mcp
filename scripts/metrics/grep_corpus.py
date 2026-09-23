@@ -32,6 +32,7 @@ import shlex
 from datetime import datetime, timedelta, timezone
 
 # ---------------- 口径常量 ----------------
+FEW_FILES_MAX = 3      # 页内精定位的具体文件上限（与 hook 同口径）
 REPLAY_BURST_S = 10   # fork 重放帧窗口
 SESSION_ROOTS = ("~/.codex/sessions", "~/.coder/sessions", "~/.codex-zkf/sessions")
 
@@ -331,10 +332,11 @@ def _classify_grep(best, cwd=""):
     inc = best["includes"]
     if inc and all(os.path.splitext(g)[1].lower() in NONCODE_EXT for g in inc):
         return ("text_search", "include_noncode", detail)
-    # 4) 单个具体代码文件、非递归 → 页内精定位，MCP 接管不了
-    if len(files) == 1 and not best["recursive"] and \
-            not any(ch in files[0] for ch in "*?[") and kinds[0] == "code":
-        return ("text_search", "page_local", detail)
+    # 4) 少量（≤FEW_FILES_MAX）具体代码文件、非递归 → 页内精定位，MCP 接管不了
+    if 1 <= len(files) <= FEW_FILES_MAX and not best["recursive"] and \
+            all(not any(ch in f for ch in "*?[") for f in files) and \
+            all(k in ("code", "noncode") for k in kinds):
+        return ("text_search", "page_local" if len(files) == 1 else "page_local_few", detail)
     # 5) pattern 不像符号 → 文本检索
     if not pattern_looks_symbolic(pat):
         return ("text_search", "pattern_not_symbolic", detail)
