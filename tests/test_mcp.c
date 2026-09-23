@@ -2193,7 +2193,34 @@ TEST(search_code_literal_pipe_warns_issue282) {
     ASSERT_NOT_NULL(strstr(resp, "warnings"));   /* surfaced, not silent */
     ASSERT_NOT_NULL(strstr(resp, "regex=true")); /* the hint names the fix */
     ASSERT_NOT_NULL(strstr(resp, "elapsed_ms")); /* timing is reported */
+    /* 09-23 replay: a bare '|' under regex=false is now run as alternation,
+     * so the real symbol is found instead of a silent 0. */
+    ASSERT_NOT_NULL(strstr(resp, "literal_alternation_normalized"));
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
     free(resp);
+
+    /* Metachars other than '|' stay literal: "HandleRequest(|Nope(" must
+     * become "HandleRequest\\(|Nope\\(" and still match, not error. */
+    char *paren =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":931,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest(|Nope(\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(paren);
+    ASSERT_NOT_NULL(strstr(paren, "literal_alternation_normalized"));
+    ASSERT_NULL(strstr(paren, "invalid regex"));
+    free(paren);
+
+    /* A real literal pipe ("a || b", "|x") is left untouched and only warned. */
+    char *oror =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":932,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"a||b\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(oror);
+    ASSERT_NULL(strstr(oror, "literal_alternation_normalized"));
+    ASSERT_NOT_NULL(strstr(oror, "matched literally"));
+    free(oror);
 
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
