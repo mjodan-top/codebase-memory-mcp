@@ -1140,9 +1140,13 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     } else if (check_store) {
         cbm_store_close(check_store);
     }
-    cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
-    /* Capture any ADR before deleting the DB so the full-reindex rebuild can
-     * restore it (project_summaries is otherwise lost). Issue #516. */
+    /* Issue #81: do NOT unlink the live DB here. The full rebuild writes to
+     * <db>.building and atomically renames it over the live DB only after it is
+     * complete (publish_building_db), so queries keep answering from the old
+     * index for the whole rebuild window instead of "project not found". */
+    cbm_log_info("pipeline.route", "path", "reindex", "action", "rebuild into .building");
+    /* Capture any ADR so the full-reindex rebuild can carry it into the new DB
+     * (project_summaries is otherwise lost). Issue #516. */
     {
         cbm_store_t *adr_store = cbm_store_open_path(db_path);
         if (adr_store) {
@@ -1157,15 +1161,81 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             cbm_store_close(adr_store);
         }
     }
-    cbm_unlink(db_path);
-    char wal[PL_WAL_BUF];
-    char shm[PL_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
     free(db_path);
     return CBM_NOT_FOUND;
+}
+
+/* ── Atomic full rebuild (issue #81) ─────────────────────────────── */
+
+static cbm_pipeline_prepublish_hook_fn g_prepublish_hook = NULL;
+static void *g_prepublish_hook_ud = NULL;
+
+void cbm_pipeline_set_prepublish_hook(cbm_pipeline_prepublish_hook_fn fn, void *ud) {
+    g_prepublish_hook = fn;
+    g_prepublish_hook_ud = ud;
+}
+
+/* Remove <path>, <path>-wal, <path>-shm (missing files are fine). */
+static void unlink_db_family(const char *path) {
+    char side[PL_WAL_BUF];
+    cbm_unlink(path);
+    snprintf(side, sizeof(side), "%s-wal", path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    cbm_unlink(side);
+}
+
+/* Atomically replace final_path with the finished build_path.
+ * The build DB's only connection was closed (WAL checkpointed + removed), so
+ * it is a single self-contained file. The OLD db's -wal/-shm must go before the
+ * rename: a stale WAL next to the new main file would be replayed onto it
+ * (corruption). Readers that still hold the old inode keep reading it until
+ * they reopen (mcp resolve_store detects the inode change). */
+static int publish_building_db(const char *build_path, const char *final_path) {
+    char side[PL_WAL_BUF];
+    snprintf(side, sizeof(side), "%s-wal", final_path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", final_path);
+    cbm_unlink(side);
+#ifdef _WIN32
+    cbm_unlink(final_path); /* rename() cannot replace on Windows (non-atomic fallback) */
+#endif
+    if (rename(build_path, final_path) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+int cbm_pipeline_sweep_stale_building(const char *cache_dir, int min_age_sec) {
+    if (!cache_dir) {
+        return 0;
+    }
+    cbm_dir_t *d = cbm_opendir(cache_dir);
+    if (!d) {
+        return 0;
+    }
+    int removed = 0;
+    time_t now = time(NULL);
+    const char *suffix = CBM_BUILDING_SUFFIX;
+    size_t slen = strlen(suffix);
+    cbm_dirent_t *e;
+    while ((e = cbm_readdir(d)) != NULL) {
+        size_t n = strlen(e->name);
+        if (e->is_dir || n <= slen || strcmp(e->name + n - slen, suffix) != 0) {
+            continue;
+        }
+        char full[CBM_SZ_1K];
+        snprintf(full, sizeof(full), "%s/%s", cache_dir, e->name);
+        struct stat st;
+        if (stat(full, &st) != 0 || (now - st.st_mtime) < min_age_sec) {
+            continue; /* possibly an in-flight build of another process */
+        }
+        unlink_db_family(full);
+        cbm_log_info("pipeline.building.swept", "path", full);
+        removed++;
+    }
+    cbm_closedir(d);
+    return removed;
 }
 
 /* Get platform-specific mtime in nanoseconds. */
@@ -1236,9 +1306,18 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
      * committed_nodes at 0, so the #334 plausibility gate never fired. */
     p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
     p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
+    /* Issue #81: write the whole new DB to <db>.building; the live DB stays
+     * queryable until publish_building_db renames the finished file over it.
+     * A leftover .building (crashed earlier run) is ours to clear — the repo
+     * xlock serializes indexers of this project. */
+    char final_path[CBM_SZ_1K];
+    snprintf(final_path, sizeof(final_path), "%s", db_path);
+    snprintf(db_path, sizeof(db_path), "%s%s", final_path, CBM_BUILDING_SUFFIX);
+    unlink_db_family(db_path);
     int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
+        unlink_db_family(db_path);
         return rc;
     }
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
@@ -1379,11 +1458,33 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
         CBM_PROF_END("persist", "5_fts_backfill", t_fts);
 
+        /* Sole connection to the .building file: closing it checkpoints the
+         * WAL into the main file and removes -wal/-shm, so the published DB is
+         * one self-contained file (it stays WAL-mode for the readers). */
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
+    } else {
+        cbm_log_error("pipeline.err", "phase", "reopen_building", "project", p->project_name);
+        unlink_db_family(db_path);
+        return CBM_NOT_FOUND;
     }
     free(p->saved_adr);
     p->saved_adr = NULL;
+
+    /* Issue #81: publish. Test hook runs with the build complete and the old
+     * DB still live; a nonzero return simulates a failed/crashed publish. */
+    if (g_prepublish_hook && g_prepublish_hook(final_path, db_path, g_prepublish_hook_ud) != 0) {
+        cbm_log_error("pipeline.err", "phase", "prepublish_hook", "project", p->project_name);
+        unlink_db_family(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (check_cancel(p) || publish_building_db(db_path, final_path) != 0) {
+        cbm_log_error("pipeline.err", "phase", "publish", "project", p->project_name);
+        unlink_db_family(db_path);
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("pipeline.publish", "project", p->project_name, "path", final_path);
+    snprintf(db_path, sizeof(db_path), "%s", final_path);
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {

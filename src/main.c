@@ -737,6 +737,18 @@ static int run_daemon(int argc, char **argv) {
     g_daemon_owner = &owner;
 
     cbm_thread_t watcher_tid;
+    /* Issue #81: a crashed full rebuild leaves <name>.db.building behind. The
+     * live DB is untouched in that case; just reclaim the disk. Files younger
+     * than a minute may belong to a worker another process is still running. */
+    {
+        const char *cdir = cbm_resolve_cache_dir();
+        int swept = cdir ? cbm_pipeline_sweep_stale_building(cdir, 60) : 0;
+        if (swept > 0) {
+            char swept_str[16];
+            (void)snprintf(swept_str, sizeof(swept_str), "%d", swept);
+            cbm_log_info("daemon.building.swept", "files", swept_str);
+        }
+    }
     bool watcher_started = false;
     g_watcher = cbm_watcher_new(NULL, daemon_watcher_index_fn, core);
     if (g_watcher && cbm_thread_create(&watcher_tid, 0, daemon_watcher_thread, g_watcher) == 0) {
