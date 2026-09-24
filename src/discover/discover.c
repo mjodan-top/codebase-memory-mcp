@@ -770,6 +770,37 @@ static bool is_linked_worktree_dir(const char *abs_path) {
     return linked;
 }
 
+/* True if any directory prefix of rel_path (under repo_path) is a linked
+ * worktree. Used by incremental reindex to purge rows that discovery now
+ * skips (#81): such files still exist on disk, so the "exists → mode-skipped,
+ * preserve" rule would otherwise keep a stale parallel checkout forever. */
+bool cbm_discover_in_linked_worktree(const char *repo_path, const char *rel_path) {
+    if (!repo_path || !rel_path) {
+        return false;
+    }
+    char abs[CBM_SZ_4K];
+    int n = snprintf(abs, sizeof(abs), "%s/", repo_path);
+    if (n < 0 || n >= (int)sizeof(abs)) {
+        return false;
+    }
+    size_t base = (size_t)n;
+    for (const char *p = rel_path; *p; p++) {
+        if (*p != '/') {
+            continue;
+        }
+        size_t len = (size_t)(p - rel_path);
+        if (base + len >= sizeof(abs)) {
+            return false;
+        }
+        memcpy(abs + base, rel_path, len);
+        abs[base + len] = '\0';
+        if (is_linked_worktree_dir(abs)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *frame,
                                    const cbm_discover_opts_t *opts,
                                    const cbm_gitignore_t *gitignore,

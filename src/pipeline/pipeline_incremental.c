@@ -312,7 +312,11 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             preserve = true;
         } else {
             struct stat st;
-            if (stat(abs_path, &st) == 0) {
+            if (cbm_discover_in_linked_worktree(repo_path, stored[i].rel_path)) {
+                /* Under a nested linked worktree that discovery now skips
+                 * (#81/#85): still on disk, but must be purged, not kept. */
+                preserve = false;
+            } else if (stat(abs_path, &st) == 0) {
                 /* File exists on disk — mode-skipped, not deleted. */
                 preserve = true;
             } else if (errno != ENOENT && errno != ENOTDIR) {

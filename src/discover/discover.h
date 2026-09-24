@@ -87,6 +87,9 @@ typedef enum {
  * Only checks the basename, not the full path. */
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode);
 
+/* True if a directory prefix of rel_path is a linked git worktree (#81). */
+bool cbm_discover_in_linked_worktree(const char *repo_path, const char *rel_path);
+
 /* Check if a file has a suffix that should be skipped (e.g. .pyc, .png). */
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode);
 
