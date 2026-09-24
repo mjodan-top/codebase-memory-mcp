@@ -851,12 +851,44 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
     return 0;
 }
 
-int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
-    if (!gb || !file_path) {
+/* Drop entries whose node id is in deleted_set from one node_ptr_array. */
+static void compact_ptr_array_cb(const char *key, void *value, void *ud) {
+    (void)key;
+    node_ptr_array_t *arr = value;
+    const CBMHashTable *deleted_set = ud;
+    if (!arr) {
+        return;
+    }
+    int w = 0;
+    for (int j = 0; j < arr->count; j++) {
+        char id_buf[CBM_SZ_32];
+        make_id_key(id_buf, sizeof(id_buf), arr->items[j]->id);
+        if (!cbm_ht_get(deleted_set, id_buf)) {
+            arr->items[w++] = arr->items[j];
+        }
+    }
+    arr->count = w;
+}
+
+int cbm_gbuf_delete_by_files(cbm_gbuf_t *gb, const char *const *file_paths, int n_paths) {
+    if (!gb || (!file_paths && n_paths > 0) || n_paths < 0) {
         return CBM_NOT_FOUND;
     }
+    if (n_paths == 0) {
+        return 0;
+    }
 
-    /* Collect IDs of nodes in this file */
+    /* One path set, one node scan, one edge cascade, one secondary-index
+     * compaction - regardless of how many files are purged. Calling the
+     * per-file variant N times costs N full node+edge scans (#81/#88 purge of
+     * 25k nested-worktree files never finished on a 900k-node graph). */
+    CBMHashTable *path_set = cbm_ht_create((uint32_t)n_paths);
+    for (int i = 0; i < n_paths; i++) {
+        if (file_paths[i]) {
+            cbm_ht_set(path_set, file_paths[i], intptr_to_ptr(SKIP_ONE));
+        }
+    }
+
     CBMHashTable *deleted_set = cbm_ht_create(CBM_SZ_64);
     int deleted_count = 0;
     int scanned = 0;
@@ -864,7 +896,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
         scanned++;
-        if (!n->file_path || strcmp(n->file_path, file_path) != 0) {
+        if (!n->file_path || !cbm_ht_get(path_set, n->file_path)) {
             continue;
         }
         if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
@@ -874,10 +906,6 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
         cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
-
-        /* Remove from secondary indexes */
-        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
-        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
 
         /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
@@ -891,11 +919,16 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         n->qualified_name = NULL;
         deleted_count++;
     }
+    cbm_ht_free(path_set);
 
     if (deleted_count == 0) {
         cbm_ht_free(deleted_set);
         return 0;
     }
+
+    /* Secondary indexes: one pass over every label/name array. */
+    cbm_ht_foreach(gb->nodes_by_label, compact_ptr_array_cb, deleted_set);
+    cbm_ht_foreach(gb->nodes_by_name, compact_ptr_array_cb, deleted_set);
 
     /* Cascade-delete edges referencing deleted nodes */
     cascade_delete_edges(gb, deleted_set);
@@ -903,13 +936,23 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     cbm_ht_foreach(deleted_set, free_key_only, NULL);
     cbm_ht_free(deleted_set);
     {
+        char f_buf[CBM_SZ_16];
         char s_buf[CBM_SZ_16];
         char d_buf[CBM_SZ_16];
+        snprintf(f_buf, sizeof(f_buf), "%d", n_paths);
         snprintf(s_buf, sizeof(s_buf), "%d", scanned);
         snprintf(d_buf, sizeof(d_buf), "%d", deleted_count);
-        cbm_log_info("gbuf.delete_by_file", "file", file_path, "scanned", s_buf, "deleted", d_buf);
+        cbm_log_info("gbuf.delete_by_files", "files", f_buf, "scanned", s_buf, "deleted", d_buf);
     }
     return deleted_count;
+}
+
+int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
+    if (!gb || !file_path) {
+        return CBM_NOT_FOUND;
+    }
+    const char *one[1] = {file_path};
+    return cbm_gbuf_delete_by_files(gb, one, 1);
 }
 
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {

@@ -104,6 +104,11 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
 
+/* Batch variant: delete all nodes whose file_path is in file_paths[0..n).
+ * Single node scan + single edge cascade, independent of n. Returns the
+ * number of nodes deleted. */
+int cbm_gbuf_delete_by_files(cbm_gbuf_t *gb, const char *const *file_paths, int n_paths);
+
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project);
