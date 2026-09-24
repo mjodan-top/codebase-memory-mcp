@@ -2604,6 +2604,54 @@ TEST(full_rebuild_failure_leaves_old_db_intact) {
     PASS();
 }
 
+/* #81 follow-up: rows indexed before #85 from a nested linked worktree must be
+ * purged by the next INCREMENTAL reindex. The files still exist on disk, so the
+ * "exists -> mode-skipped, preserve" rule used to keep them forever (measured:
+ * 25005 stale .wt-rnfp2 rows in run-solo-company, duplicate hits in search). */
+TEST(incremental_purges_rows_under_nested_linked_worktree) {
+    char tmp_dir[256], cache[256], sub[512];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-purge-wt-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-purge-wt-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_dir));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    write_src(tmp_dir, "main.py", "def main_func():\n    return 1\n");
+    write_src(tmp_dir, "a.py", "def a_func():\n    return 2\n");
+    write_src(tmp_dir, "b.py", "def b_func():\n    return 3\n");
+    snprintf(sub, sizeof(sub), "%s/wtx", tmp_dir);
+    ASSERT_TRUE(cbm_mkdir_p(sub, 0755));
+    write_src(sub, "w.py", "def wt_func():\n    return 4\n");
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp_dir);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    /* Not yet a worktree: indexed like any directory (the pre-#85 state). */
+    ASSERT_TRUE(graph_has_symbol(srv, project, "wt_func"));
+
+    /* It becomes a linked worktree; the next index is incremental (4 -> 3 files). */
+    write_src(sub, ".git", "gitdir: /r/.git/worktrees/-wtx\n");
+    resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT_FALSE(graph_has_symbol(srv, project, "wt_func"));
+    ASSERT_TRUE(graph_has_symbol(srv, project, "main_func"));
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    th_rmtree(tmp_dir);
+    th_rmtree(cache);
+    PASS();
+}
+
 TEST(sweep_stale_building_removes_only_old_leftovers) {
     char cache[256];
     snprintf(cache, sizeof(cache), "/tmp/cbm-sweep-building-XXXXXX");
@@ -6365,6 +6413,7 @@ SUITE(mcp) {
     RUN_TEST(full_rebuild_keeps_old_db_queryable_then_swaps);
     RUN_TEST(full_rebuild_failure_leaves_old_db_intact);
     RUN_TEST(sweep_stale_building_removes_only_old_leftovers);
+    RUN_TEST(incremental_purges_rows_under_nested_linked_worktree);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_project_alias_lifetime_issue28);
