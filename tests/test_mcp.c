@@ -2641,6 +2641,35 @@ TEST(incremental_purges_rows_under_nested_linked_worktree) {
     free(resp);
     ASSERT_FALSE(graph_has_symbol(srv, project, "wt_func"));
     ASSERT_TRUE(graph_has_symbol(srv, project, "main_func"));
+    /* The purged file's hash row must go too, or every later reindex re-purges
+     * it and its coverage rows never prune. A plain deletion takes the same path. */
+    char bpath[600];
+    snprintf(bpath, sizeof(bpath), "%s/b.py", tmp_dir);
+    ASSERT_EQ(unlink(bpath), 0);
+    resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT_FALSE(graph_has_symbol(srv, project, "b_func"));
+    char dbp[600];
+    snprintf(dbp, sizeof(dbp), "%s/%s.db", cache, project);
+    cbm_store_t *hs = cbm_store_open_path(dbp);
+    ASSERT_NOT_NULL(hs);
+    cbm_file_hash_t *hashes = NULL;
+    int hn = 0;
+    cbm_store_get_file_hashes(hs, project, &hashes, &hn);
+    int stale = 0, live = 0;
+    for (int i = 0; i < hn; i++) {
+        if (strcmp(hashes[i].rel_path, "wtx/w.py") == 0 || strcmp(hashes[i].rel_path, "b.py") == 0) {
+            stale++;
+        }
+        if (strcmp(hashes[i].rel_path, "main.py") == 0) {
+            live++;
+        }
+    }
+    cbm_store_free_file_hashes(hashes, hn);
+    cbm_store_close(hs);
+    ASSERT_EQ(stale, 0);
+    ASSERT_EQ(live, 1);
 
     cbm_mcp_server_free(srv);
     cleanup_project_db(cache, project);

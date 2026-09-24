@@ -604,6 +604,55 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
     }
 }
 
+/* Drop hash rows for files this run purged as deleted. persist_hashes only
+ * upserts, so without this a deleted file keeps its row forever: every later
+ * reindex re-classifies it as deleted and purges it again, and the coverage
+ * prune (keyed on file_hashes as the live-file set) keeps its failure rows
+ * alive in the miss graph (#81: 25005 stale rows under a skipped nested
+ * worktree). changed_paths = changed + deleted; a key not in the current
+ * discovery is a deletion (changed files are always in it). */
+typedef struct {
+    cbm_store_t *store;
+    const char *project;
+    const CBMHashTable *current;
+    int removed;
+    int failed;
+} incr_hash_prune_ctx_t;
+
+static void incr_hash_prune_cb(const char *key, void *value, void *userdata) {
+    (void)value;
+    incr_hash_prune_ctx_t *ctx = (incr_hash_prune_ctx_t *)userdata;
+    if (!ctx || !key || cbm_ht_get(ctx->current, key)) {
+        return;
+    }
+    if (cbm_store_delete_file_hash(ctx->store, ctx->project, key) == CBM_STORE_OK) {
+        ctx->removed++;
+    } else {
+        ctx->failed++;
+    }
+}
+
+static void prune_deleted_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
+                                 int file_count, const CBMHashTable *changed_paths) {
+    if (!changed_paths) {
+        return;
+    }
+    CBMHashTable *current =
+        cbm_ht_create(file_count > 0 ? (size_t)file_count * PAIR_LEN : CBM_SZ_64);
+    for (int i = 0; i < file_count; i++) {
+        cbm_ht_set(current, files[i].rel_path, &files[i]);
+    }
+    incr_hash_prune_ctx_t ctx = {.store = store, .project = project, .current = current};
+    cbm_store_begin(store);
+    cbm_ht_foreach(changed_paths, incr_hash_prune_cb, &ctx);
+    cbm_store_commit(store);
+    cbm_ht_free(current);
+    if (ctx.removed > 0 || ctx.failed > 0) {
+        cbm_log_info("incremental.hash_prune", "removed", itoa_buf(ctx.removed), "failed",
+                     itoa_buf(ctx.failed));
+    }
+}
+
 /* ── Registry seed visitor ────────────────────────────────────────── */
 
 /* Labels the full-index definition pass seeds into the registry
@@ -866,6 +915,7 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
                      itoa_buf((int)elapsed_ms(t)));
 
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+        prune_deleted_hashes(hash_store, project, files, file_count, changed_paths);
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */
