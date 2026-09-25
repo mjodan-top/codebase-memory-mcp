@@ -6281,10 +6281,11 @@ static int search_result_cmp(const void *a, const void *b) {
 /* Build the grep/search command string based on scoped vs recursive mode.
  * On Windows, uses PowerShell Select-String with tab-delimited output.
  * On POSIX, uses grep with colon-delimited output. */
-static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
+static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool icase, bool scoped,
                            const char *file_pattern, const char *tmpfile, const char *filelist,
                            const char *root_path) {
 #ifdef _WIN32
+    (void)icase; /* Select-String is case-insensitive by default */
     const char *sm = use_regex ? "" : " -SimpleMatch";
     if (scoped) {
         if (file_pattern) {
@@ -6329,7 +6330,7 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         }
     }
 #else
-    const char *flag = use_regex ? "-E" : "-F";
+    const char *flag = use_regex ? (icase ? "-iE" : "-E") : (icase ? "-iF" : "-F");
     if (scoped) {
         if (file_pattern) {
             /* -0: read NUL-separated paths from the filelist so paths containing
@@ -6476,7 +6477,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path,
                                     bool warn_literal_pipe, bool bre_alternation_applied,
-                                    bool literal_alternation_applied,
+                                    bool literal_alternation_applied, bool icase_applied,
                                     const char *effective_pattern, uint64_t elapsed_ms) {
     enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
@@ -6594,6 +6595,13 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
         }
     }
 
+    if (icase_applied) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "case_insensitive", true);
+        if (effective_pattern && !bre_alternation_applied && !literal_alternation_applied) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "effective_pattern", effective_pattern);
+        }
+    }
+
     /* Warnings: surface common foot-guns instead of leaving them silent. */
     yyjson_mut_val *warnings = yyjson_mut_arr(doc);
     if (bre_alternation_applied) {
@@ -6608,6 +6616,12 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
             doc, warnings,
             "pattern had a bare '|' with regex=false; it was run as alternation (regex=true, "
             "other metacharacters escaped) - see 'effective_pattern'.");
+    }
+    if (icase_applied) {
+        yyjson_mut_arr_add_strcpy(
+            doc, warnings,
+            "leading inline flag '(?i)' is not POSIX ERE; it was stripped and the search ran "
+            "case-insensitively (grep -i) - see 'effective_pattern'.");
     }
     if (warn_literal_pipe) {
         yyjson_mut_arr_add_strcpy(
@@ -7062,6 +7076,17 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("path or file_pattern contains invalid characters", true);
     }
 
+    /* #97: agents carry PCRE/RE2 habits — `(?i)foo` for case-insensitive. POSIX
+     * ERE has no inline flags, so the probe below rejected it as "invalid regex"
+     * and the caller got an error instead of hits. A leading (?i) is the one
+     * inline flag with an exact grep equivalent: strip it and run with -i. */
+    bool icase = false;
+    if (pattern && strncmp(pattern, "(?i)", 4) == 0 && pattern[4] != '\0') {
+        memmove(pattern, pattern + 4, strlen(pattern + 4) + 1);
+        icase = true;
+        cbm_log_info("search.inline_icase_stripped", "pattern", pattern);
+    }
+
     /* issue #283: when regex=true, a syntactically invalid pattern (e.g. an
      * unclosed group) makes the underlying grep fail, which the handler would
      * otherwise report as an empty result set — indistinguishable from a
@@ -7295,7 +7320,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         cbm_unlink(filelist);
     } else {
         char cmd[CBM_SZ_4K];
-        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
+        build_grep_cmd(cmd, sizeof(cmd), use_regex, icase, scoped, file_pattern, tmpfile, filelist,
                        root_path);
 
         FILE *fp = cbm_popen(cmd, "r");
@@ -7374,7 +7399,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
                                root_path, pat_has_pipe && !use_regex, bre_alternation_applied,
                                literal_alternation_applied || literal_unescaped_applied,
-                               pattern, cbm_now_ms() - search_t0);
+                               icase, pattern, cbm_now_ms() - search_t0);
     free(gm);
     free(sr);
     free(raw);
