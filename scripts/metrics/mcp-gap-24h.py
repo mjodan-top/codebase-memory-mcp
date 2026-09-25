@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """近 N 小时 codebase-memory MCP 两个缺口指标（默认 24h）。
 
+A_strict = A 去掉 hook 设计豁免后的真缺口（见 report 注释）：放行帧按线上 hook 重放，
+    hook 自己也放行的（仓外/记忆根/≤3 文件页内精定位）不计；被拦后下一步是页内精读
+    （sed -n/单文件 grep）不计，只有放弃或换工具继续跨文件扫（git grep/find/rg -r）才计。
 A = 应该用但没用 MCP 的比例
     分母：代码检索意图 = grep 帧里判为 code_symbol 的（含被 hook 拦下的）+ MCP 调用数
     分子：code_symbol grep 放行执行的 + 被拦后没转 MCP 的（绕过/放弃）
@@ -17,6 +20,54 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import grep_corpus as gc  # noqa: E402
+import importlib.util as _ilu  # noqa: E402
+
+_HOOK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "hooks", "grep-intercept.py")
+_spec = _ilu.spec_from_file_location("grep_intercept", _HOOK_PATH)
+hook = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(hook)
+
+
+def hook_verdict(cmd, cwd):
+    """用线上 hook 的同一套判定重放一条命令 → 'deny' / 'allow'。
+
+    hook 放行的形态（仓外目标、记忆/会话根、≤3 个具体文件页内精定位、
+    远端执行……）是设计上的豁免：索引不覆盖或 MCP 替代不了，不算「该用没用」。
+    """
+    import shlex
+    env = hook.collect_assignments(cmd)
+    for seg, head in hook.split_pipeline(cmd):
+        if re.match(r"^cd(\s|$)", seg):
+            try:
+                ct = hook.strip_redirects(shlex.split(seg))
+            except ValueError:
+                ct = []
+            ca = [t for t in ct[1:] if t != "--"]
+            cwd = (hook.resolve_target(hook.expand_assigned(ca[0], env), cwd) or "") \
+                if len(ca) == 1 else ""
+            continue
+        if hook.analyze_segment(seg, is_first=head, cwd=cwd, env=env) == "deny":
+            return "deny"
+    return "allow"
+
+
+RESCAN_RE = re.compile(r"\bgit\s+grep\b|\bfind\s+\S+.*-name\b|\bag\b|\back\b|os\.walk|glob\.glob|\bfd\s")
+PAGE_RE = re.compile(r"\b(sed\s+-n|nl\s|awk\s+'?NR|head\s|tail\s|cat\s)")
+
+
+def classify_next(nxt_cmd, cwd):
+    """被拦后下一条 shell 命令 → rescan（换工具继续跨文件扫 = 真绕过）/
+    page_read（对具体文件页内读/单文件 grep = hook 提示里允许的精定位）/ other。"""
+    if not nxt_cmd:
+        return "other"
+    if RESCAN_RE.search(nxt_cmd):
+        return "rescan"
+    if re.search(r"\b(grep|rg|egrep)\b", nxt_cmd):
+        return "rescan" if hook_verdict(nxt_cmd, cwd) == "deny" else "page_read"
+    if PAGE_RE.search(nxt_cmd):
+        return "page_read"
+    return "other"
 
 SHELL = {"exec_command", "shell_command", "shell", "local_shell"}
 BAD = ("project_not_found", "root_missing", "error", "timeout", "empty", "flood",
@@ -186,7 +237,9 @@ def analyze(hours, until=None):
                             nxt_cmd = cmd_of(n)[:600]
                             break
                 row = {"sid": sid, "ts": e["ts"], "cwd": fcwd, "cmd": c[:4000],
-                       "reason": reason, "blocked": blocked, "next": nxt, "next_cmd": nxt_cmd}
+                       "reason": reason, "blocked": blocked, "next": nxt, "next_cmd": nxt_cmd,
+                       "exempt": (not blocked) and hook_verdict(c, fcwd) == "allow",
+                       "next_kind": classify_next(nxt_cmd, fcwd) if nxt == "shell_bypass" else nxt}
                 (deny_rows if blocked else A_rows).append(row)
             elif is_mcp(e):
                 tool = e["name"].split("__")[-1]
@@ -220,6 +273,13 @@ def report(since, now, A_rows, deny_rows, mcp_rows, samples=8):
     kc = collections.Counter(r["k"] for r in mcp_rows)
     b_num = sum(v for k, v in kc.items() if k != "hit")
     pct = lambda a, b: f"{100 * a / b:.1f}%" if b else "n/a"  # noqa: E731
+    # A_strict：剔除 hook 设计豁免的放行（仓外/记忆根/页内精定位），分子只留
+    # 「非豁免放行」+「被拦后放弃（none）或换工具继续跨文件扫（rescan）」。
+    # page_read / other 是 hook 提示允许的精定位或与目标无关的下一步，不计缺口。
+    a_nonexempt = [r for r in A_rows if not r["exempt"]]
+    s_miss = [r for r in deny_rows if r["next_kind"] in ("rescan", "none")]
+    s_num = len(a_nonexempt) + len(s_miss)
+    s_den = len(a_nonexempt) + len(deny_rows) + n_mcp
     out = {
         "window_bj": f"{since.astimezone(tz8):%m-%d %H:%M} → {now.astimezone(tz8):%m-%d %H:%M}",
         "A": {"pct": pct(a_num, a_den), "num": a_num, "den": a_den,
@@ -227,6 +287,10 @@ def report(since, now, A_rows, deny_rows, mcp_rows, samples=8):
               "denied_then_not_mcp": len(miss_deny), "mcp_calls": n_mcp,
               "allowed_reason": dict(collections.Counter(r["reason"] for r in A_rows).most_common(10)),
               "deny_next": dict(collections.Counter(r["next"] for r in deny_rows))},
+        "A_strict": {"pct": pct(s_num, s_den), "num": s_num, "den": s_den,
+                     "allowed_exempt_by_hook": len(A_rows) - len(a_nonexempt),
+                     "allowed_nonexempt": len(a_nonexempt),
+                     "deny_next_kind": dict(collections.Counter(r["next_kind"] for r in deny_rows))},
         "B": {"pct": pct(b_num, n_mcp), "num": b_num, "den": n_mcp,
               "by_kind": dict(kc.most_common()),
               "by_tool": {t: dict(collections.Counter(r["k"] for r in mcp_rows if r["tool"] == t))
@@ -236,6 +300,10 @@ def report(since, now, A_rows, deny_rows, mcp_rows, samples=8):
     print("\n-- A 样例（放行的 code_symbol grep）")
     for r in A_rows[-samples:]:
         print(f"  {r['ts'].astimezone(tz8):%m-%d %H:%M} {r['sid']} [{r['reason']}] {r['cmd'][:150]!r}")
+    print("-- A_strict 样例（非豁免放行 / 被拦后放弃或换工具重扫）")
+    for r in (a_nonexempt + s_miss)[-samples:]:
+        print(f"  {r['ts'].astimezone(tz8):%m-%d %H:%M} {r['sid']} kind={r.get('next_kind') or 'allowed'} "
+              f"{r['cmd'][:110]!r} -> {r['next_cmd'][:110]!r}")
     print("-- A 样例（被拦后没转 MCP）")
     for r in miss_deny[-samples:]:
         print(f"  {r['ts'].astimezone(tz8):%m-%d %H:%M} {r['sid']} next={r['next']} {r['cmd'][:150]!r}")
