@@ -2743,6 +2743,62 @@ char *cbm_glob_to_like(const char *pattern) {
     return out;
 }
 
+/* file_pattern is documented as a glob, but agents routinely pass regex
+ * syntax there — `*(sessionfile|workbench)*`, `gateway-go/internal/authfail/.*`,
+ * `^src/(a|b)/`. Through cbm_glob_to_like those become LIKE patterns that can
+ * never match (a literal '(' / '|' / '.' in the path), so the search silently
+ * returns total=0 and the agent concludes the symbol does not exist.
+ * When the pattern carries regex-only syntax, return an equivalent unanchored
+ * POSIX ERE for n.file_path (glob '*' not already quantifying something is
+ * rewritten to '.*'); otherwise return NULL and the glob path is kept.
+ * Caller must free. */
+char *cbm_file_pattern_regex(const char *pattern) {
+    if (!pattern || !pattern[0]) {
+        return NULL;
+    }
+    bool regexy = strchr(pattern, '|') || strchr(pattern, '(') || strchr(pattern, '^') ||
+                  strchr(pattern, '$') || strchr(pattern, '\\') || strstr(pattern, ".*") ||
+                  strstr(pattern, ".+");
+    if (!regexy) {
+        return NULL;
+    }
+    size_t len = strlen(pattern);
+    char *out = malloc((len * 2) + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = pattern[i];
+        if (c == '*') {
+            char prev = i > 0 ? pattern[i - SKIP_ONE] : '\0';
+            if (i + SKIP_ONE < len && pattern[i + SKIP_ONE] == '*') {
+                i++; /* glob '**' → one '.*' */
+            }
+            /* After '.' / ']' it is already a regex quantifier. After ')' it is
+             * ambiguous: `*(a|b)*` is glob-flavoured (a leading '*' is not a
+             * valid ERE start), so there it means "anything", not "group*". */
+            bool quant = prev == '.' || prev == ']' || (prev == ')' && pattern[0] != '*');
+            if (quant) {
+                out[j++] = '*';
+            } else {
+                out[j++] = '.';
+                out[j++] = '*';
+            }
+        } else {
+            out[j++] = c;
+        }
+    }
+    out[j] = '\0';
+    cbm_regex_t re;
+    if (cbm_regcomp(&re, out, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+        free(out); /* not a valid ERE either: keep glob semantics */
+        return NULL;
+    }
+    cbm_regfree(&re);
+    return out;
+}
+
 /* ── extractLikeHints ─────────────────────────────────────────── */
 
 int cbm_extract_like_hints(const char *pattern, char **out, int max_out) {
@@ -2944,6 +3000,13 @@ static void where_add_regex(char *where, int where_sz, int *wlen, int *nparams,
                             search_bind_t *binds, int *bind_idx, const char *column,
                             const char *pattern, bool case_sensitive) {
     char buf[CBM_SZ_128];
+    /* A leading PCRE-style (?i) is not POSIX ERE: regcomp fails, the SQL
+     * function raises "invalid regex" and the search comes back empty. Treat
+     * it as the case-insensitive request it is (same as #97 for search_code). */
+    if (pattern && strncmp(pattern, "(?i)", SLEN("(?i)")) == 0 && pattern[SLEN("(?i)")]) {
+        pattern += SLEN("(?i)");
+        case_sensitive = false;
+    }
     if (case_sensitive) {
         snprintf(buf, sizeof(buf), "%s REGEXP ?%d", column, *bind_idx + SKIP_ONE);
     } else {
@@ -3011,7 +3074,19 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
         where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx, "n.qualified_name",
                         params->qn_pattern, params->case_sensitive);
     }
-    if (params->file_pattern) {
+    char *fp_re = cbm_file_pattern_regex(params->file_pattern);
+    if (fp_re) {
+        /* regex-shaped file_pattern: match n.file_path with iregexp instead of
+         * a LIKE that could never match. The pooled string outlives the bind. */
+        int pool_was_full = (pool->count >= ST_LIKE_POOL_MAX);
+        like_pool_add(pool, fp_re);
+        if (!pool_was_full) {
+            snprintf(bind_buf, sizeof(bind_buf), "iregexp(?%d, n.file_path)",
+                     *bind_idx + SKIP_ONE);
+            *wlen = where_append(where, where_sz, *wlen, nparams, bind_buf);
+            where_bind_text(binds, bind_idx, fp_re);
+        }
+    } else if (params->file_pattern) {
         char *lp = cbm_glob_to_like(params->file_pattern);
         /* A file_pattern with no glob wildcards is treated as a path-substring
          * match (issue #200): file_pattern="offer-server" should match
