@@ -2344,6 +2344,61 @@ TEST(search_code_bre_alternation_normalized_issue73) {
     PASS();
 }
 
+/* #97: a leading PCRE inline flag '(?i)' is not POSIX ERE. It used to be
+ * rejected as "invalid regex"; now it is stripped and grep runs with -i. */
+TEST(search_code_inline_icase_flag_issue97) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* lower-case needle only matches 'HandleRequest' case-insensitively */
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"(?i)handlerequest\","
+                                   "\"regex\":true,\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid regex"));
+    ASSERT_NOT_NULL(strstr(resp, "case_insensitive"));
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
+    free(resp);
+
+    /* literal mode too */
+    char *lit =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"(?i)handlerequest\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(lit);
+    ASSERT_NOT_NULL(strstr(lit, "HandleRequest"));
+    free(lit);
+
+    /* Regression: without the flag the search stays case-sensitive (0 hits). */
+    char *cs =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"handlerequest\","
+                                   "\"regex\":true,\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(cs);
+    ASSERT_NULL(strstr(cs, "case_insensitive"));
+    ASSERT_NULL(strstr(cs, "\\\"node\\\""));
+    free(cs);
+
+    /* A non-leading inline group stays an invalid-regex error (no guessing). */
+    char *mid =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"foo(?i)bar\","
+                                   "\"regex\":true,\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(mid);
+    ASSERT_NOT_NULL(strstr(mid, "invalid regex"));
+    free(mid);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* issue #272: '&' in a path / file_pattern is neutralised by the command's
  * quoting and must no longer be rejected as "invalid characters". */
 TEST(search_code_ampersand_accepted_issue272) {
@@ -6490,6 +6545,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_long_line_no_junk_files);
     RUN_TEST(search_code_bre_alternation_normalized_issue73);
+    RUN_TEST(search_code_inline_icase_flag_issue97);
     RUN_TEST(search_code_ampersand_accepted_issue272);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
