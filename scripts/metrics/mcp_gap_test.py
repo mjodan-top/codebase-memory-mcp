@@ -25,9 +25,22 @@ CASES = [
     (g.classify_next, ("", REPO), "other"),
 ]
 
+CASES += [
+    (g.mcp_result, ("search_code", '{"results":[{"node":"stream_idle_timeout","qualified_name":"x"}],"total_grep_matches":3}'), ("hit", "total=3")),
+    (g.mcp_result, ("index_repository", "tool call error: tool call failed for `codebase-memory/index_repository`\n\nCaused by: timed out awaiting tools/call after 300s"), None),
+]
+
+
+def _kind(fn, args):
+    r = fn(*args)
+    return r[0] if fn is g.mcp_result else r
+
+
 fail = 0
 for fn, args, want in CASES:
     got = fn(*args)
+    if fn is g.mcp_result:
+        got, want = got[0], (want[0] if want else "timeout")
     ok = got == want
     fail += not ok
     print(f"[{'ok' if ok else 'FAIL'}] {fn.__name__}{args[:1]} -> {got} (want {want})")

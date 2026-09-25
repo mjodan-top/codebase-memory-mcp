@@ -101,7 +101,12 @@ def mcp_result(tool, out):
         return "root_missing", o[:160]
     if "project" in err and "not found" in err:
         return "project_not_found", o[:200]
-    if "timed out" in low[:400] or "timeout" in low[:200]:
+    # Timeout = transport/tool-call failure envelope or server error, never a
+    # substring of the payload (a hit on DEFAULT_STREAM_IDLE_TIMEOUT_MS was
+    # being scored as a timeout, #98).
+    head = low[:400]
+    if ("tool call error" in head or "tool call failed" in head or err) and \
+            ("timed out" in head or "timeout" in err):
         return "timeout", o[:160]
     if isinstance(out, dict) and out.get("error"):
         return "error", o[:200]
