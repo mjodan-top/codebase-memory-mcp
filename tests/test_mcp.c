@@ -2179,6 +2179,38 @@ TEST(search_code_invalid_regex_errors_issue283) {
 
 /* issue #282: a literal '|' under regex=false is a silent 0-match trap. It must
  * now be surfaced as a warning (and the result carries elapsed_ms). */
+TEST(search_code_long_line_no_junk_files) {
+    /* #73 24h replay 09-25: a grep line longer than the 2K read buffer was
+     * split by fgets and each tail chunk re-parsed as "path:line:content",
+     * so mode=files returned fragments like ' 9, "tid"' as file paths. */
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char fp[640];
+    snprintf(fp, sizeof(fp), "%s/project/main.go", tmp);
+    FILE *f = fopen(fp, "a"); /* indexed file: search scope is the index */
+    ASSERT_NOT_NULL(f);
+    fputs("// {\"k\": \"HandleRequest\"", f);
+    for (int i = 0; i < 600; i++) {
+        fprintf(f, ", \"f%d\": %d:%d", i, i, i);
+    }
+    fputs("}\n", f);
+    fclose(f);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":940,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest\","
+                                   "\"mode\":\"files\",\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "main.go"));
+    ASSERT_NULL(strstr(resp, "\\\" f1"));   /* no tail fragment as a file */
+    ASSERT_NULL(strstr(resp, "\\\"\""));
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(search_code_literal_pipe_warns_issue282) {
     char tmp[512];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -6456,6 +6488,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
+    RUN_TEST(search_code_long_line_no_junk_files);
     RUN_TEST(search_code_bre_alternation_normalized_issue73);
     RUN_TEST(search_code_ampersand_accepted_issue272);
     RUN_TEST(tool_detect_changes_no_project);
