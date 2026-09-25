@@ -18,6 +18,7 @@
 #include "foundation/win_utf8.h"
 #endif
 #include <ctype.h>
+#include <stdbool.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -617,8 +618,76 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
 }
 
 /* Detect language for a file, handling .m disambiguation and JSON filtering. */
+/* #94: extensionless executables (scripts/dev/foo, bin/tool) are common in
+ * real repos but have no extension to map. Sniff a "#!" first line and map
+ * the interpreter. Only called for names without a '.', so the cost is one
+ * small read per extensionless file. */
+static CBMLanguage language_from_shebang(const char *abs_path) {
+    FILE *fp = fopen(abs_path, "rb");
+    if (!fp) {
+        return CBM_LANG_COUNT;
+    }
+    char line[CBM_SZ_256];
+    size_t n = fread(line, 1, sizeof(line) - 1, fp);
+    fclose(fp);
+    line[n] = '\0';
+    if (n < 3 || line[0] != '#' || line[1] != '!') {
+        return CBM_LANG_COUNT;
+    }
+    char *nl = strchr(line, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
+    /* Interpreter = basename of the first word, or the word after "env"
+     * (skipping env flags like -S). */
+    char *tok = strtok(line + 2, " \t\r");
+    const char *interp = NULL;
+    while (tok) {
+        const char *base = strrchr(tok, '/');
+        base = base ? base + 1 : tok;
+        if (strcmp(base, "env") == 0 || tok[0] == '-') {
+            tok = strtok(NULL, " \t\r");
+            continue;
+        }
+        interp = base;
+        break;
+    }
+    if (!interp) {
+        return CBM_LANG_COUNT;
+    }
+    static const struct {
+        const char *prefix;
+        CBMLanguage lang;
+    } SHEBANG_TABLE[] = {
+        {"python", CBM_LANG_PYTHON}, {"bash", CBM_LANG_BASH},       {"sh", CBM_LANG_BASH},
+        {"zsh", CBM_LANG_BASH},      {"dash", CBM_LANG_BASH},       {"ksh", CBM_LANG_BASH},
+        {"node", CBM_LANG_JAVASCRIPT}, {"ruby", CBM_LANG_RUBY},     {"perl", CBM_LANG_PERL},
+    };
+    for (size_t i = 0; i < sizeof(SHEBANG_TABLE) / sizeof(SHEBANG_TABLE[0]); i++) {
+        size_t pl = strlen(SHEBANG_TABLE[i].prefix);
+        if (strncmp(interp, SHEBANG_TABLE[i].prefix, pl) == 0) {
+            const char *rest = interp + pl;
+            /* "python3", "python3.12", "bash" — but not "shellcheck". */
+            bool ok = true;
+            for (; *rest; rest++) {
+                if (!(isdigit((unsigned char)*rest) || *rest == '.')) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                return SHEBANG_TABLE[i].lang;
+            }
+        }
+    }
+    return CBM_LANG_COUNT;
+}
+
 static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
     CBMLanguage lang = cbm_language_for_filename(entry_name);
+    if (lang == CBM_LANG_COUNT && abs_path && entry_name && !strchr(entry_name, '.')) {
+        return language_from_shebang(abs_path);
+    }
     if (lang == CBM_LANG_COUNT) {
         return CBM_LANG_COUNT;
     }

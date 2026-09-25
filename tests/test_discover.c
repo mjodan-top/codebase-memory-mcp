@@ -1290,6 +1290,46 @@ TEST(discover_nested_gitignore_stacks_with_root) {
 
 /* #81: an untracked linked worktree nested in the repo is a parallel checkout
  * of the same code — skip it; a submodule (gitdir under .git/modules) stays. */
+TEST(discover_extensionless_shebang_scripts) {
+    /* #94: 36h replay 09-25 missed scripts/ops/gw-stream-attrib (python,
+     * no extension). Shebang scripts are indexed; plain extensionless
+     * files and unknown interpreters are not. */
+    char *base = th_mktempdir("cbm_disc_shebang");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "scripts/attrib"), "#!/usr/bin/env python3\nprint(1)\n");
+    th_write_file(TH_PATH(base, "scripts/run"), "#!/bin/bash\necho hi\n");
+    th_write_file(TH_PATH(base, "scripts/envs"), "#!/usr/bin/env -S node --no-warnings\n1;\n");
+    th_write_file(TH_PATH(base, "scripts/chk"), "#!/usr/bin/shellcheck\nx\n");
+    th_write_file(TH_PATH(base, "LICENSE"), "MIT\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    int py = 0, sh = 0, js = 0, other = 0;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, "scripts/attrib") == 0 && files[i].language == CBM_LANG_PYTHON) {
+            py++;
+        } else if (strcmp(files[i].rel_path, "scripts/run") == 0 &&
+                   files[i].language == CBM_LANG_BASH) {
+            sh++;
+        } else if (strcmp(files[i].rel_path, "scripts/envs") == 0 &&
+                   files[i].language == CBM_LANG_JAVASCRIPT) {
+            js++;
+        } else {
+            other++;
+        }
+    }
+    ASSERT_EQ(py, 1);
+    ASSERT_EQ(sh, 1);
+    ASSERT_EQ(js, 1);
+    ASSERT_EQ(other, 0); /* shellcheck interpreter and LICENSE stay out */
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_skips_nested_linked_worktree) {
     char *base = th_mktempdir("cbm_disc_wt");
     ASSERT(base != NULL);
@@ -1321,6 +1361,7 @@ TEST(discover_skips_nested_linked_worktree) {
 
 SUITE(discover) {
     RUN_TEST(discover_skips_nested_linked_worktree);
+    RUN_TEST(discover_extensionless_shebang_scripts);
     /* Directory skip — always */
     RUN_TEST(skip_git);
     RUN_TEST(skip_node_modules);
