@@ -7140,28 +7140,53 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * Matched literally it silently returns 0 (24h replay 09-23: 2 of the 7
      * residual empty searches). Rewrite it: escape every ERE metachar except
      * '|' and run with regex=true. Left untouched when it looks like a real
-     * literal pipe: whitespace, '||', or an empty alternative. */
+     * literal pipe: '||' or an empty alternative.
+     *
+     * Whitespace used to veto this too, but then Phase 0.5 escaped the '|' and
+     * "StatusUnauthorized|, 401," / "a b|Foo" silently matched 0 (24h replay
+     * 09-24: symbols present on main came back empty). Now whitespace next to
+     * a '|' or at either end is trimmed, and an inner whitespace run becomes
+     * ".*" — the same multi-word meaning Phase 0.5 gives a pipe-less pattern. */
     bool literal_alternation_applied = false;
     if (!use_regex && pattern && pat_has_pipe && !strstr(pattern, "||") &&
-        pattern[0] != '|' && pattern[strlen(pattern) - 1] != '|' &&
-        !strpbrk(pattern, " \t")) {
+        pattern[0] != '|' && pattern[strlen(pattern) - 1] != '|') {
         size_t plen = strlen(pattern);
-        char *alt = malloc(plen * 2 + 1);
+        char *alt = malloc(plen * 3 + 1);
         if (alt) {
             char *dst = alt;
             for (const char *p = pattern; *p; p++) {
+                if (*p == ' ' || *p == '\t') {
+                    const char *q = p;
+                    while (q[1] == ' ' || q[1] == '\t') {
+                        q++;
+                    }
+                    bool edge = dst == alt || dst[-1] == '|' || q[1] == '|' || q[1] == '\0';
+                    if (!edge) {
+                        *dst++ = '.';
+                        *dst++ = '*';
+                    }
+                    p = q;
+                    continue;
+                }
                 if (*p != '|' && strchr("\\^$.?*+()[]{}", *p)) {
                     *dst++ = '\\';
                 }
                 *dst++ = *p;
             }
             *dst = '\0';
-            free(pattern);
-            pattern = alt;
-            use_regex = true;
-            literal_alternation_applied = true;
-            pat_has_pipe = false;
-            cbm_log_warn("search.literal_alternation_normalized", "pattern", pattern);
+            size_t alen = strlen(alt);
+            /* An all-whitespace alternative ("a| |b") collapses to an empty
+             * one, which would match every line — leave such input alone. */
+            if (alen == 0 || strstr(alt, "||") || alt[0] == '|' || alt[alen - 1] == '|') {
+                free(alt);
+            } else {
+                free(pattern);
+                pattern = alt;
+                use_regex = true;
+                literal_alternation_applied = true;
+                pat_has_pipe = false;
+                cbm_log_warn("search.literal_alternation_normalized", "pattern", pattern);
+            }
         }
     }
 

@@ -2223,6 +2223,29 @@ TEST(search_code_literal_pipe_warns_issue282) {
     ASSERT_NULL(strstr(esc, "\"no_match\""));
     free(esc);
 
+    /* Whitespace no longer vetoes alternation (24h replay 09-24): Phase 0.5
+     * used to escape the '|' so "Nope zzz | HandleRequest" matched 0. */
+    char *spc =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":934,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"Nope zzz | HandleRequest\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(spc);
+    ASSERT_NOT_NULL(strstr(spc, "literal_alternation_normalized"));
+    ASSERT_NOT_NULL(strstr(spc, "Nope.*zzz|HandleRequest"));
+    ASSERT_NULL(strstr(spc, "\"no_match\""));
+    free(spc);
+
+    /* An all-whitespace alternative would match everything: left alone. */
+    char *blank =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":935,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest| |Nope\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(blank);
+    ASSERT_NULL(strstr(blank, "literal_alternation_normalized"));
+    free(blank);
+
     /* A real literal pipe ("a || b", "|x") is left untouched and only warned. */
     char *oror =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":932,\"method\":\"tools/call\","
