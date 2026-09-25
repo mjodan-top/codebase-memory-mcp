@@ -41,9 +41,14 @@ def mcp_result(tool, out):
     if not o:
         return "no_output", ""
     low = o.lower()[:3000]
-    if "root_missing" in low:
+    # Anchor failure shapes to the server's error envelope ({"error": "..."}),
+    # not to substrings anywhere in the payload: a search that *hits* a symbol
+    # named e.g. cbm_watcher_root_missing_errno was being scored as a miss.
+    err = re.search(r'"error"\s*:\s*"([^"]{0,120})', low[:400])
+    err = err.group(1) if err else ""
+    if err.startswith("root_missing"):
         return "root_missing", o[:160]
-    if "not found" in low[:600] and "project" in low[:600]:
+    if "project" in err and "not found" in err:
         return "project_not_found", o[:200]
     if "timed out" in low[:400] or "timeout" in low[:200]:
         return "timeout", o[:160]
