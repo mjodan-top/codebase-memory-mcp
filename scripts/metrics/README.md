@@ -64,6 +64,7 @@ python3 scripts/metrics/mcp_takeover_bench.py --limit 40      # 抽样快跑
 
 ### A/B 缺口（`mcp-gap-24h.py`）
 - A 分母 = code_symbol grep（放行 + 被 hook 拦）+ MCP 调用；分子 = 放行的 code_symbol grep + 被拦后下一步没转 MCP 的。
+- A_strict（#96）= A 去掉 hook 设计豁免：放行帧用 `grep-intercept.py` 同一判定重放，hook 也放行的（仓外、记忆根、≤3 个具体文件）不计；被拦后下一步是页内精读（`sed -n`、单文件 grep）不计，只计放弃（none）和换工具继续跨文件扫（rescan：git grep / find -name / 被 hook 判 deny 的 grep）。36h 回放（09-24 00:23→09-25 12:23）：A=29.9% → A_strict=0.0%（0/273；11 次放行全是豁免形态，74 次被拦后 72 次页内精读、2 次无关）。单测 `mcp_gap_test.py`。
 - B 分母 = MCP 调用；分子 = empty / error / project_not_found / root_missing / timeout / flood / snippet_ambiguous / no_output，以及命中后 15 分钟内又用同一关键词做跨文件 grep 的。
 - 2026-09-23 基线（24h）：A 63.6%（150/236），B 45.1%（32/71）。按「≤3 个具体文件 = 页内精定位」修正口径后 A 为 55.0%（105/191）。B 的 32 次里：10 次 error 全部是 daemon 重启后 shim 报 Transport closed，4 次 not_found + 2 次 timeout 发生在全量重建窗口（#81）。
 
