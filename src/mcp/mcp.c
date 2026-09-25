@@ -6665,6 +6665,16 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
 
     while (fgets(line, sizeof(line), fp) && gm_count < grep_limit) {
         size_t len = strlen(line);
+        /* #73: a grep line longer than the buffer (minified JSON, XML dumps)
+         * arrives in several fgets chunks. Keep the head (path:line:content
+         * prefix, content truncated) and drain the tail — otherwise each tail
+         * chunk is re-parsed as its own "path:line:" record and pollutes files[]
+         * and total_grep_matches with junk entries. */
+        if (len > 0 && line[len - SKIP_ONE] != '\n' && !feof(fp)) {
+            int ch;
+            while ((ch = fgetc(fp)) != EOF && ch != '\n') {
+            }
+        }
         while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
             line[--len] = '\0';
         }
@@ -6685,6 +6695,21 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
         }
         char *sep2 = strchr(sep1 + SKIP_ONE, (unsigned char)sep);
         if (!sep2) {
+            continue;
+        }
+        /* The line field must be all digits; anything else is not a grep
+         * record (e.g. a path-less fragment) and must not become a "file". */
+        if (sep2 == sep1 + SKIP_ONE) {
+            continue;
+        }
+        bool digits = true;
+        for (const char *q = sep1 + SKIP_ONE; q < sep2; q++) {
+            if (*q < '0' || *q > '9') {
+                digits = false;
+                break;
+            }
+        }
+        if (!digits || sep1 == line) {
             continue;
         }
         *sep1 = '\0';
