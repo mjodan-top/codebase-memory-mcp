@@ -649,6 +649,11 @@ void cbm_adr_sections_free(cbm_adr_sections_t *s);
 /* Convert a glob pattern to SQL LIKE pattern. Caller must free result. */
 char *cbm_glob_to_like(const char *pattern);
 
+/* If a file_pattern carries regex-only syntax ('|', '(', '^', '$', '\\', '.*'),
+ * return an equivalent unanchored POSIX ERE for file_path; NULL = plain glob.
+ * Caller must free. */
+char *cbm_file_pattern_regex(const char *pattern);
+
 /* Extract literal substrings (>= 3 chars) from a regex pattern for LIKE pre-filtering.
  * Bails on alternation (|). Returns count of hints written to out[].
  * Each out[i] is malloc'd — caller must free each string. */

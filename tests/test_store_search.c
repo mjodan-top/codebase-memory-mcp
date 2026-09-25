@@ -186,6 +186,56 @@ TEST(store_search_file_pattern_substring_issue200) {
     PASS();
 }
 
+/* Agents pass regex syntax in file_pattern (documented as a glob) and a
+ * PCRE-style (?i) in name_pattern. Both used to return total=0 silently:
+ * `*(a|b)*` / `dir/.*` became LIKE patterns that never match, and `(?i)`
+ * failed POSIX regcomp. Seen in the 36h MCP replay (B=empty, true answer >0). */
+TEST(store_search_regex_file_pattern_and_icase_name) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t a = {.project = "test", .label = "Function", .name = "Mount",
+                    .qualified_name = "test.wb.Mount",
+                    .file_path = "gateway-go/internal/workbench/workbench.go"};
+    cbm_node_t b = {.project = "test", .label = "Function", .name = "writeAuthFailure",
+                    .qualified_name = "test.pool.writeAuthFailure",
+                    .file_path = "gateway-go/internal/poolapi/authfailure.go"};
+    cbm_node_t c = {.project = "test", .label = "Function", .name = "Mount",
+                    .qualified_name = "test.voice.Mount",
+                    .file_path = "gateway-go/internal/voice/mount.go"};
+    cbm_store_upsert_node(s, &a);
+    cbm_store_upsert_node(s, &b);
+    cbm_store_upsert_node(s, &c);
+
+    struct { const char *name; const char *file; int want; } cases[] = {
+        {"^(ResolveStateDir|Mount)$", "*(sessionfile|workbench)*", 1},
+        {NULL, "gateway-go/internal/poolapi/.*", 1},
+        {NULL, "^gateway-go/internal/(voice|workbench)/", 2},
+        {"(?i).*(WRITEAUTH|userCred).*", "*poolapi*", 1},
+        {"(?i).*mount.*", NULL, 2},
+        /* plain globs keep their old semantics */
+        {"Mount", "*workbench*", 1},
+        {NULL, "gateway-go/internal/voice/*", 1},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cbm_search_params_t p = {.project = "test", .name_pattern = cases[i].name,
+                                 .file_pattern = cases[i].file, .case_sensitive = true,
+                                 .min_degree = -1, .max_degree = -1};
+        cbm_search_output_t out = {0};
+        ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+        ASSERT_EQ(out.count, cases[i].want);
+        cbm_store_search_free(&out);
+    }
+
+    char *re = cbm_file_pattern_regex("*(a|b)*");
+    ASSERT_STR_EQ(re, ".*(a|b).*");
+    free(re);
+    ASSERT(cbm_file_pattern_regex("src/**/x*.go") == NULL);
+    ASSERT(cbm_file_pattern_regex("offer-server") == NULL);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Search pagination ──────────────────────────────────────────── */
 
 TEST(store_search_pagination) {
@@ -1464,6 +1514,7 @@ SUITE(store_search) {
     RUN_TEST(store_search_empty_label_ignored);
     RUN_TEST(store_search_by_file_pattern);
     RUN_TEST(store_search_file_pattern_substring_issue200);
+    RUN_TEST(store_search_regex_file_pattern_and_icase_name);
     RUN_TEST(store_search_pagination);
     RUN_TEST(store_search_degree_filter);
     RUN_TEST(store_search_degree_counts_inherits);
